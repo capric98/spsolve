@@ -4,6 +4,7 @@ import warnings
 import psutil
 import scipy
 import numpy as np
+import scipy.sparse
 
 from . import _spsolve
 
@@ -16,34 +17,46 @@ OMP_NUM_THREADS  = int(os.getenv("OMP_NUM_THREADS", len(_PS_CPU_AFFINITY)))
 
 
 def spsolve_triangular(A, b: np.ndarray, lower: bool=True, overwrite_b: bool=False, overwrite_A: bool=False, unit_diagonal: bool=False) -> np.ndarray:
-    if not scipy.sparse.isspmatrix_coo(A):
-        # convert to coo_matrix to guarantee the ascending order of coords
-        A = scipy.sparse.coo_matrix(A)
+    # Make sure CSR to ensure memory contiguous
+    if not scipy.sparse.isspmatrix_csr(A):
+        warnings.warn("use CSR matrix for better performance")
+        A = scipy.sparse.csr_matrix(A)
 
-    rows, cols = A.coords
-    vals: np.ndarray = A.data
+    if not A.has_sorted_indices:
+        A.sort_indices()
+
+
+    data:    np.ndarray = A.data
+    indices: np.ndarray = A.indices
+    indptr:  np.ndarray = A.indptr
+    nnz:            int = A.size
+
 
     # sanity check
-    A_shape = A.shape
+    assert(nnz == data.size)
+    assert(nnz == indices.size)
+
+    A_shape: tuple = A.shape # type: ignore
     assert(A_shape[0] == A_shape[1])
     assert(A_shape[0] == b.shape[0])
+
     if overwrite_A: warnings.warn("overwrite_A has no effect here", stacklevel=2)
     if unit_diagonal: warnings.warn("unit_diagonal has no effect here", stacklevel=2)
 
 
-    if vals.dtype != np.float64:
-        if np.iscomplexobj(vals):
+    if data.dtype != np.float64:
+        if np.iscomplexobj(data):
             raise Exception("complex A is not supported currently")
 
         overwrite_b = True
-        warnings.warn(f"explictly made a copy of A from dtype='{vals.dtype}' to dtype='{np.dtype(np.float64)}'", stacklevel=2)
-        vals = vals.astype(np.float64, copy=True, order=_SPSOLVE_ORDER)
+        warnings.warn(f"explictly made a copy of A from dtype='{data.dtype}' to dtype='{np.dtype(np.float64)}'", stacklevel=2)
+        data = data.astype(np.float64, copy=True, order=_SPSOLVE_ORDER)
 
 
     flag_C128_as_F64 = False
     if (b_dtype:=b.dtype) != np.float64:
         if np.iscomplexobj(b):
-            if np.iscomplexobj(vals):
+            if np.iscomplexobj(data):
                 raise Exception("complex A\\b is not supported currently")
             else:
                 if b_dtype == np.complex128:
@@ -72,10 +85,10 @@ def spsolve_triangular(A, b: np.ndarray, lower: bool=True, overwrite_b: bool=Fal
     #     lower = True
     #     rows = np.flip(rows)
     #     cols = np.flip(cols)
-    #     vals = np.flip(vals)
+    #     data = np.flip(data)
 
     # solve Ax=b in place where b is already copied into ans or overwrite_b is True
-    _spsolve.spsolve_triangular(rows, cols, vals, ans, A.nnz, lower, OMP_NUM_THREADS)
+    _spsolve.spsolve_triangular(data, indices, indptr, ans, lower, OMP_NUM_THREADS)
 
     if flag_C128_as_F64: ans = ans.view(dtype=b_dtype)
 

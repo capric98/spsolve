@@ -20,19 +20,21 @@ namespace nb = nanobind;
  * @param num_threads The number of OpenMP threads to use. If <= 0, it defaults to the maximum
  *        number of available threads.
  */
+// data, indices, indptr, ans, nnz, num_rows, lower, OMP_NUM_THREADS
 void spsolve_triangular(
-    nb::ndarray<const int, nb::ndim<1>, nb::c_contig>& rows,
-    nb::ndarray<const int, nb::ndim<1>, nb::c_contig>& cols,
-    nb::ndarray<const double,  nb::ndim<1>, nb::c_contig>& vals,
+    nb::ndarray<const double,  nb::ndim<1>, nb::c_contig>& data,
+    nb::ndarray<const int, nb::ndim<1>, nb::c_contig>& indices,
+    nb::ndarray<const int, nb::ndim<1>, nb::c_contig>& indptr,
     nb::ndarray<double, nb::ndim<2>, nb::c_contig>& b,
-    int nnz,
-    bool lower,
-    int num_threads
+    bool lower, int num_threads
 ) {
     // get raw data pointers once at the beginning
-    const auto* rows_ptr = rows.data();
-    const auto* cols_ptr = cols.data();
-    const auto* vals_ptr = vals.data();
+    const auto* data_ptr    = data.data();
+    const auto* indices_ptr = indices.data();
+    const auto* ind_ptr     = indptr.data();
+
+    const auto  nnz      = data.size();
+    const auto  num_rows = indptr.size() - 1;
     const auto  num_cols = b.shape(1);
     double*     b_ptr    = b.data();
 
@@ -60,8 +62,9 @@ void spsolve_triangular(
 #endif
     {
 
-        double* b_i_ptr;
-        __m256d b_i_vec, b_j_vec, val_vec, result;
+
+        double *b_i_ptr;
+        __m256d b_i_vec, b_j_vec, val_vec;
 
         if (lower) {
 
@@ -69,39 +72,46 @@ void spsolve_triangular(
             #pragma omp for schedule(guided) nowait
             for (int col = 0; col < vec_cols; col += 4) {
                 // use AVX2
-                for (int k = 0; k < nnz; ++k) {
-                    const auto& i = rows_ptr[k];
-                    const auto& j = cols_ptr[k];
+                for (int i = 0; i < num_rows; ++i) {
+                    const auto& data_lpos = ind_ptr[i];
+                    const auto& data_rpos = ind_ptr[i+1] - 1;
+                    if ((i != 0) && (data_lpos > data_rpos)) { continue; } // empty row
+                    if (i != indices_ptr[data_rpos]) { throw; }
 
                     b_i_ptr = b_ptr + i * num_cols + col;
                     b_i_vec = _mm256_load_pd(b_i_ptr);
-                    val_vec = _mm256_set1_pd(vals_ptr[k]);
 
-                    if (i == j) {
-                        // b[i, col] = b[i, col] / val;
-                        result = _mm256_div_pd(b_i_vec, val_vec);
-                    } else {
-                        // b[i, col] - val * b[j, col];
+                    for (int k = data_lpos; k < data_rpos; ++k) {
+                        const auto& j = indices_ptr[k];
                         b_j_vec = _mm256_load_pd(b_ptr + j * num_cols + col);
-                        result = _mm256_sub_pd(b_i_vec, _mm256_mul_pd(val_vec, b_j_vec));
+                        val_vec = _mm256_set1_pd(data_ptr[k]);
+                        b_i_vec = _mm256_sub_pd(b_i_vec, _mm256_mul_pd(val_vec, b_j_vec));
                     }
-                    _mm256_store_pd(b_i_ptr, result);
+
+                    b_i_vec = _mm256_div_pd(b_i_vec, _mm256_set1_pd(data_ptr[data_rpos]));
+                    _mm256_store_pd(b_i_ptr, b_i_vec);
                 }
             }
 
             #pragma omp for schedule(guided) nowait
             for (int col = vec_cols; col < num_cols; ++col) {
                 // _mm256_maskload_pd, _mm256_masksave_pd are slow...
-                for (int k = 0; k < nnz; ++k) {
-                    const auto& i = rows_ptr[k] * num_cols + col;
-                    const auto& j = cols_ptr[k] * num_cols + col;
-                    const auto& v = vals_ptr[k];
+                for (int i = 0; i < num_rows; ++i) {
+                    const auto& data_lpos = ind_ptr[i];
+                    const auto& data_rpos = ind_ptr[i+1] - 1;
+                    if ((i != 0) && (data_lpos > data_rpos)) { continue; } // empty row
+                    if (i != indices_ptr[data_rpos]) { throw; }
 
-                    if (i == j) {
-                        b_ptr[i] /= v;
-                    } else {
-                        b_ptr[i] -= v * b_ptr[j];
+                    const auto& b_i = b_ptr + i * num_cols + col;
+
+                    for (int k = data_lpos; k < data_rpos; ++k) {
+                        const auto& j = indices_ptr[k];
+                        const auto& v = data_ptr[k];
+                        *(b_i) -= v * b_ptr[j * num_cols + col];
                     }
+
+                    *(b_i) /= data_ptr[data_rpos];
+
                 }
             }
 
@@ -111,43 +121,54 @@ void spsolve_triangular(
             #pragma omp for schedule(guided) nowait
             for (int col = 0; col < vec_cols; col += 4) {
                 // use AVX2
-                for (int k = nnz - 1; k >= 0; --k) {
-                    const auto& i = rows_ptr[k];
-                    const auto& j = cols_ptr[k];
+                const auto num_rows_1 = num_rows-1;
+                for (int i = num_rows_1; i >= 0; --i) {
+                    const auto& data_lpos = ind_ptr[i];
+                    const auto& data_rpos = ind_ptr[i+1] - 1;
+                    if ((i != num_rows_1) && (data_lpos > data_rpos)) { continue; } // empty row
+                    if (i != indices_ptr[data_lpos]) { throw; }
 
                     b_i_ptr = b_ptr + i * num_cols + col;
                     b_i_vec = _mm256_load_pd(b_i_ptr);
-                    val_vec = _mm256_set1_pd(vals_ptr[k]);
 
-                    if (i == j) {
-                        // b[i, col] = b[i, col] / val;
-                        result = _mm256_div_pd(b_i_vec, val_vec);
-                    } else {
-                        // b[i, col] - val * b[j, col];
+                    for (int k = data_rpos; k > data_lpos; --k) {
+                        const auto& j = indices_ptr[k];
                         b_j_vec = _mm256_load_pd(b_ptr + j * num_cols + col);
-                        result = _mm256_sub_pd(b_i_vec, _mm256_mul_pd(val_vec, b_j_vec));
+                        val_vec = _mm256_set1_pd(data_ptr[k]);
+                        b_i_vec = _mm256_sub_pd(b_i_vec, _mm256_mul_pd(val_vec, b_j_vec));
                     }
-                    _mm256_store_pd(b_i_ptr, result);
+
+                    b_i_vec = _mm256_div_pd(b_i_vec, _mm256_set1_pd(data_ptr[data_lpos]));
+                    _mm256_store_pd(b_i_ptr, b_i_vec);
                 }
             }
 
             #pragma omp for schedule(guided) nowait
             for (int col = vec_cols; col < num_cols; ++col) {
                 // _mm256_maskload_pd, _mm256_masksave_pd are slow...
-                for (int k = nnz - 1; k >=0 ; --k) {
-                    const auto& i = rows_ptr[k] * num_cols + col;
-                    const auto& j = cols_ptr[k] * num_cols + col;
-                    const auto& v = vals_ptr[k];
+                const auto num_rows_1 = num_rows-1;
+                for (int i = num_rows_1; i >= 0; --i) {
+                    const auto& data_lpos = ind_ptr[i];
+                    const auto& data_rpos = ind_ptr[i+1] - 1;
+                    if ((i != num_rows_1) && (data_lpos > data_rpos)) { continue; } // empty row
+                    if (i != indices_ptr[data_lpos]) { throw; }
 
-                    if (i == j) {
-                        b_ptr[i] /= v;
-                    } else {
-                        b_ptr[i] -= v * b_ptr[j];
+                    const auto& b_i = b_ptr + i * num_cols + col;
+
+                    for (int k = data_rpos; k > data_lpos; --k) {
+                        const auto& j = indices_ptr[k];
+                        const auto& v = data_ptr[k];
+                        *(b_i) -= v * b_ptr[j * num_cols + col];
                     }
+
+                    *(b_i) /= data_ptr[data_lpos];
+
                 }
             }
 
         }
+
+
     } // end of #pragma omp
 
 
@@ -160,11 +181,10 @@ NB_MODULE(_spsolve, m) {
     m.doc() = "Nanobind implementation of a sparse triangular solver with OpenMP and AVX2.";
     // This defines the Python-callable function, mapping it to our C++ function.
     m.def("spsolve_triangular", &spsolve_triangular,
-        nb::arg("rows"),
-        nb::arg("cols"),
-        nb::arg("vals"),
+        nb::arg("data"),
+        nb::arg("indices"),
+        nb::arg("indptr"),
         nb::arg("b"),
-        nb::arg("nnz"),
         nb::arg("lower"),
         nb::arg("num_threads") = 0, // Default value for the argument
         nb::call_guard<nb::gil_scoped_release>(),
