@@ -2,7 +2,7 @@
 #include <nanobind/ndarray.h>
 #include <immintrin.h>
 #include <omp.h>
-#include <vector>
+#include <stdexcept>
 
 namespace nb = nanobind;
 
@@ -76,7 +76,9 @@ void spsolve_triangular(
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
                     if ((i != 0) && (data_lpos > data_rpos)) { continue; } // empty row
-                    if (i != indices_ptr[data_rpos]) { throw; }
+                    if (i != indices_ptr[data_rpos]) {
+                        throw std::invalid_argument("ill-conditioned matrix: non-empty row with 0 diag element");
+                    }
 
                     b_i_ptr = b_ptr + i * num_cols + col;
                     b_i_vec = _mm256_load_pd(b_i_ptr);
@@ -100,7 +102,9 @@ void spsolve_triangular(
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
                     if ((i != 0) && (data_lpos > data_rpos)) { continue; } // empty row
-                    if (i != indices_ptr[data_rpos]) { throw; }
+                    if (i != indices_ptr[data_rpos]) {
+                        throw std::invalid_argument("ill-conditioned matrix: non-empty row with 0 diag element");
+                    }
 
                     const auto& b_i = b_ptr + i * num_cols + col;
 
@@ -126,7 +130,9 @@ void spsolve_triangular(
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
                     if ((i != num_rows_1) && (data_lpos > data_rpos)) { continue; } // empty row
-                    if (i != indices_ptr[data_lpos]) { throw; }
+                    if (i != indices_ptr[data_lpos]) {
+                        throw std::invalid_argument("ill-conditioned matrix: non-empty row with 0 diag element");
+                    }
 
                     b_i_ptr = b_ptr + i * num_cols + col;
                     b_i_vec = _mm256_load_pd(b_i_ptr);
@@ -151,7 +157,9 @@ void spsolve_triangular(
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
                     if ((i != num_rows_1) && (data_lpos > data_rpos)) { continue; } // empty row
-                    if (i != indices_ptr[data_lpos]) { throw; }
+                    if (i != indices_ptr[data_lpos]) {
+                        throw std::invalid_argument("ill-conditioned matrix: non-empty row with 0 diag element");
+                    }
 
                     const auto& b_i = b_ptr + i * num_cols + col;
 
