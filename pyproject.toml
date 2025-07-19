@@ -1,0 +1,45 @@
+[project]
+name = "spsolve"
+version = "0.0.1"
+requires-python = ">=3.10"
+
+dependencies = [
+    "numpy >= 2.0.0",
+    "scipy >= 1.9.0",
+    "psutil ~= 7.0.0",
+]
+
+description = "A sparse (triangular) linear equations solver that is compatible with scipy.sparse.linalg.spsolve_triangular"
+readme = "README.md"
+authors = [
+    { name = "capric98" },
+]
+classifiers = [
+    "License :: OSI Approved :: BSD License",
+]
+
+
+[project.urls]
+Homepage = "https://github.com/capric98/spsolve"
+
+
+[build-system]
+requires = [
+    "cmake >= 3.18",
+    "nanobind >=2.8.0",
+    "scikit-build-core >= 0.11.5",
+]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+# Tells scikit-build-core where to find the Python package source
+wheel.packages = ["src/spsolve"]
+
+
+[tool.cibuildwheel]
+# Necessary to see build output from the actual compilation
+build-verbosity = 1
+
+# Run pytest to ensure that the package was correctly built
+# test-command = "pytest {project}/tests"
+# test-requires = "pytest"
