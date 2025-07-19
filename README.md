@@ -5,7 +5,7 @@
 It implements a naïve forward / backward substitution solver which:
 
 1. Use AVX2 instructions to vectorize the calculation.
-2. Use OpenMP to parallel when $b$ has many columns. Achieve the best performance when $n_\text{RHS} > 4 \times n_\text{cores}$
+2. Use OpenMP to parallel when $b$ has many columns. Achieve the best performance when $n_\text{RHS} \ge 4 \times n_\text{cores}$
 
 ## Usage
 
