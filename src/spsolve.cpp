@@ -60,8 +60,9 @@ void spsolve_triangular(
 #endif
     {
 
+        bool write_back_flag;
         double* b_i_ptr;
-        __m256d b_i_vec, b_j_vec, val_vec, result;
+        __m256d b_i_vec, b_j_vec, val_vec;
 
         if (lower) {
 
@@ -69,23 +70,28 @@ void spsolve_triangular(
             #pragma omp for schedule(guided) nowait
             for (int col = 0; col < vec_cols; col += 4) {
                 // use AVX2
+                write_back_flag = true;
                 for (int k = 0; k < nnz; ++k) {
                     const auto& i = rows_ptr[k];
                     const auto& j = cols_ptr[k];
 
-                    b_i_ptr = b_ptr + i * num_cols + col;
-                    b_i_vec = _mm256_load_pd(b_i_ptr);
+                    if (write_back_flag) {
+                        b_i_ptr = b_ptr + i * num_cols + col;
+                        b_i_vec = _mm256_load_pd(b_i_ptr);
+                    }
                     val_vec = _mm256_set1_pd(vals_ptr[k]);
 
                     if (i == j) {
                         // b[i, col] = b[i, col] / val;
-                        result = _mm256_div_pd(b_i_vec, val_vec);
+                        b_i_vec = _mm256_div_pd(b_i_vec, val_vec);
+                        _mm256_store_pd(b_i_ptr, b_i_vec);
+                        write_back_flag = true;
                     } else {
                         // b[i, col] - val * b[j, col];
                         b_j_vec = _mm256_load_pd(b_ptr + j * num_cols + col);
-                        result = _mm256_sub_pd(b_i_vec, _mm256_mul_pd(val_vec, b_j_vec));
+                        b_i_vec = _mm256_sub_pd(b_i_vec, _mm256_mul_pd(val_vec, b_j_vec));
+                        write_back_flag = false;
                     }
-                    _mm256_store_pd(b_i_ptr, result);
                 }
             }
 
@@ -111,23 +117,28 @@ void spsolve_triangular(
             #pragma omp for schedule(guided) nowait
             for (int col = 0; col < vec_cols; col += 4) {
                 // use AVX2
+                write_back_flag = true;
                 for (int k = nnz - 1; k >= 0; --k) {
                     const auto& i = rows_ptr[k];
                     const auto& j = cols_ptr[k];
 
-                    b_i_ptr = b_ptr + i * num_cols + col;
-                    b_i_vec = _mm256_load_pd(b_i_ptr);
+                    if (write_back_flag) {
+                        b_i_ptr = b_ptr + i * num_cols + col;
+                        b_i_vec = _mm256_load_pd(b_i_ptr);
+                    }
                     val_vec = _mm256_set1_pd(vals_ptr[k]);
 
                     if (i == j) {
                         // b[i, col] = b[i, col] / val;
-                        result = _mm256_div_pd(b_i_vec, val_vec);
+                        b_i_vec = _mm256_div_pd(b_i_vec, val_vec);
+                        _mm256_store_pd(b_i_ptr, b_i_vec);
+                        write_back_flag = true;
                     } else {
                         // b[i, col] - val * b[j, col];
                         b_j_vec = _mm256_load_pd(b_ptr + j * num_cols + col);
-                        result = _mm256_sub_pd(b_i_vec, _mm256_mul_pd(val_vec, b_j_vec));
+                        b_i_vec = _mm256_sub_pd(b_i_vec, _mm256_mul_pd(val_vec, b_j_vec));
+                        write_back_flag = false;
                     }
-                    _mm256_store_pd(b_i_ptr, result);
                 }
             }
 
