@@ -19,7 +19,7 @@ And then replace `scipy.sparse.linalg.solve_triangular` to `spsolve.solve_triang
 
 1. Currently only support CPUs with AVX2 instructions.
 
-2. Only support `COO` sparse matrix.
+2. Only support `scipy.sparse.csr_matrix` sparse matrix.
 
 3. Slight performance degradation when $n_\text{RHS}$  is not fourfold.
 
