@@ -23,7 +23,7 @@ nexttile; tlplot_bar(data1, "$n_\mathrm{RHS}=1$");
 nexttile; tlplot_bar(data24, "$n_\mathrm{RHS}=24$");
 nexttile; tlplot_bar(data1000, "$n_\mathrm{RHS}=1000$");
 
-% title(tl, "Solve $10000\times10000$, density$=10$\%", Interpreter="latex", FontName="Times");
+title(tl, "Average Execution Time (lower is better)", Interpreter="latex", FontName="Times");
 set(gcf, "Color", "white");
 
 function tlplot_bar(data, tstr)
