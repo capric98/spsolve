@@ -40,7 +40,7 @@ And then replace `scipy.sparse.linalg.solve_triangular` to `spsolve.solve_triang
 
 ## Performance
 * Environment:
-  * Intel Core i5-13600K, P-Cores@5.2GHz, Windows 10 LTSC
+  * Intel Core i5-13600K, P-Cores @5.2GHz, Windows 10 LTSC
   * Python 3.13.5: `OMP_NUM_THREADS=6`, manually bind to physical P-Cores, `overwrite_b=True`
   * MATLAB R2025a: `maxNumCompThreads=6` (default)
 
