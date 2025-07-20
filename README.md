@@ -19,7 +19,7 @@ And then replace `scipy.sparse.linalg.solve_triangular` to `spsolve.solve_triang
 
 1. Currently only support CPUs with AVX2 instructions.
 
-2. Only support `scipy.sparse.csr_matrix` sparse matrix.
+2. Only support `scipy.sparse.csr_matrix`, other sparse matrix will be converted to CSR.
 
 3. Slight performance degradation when $n_\text{RHS}$  is not fourfold.
 
@@ -27,7 +27,7 @@ And then replace `scipy.sparse.linalg.solve_triangular` to `spsolve.solve_triang
 
 5. Limited data type supported:
 
-   |       |  $\mathbf{A}$   |  \   |   $\mathbf{b}$    |  =   |   $\mathbf{x}$    |                                                              |
+   |       |       $A$       |  \   |        $b$        |  =   |        $x$        |                                                              |
    | ----: | :-------------: | :--: | :---------------: | :--: | :---------------: | :----------------------------------------------------------- |
    | dtype |  `np.float64`   |      |   `np.float64`    |      |   `np.float64`    | ✅                                                            |
    | dtype |  `np.float64`   |      | ``np.complex128`` |      | ``np.complex128`` | ✅ View `b` as double and solve a $2\times n_\text{RHS}$ problem. |

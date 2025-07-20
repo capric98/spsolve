@@ -29,8 +29,12 @@ nanobind_add_module(
   _spsolve
   STABLE_ABI
   NB_STATIC
+  src/spsolve.h
   src/spsolve.cpp
+  src/spsolve_triangular.cpp
 )
+
+target_include_directories(_spsolve PRIVATE src)
 
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")

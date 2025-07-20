@@ -1,30 +1,18 @@
-import os
-
 from warnings import warn
 
-import psutil
-
 from numpy import iscomplexobj, ndarray, dtype, float64, complex128
-from scipy.sparse import isspmatrix_csr, csr_matrix, SparseEfficiencyWarning
+from scipy.sparse import issparse, isspmatrix_csr, csr_matrix, SparseEfficiencyWarning
 
-from . import _spsolve
-
-
-_SPSOLVE_ORDER   = "C"
-_CONTIG_FLAG_STR = f"{_SPSOLVE_ORDER.lower()}_contiguous"
-_PS_CPU_AFFINITY = psutil.Process().cpu_affinity()
-_PS_CPU_AFFINITY = [0] if not _PS_CPU_AFFINITY else _PS_CPU_AFFINITY
-OMP_NUM_THREADS  = int(os.getenv("OMP_NUM_THREADS", len(_PS_CPU_AFFINITY)))
+from .spparams import _SPSOLVE_ORDER, _CONTIG_FLAG_STR, OMP_NUM_THREADS
+from ._spsolve import spsolve_triangular as _spsolve_triangular
 
 
 def spsolve_triangular(A, b: ndarray, lower: bool=True, overwrite_b: bool=False, overwrite_A: bool=False, unit_diagonal: bool=False) -> ndarray:
-    # Make sure CSR to ensure memory contiguous
+    if not issparse(A): raise ValueError(f"expect a scipy sparse matrix but got '{type(A)}'")
     if not isspmatrix_csr(A):
         warn("CSR matrix format is required. Converting to CSR matrix.", SparseEfficiencyWarning, stacklevel=2)
         A = csr_matrix(A)
-
-    if not A.has_sorted_indices:
-        A.sort_indices()
+    if not A.has_sorted_indices: A.sort_indices()
 
 
     data:    ndarray = A.data
@@ -89,7 +77,7 @@ def spsolve_triangular(A, b: ndarray, lower: bool=True, overwrite_b: bool=False,
     #     data = flip(data)
 
     # solve Ax=b in place where b is already copied into ans or overwrite_b is True
-    _spsolve.spsolve_triangular(data, indices, indptr, ans, lower, OMP_NUM_THREADS)
+    _spsolve_triangular(data, indices, indptr, ans, lower, OMP_NUM_THREADS)
 
     if flag_C128_as_F64: ans = ans.view(dtype=b_dtype)
 
