@@ -1,87 +1,60 @@
+import time
+
 from warnings import warn
 
-from numpy import iscomplexobj, ndarray, dtype, float64, complex128
-from scipy.sparse import issparse, isspmatrix_csr, csr_matrix, SparseEfficiencyWarning
+from numpy import arange, ones, ndarray
+from scipy.sparse import issparse, spmatrix, csr_matrix, SparseEfficiencyWarning
+from scipy.sparse.linalg import spbandwidth, is_sptriangular, splu, SuperLU
 
-from .spparams import _SPSOLVE_ORDER, _CONTIG_FLAG_STR, OMP_NUM_THREADS
-from ._spsolve import spsolve_triangular as _spsolve_triangular
-
-
-def spsolve_triangular(A, b: ndarray, lower: bool=True, overwrite_b: bool=False, overwrite_A: bool=False, unit_diagonal: bool=False) -> ndarray:
-    if not issparse(A): raise ValueError(f"expect a scipy sparse matrix but got '{type(A)}'")
-    if not isspmatrix_csr(A):
-        warn("CSR matrix format is required. Converting to CSR matrix.", SparseEfficiencyWarning, stacklevel=2)
-        A = csr_matrix(A)
-    if not A.has_sorted_indices: A.sort_indices()
+from .spsolve_triangular import spsolve_triangular
 
 
-    data:    ndarray = A.data
-    indices: ndarray = A.indices
-    indptr:  ndarray = A.indptr
-    nnz:         int = A.size
-
+def spsolve(A: spmatrix, b: ndarray, overwrite_b: bool=False, permc_spec: str="COLAMD", use_umfpack: bool=True) -> ndarray:
+    warn("unfinished spsolve function", stacklevel=2)
 
     # sanity check
-    assert(nnz == data.size)
-    assert(nnz == indices.size)
-
-    A_shape: tuple = A.shape # type: ignore
+    # non-square matrix can utilize QR solver, but I didn't find a sparse QR decomposition available,
+    # let it throw exception currently...
+    assert(issparse(A))
+    A_shape = A.shape
     assert(A_shape[0] == A_shape[1])
     assert(A_shape[0] == b.shape[0])
 
-    if overwrite_A: warn("overwrite_A has no effect here", stacklevel=2)
-    if unit_diagonal: warn("unit_diagonal has no effect here", stacklevel=2)
+    # lo_bandwidth, hi_bandwidth = spbandwidth(A)
 
+    # if lo_bandwidth == hi_bandwidth == 0:
+    #     # diagonal solver
+    #     warn("diagonal solver is not implemented, use triangular solver instead", stacklevel=2)
+    #     return spsolve_triangular(A, b, overwrite_b=overwrite_b, lower=True)
 
-    if data.dtype != float64:
-        if iscomplexobj(data):
-            raise Exception("complex A is not supported currently")
+    # if lo_bandwidth == 0 or hi_bandwidth == 0:
+    #     return spsolve_triangular(A, b, overwrite_b=overwrite_b, lower=(hi_bandwidth==0))
 
-        overwrite_b = True
-        warn(f"explictly made a copy of A from dtype='{data.dtype}' to dtype='{dtype(float64)}'", stacklevel=2)
-        data = data.astype(float64, copy=True, order=_SPSOLVE_ORDER)
+    is_lo_tri, is_up_tri = is_sptriangular(A)
+    if is_lo_tri or is_up_tri:
+        return spsolve_triangular(A, b, lower=bool(is_lo_tri), overwrite_b=overwrite_b)
 
+    # if is permuted triangular
 
-    flag_C128_as_F64 = False
-    if (b_dtype:=b.dtype) != float64:
-        if iscomplexobj(b):
-            if iscomplexobj(data):
-                raise Exception("complex A\\b is not supported currently")
-            else:
-                if b_dtype == complex128:
-                    flag_C128_as_F64 = True
-                    b = b.view(dtype=float64)
-                else:
-                    raise Exception(f"'{dtype(b_dtype)}' b is not supported currently")
+    # if symmetric or hermitian: chol? LDL?
 
-        else:
-            warn(f"'b' has dtype='{b.dtype}', explicitly make a copy of dtype='{dtype(float64)}'", stacklevel=2)
-            overwrite_b = True
-            b = b.astype(float64, copy=True, order=_SPSOLVE_ORDER)
+    # LU solver
+    t_start = time.perf_counter()
+    lu: SuperLU = splu(A, permc_spec=permc_spec)
+    t_elapsed = time.perf_counter() - t_start
+    print(f"LU decomposition finished in {1000*t_elapsed:.2f} ms")
 
+    L = csr_matrix(lu.L)
+    U = csr_matrix(lu.U)
 
-    ans: ndarray = b if overwrite_b else b.copy(order=_SPSOLVE_ORDER)
+    Pr = csr_matrix((ones(A_shape[0]), (lu.perm_r, arange(A_shape[0]))))
+    Pc = csr_matrix((ones(A_shape[0]), (arange(A_shape[0]), lu.perm_c)))
 
-    if overwrite_b:
-        if not getattr(ans.data, _CONTIG_FLAG_STR):
-            warn(f"overwrite_b in enabled but 'b' is not {_SPSOLVE_ORDER} CONTIGUOUS", stacklevel=2)
-            ans = b.copy(order=_SPSOLVE_ORDER)
-    else:
-        ans = b.copy(order=_SPSOLVE_ORDER)
+    ans = Pr @ b
+    spsolve_triangular(L, ans, lower=True, overwrite_b=True)
+    spsolve_triangular(U, ans, lower=False, overwrite_b=True)
 
-    ## Will it run faster by force lower? Introduce an overhead of flip but may be friendlier to the cache...
-    # if not lower:
-    #     lower = True
-    #     rows = flip(rows)
-    #     cols = flip(cols)
-    #     data = flip(data)
-
-    # solve Ax=b in place where b is already copied into ans or overwrite_b is True
-    _spsolve_triangular(data, indices, indptr, ans, lower, OMP_NUM_THREADS)
-
-    if flag_C128_as_F64: ans = ans.view(dtype=b_dtype)
-
-    return ans
+    return Pc @ ans
 
 
 if __name__ == "__main__":
