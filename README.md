@@ -13,13 +13,15 @@ It implements a naïve forward / backward substitution solver which:
 pip install -U git+https://github.com/capric98/spsolve
 ```
 
-And then replace `scipy.sparse.linalg.solve_triangular` to `spsolve.solve_triangular` in your code.
+And then replace `scipy.sparse.linalg.solve_triangular()` to `spsolve.solve_triangular()` in your code.
+
+A `spsolve.spsolve()` function is available for replacement of `scipy.sparse.linalg.solve()`, currently it simply uses `scipy.sparse.linalg.splu` and then solve `Ax=b` via `x = Pc @ { U \ [ L \ (Pr@b) ] }`, while `splu` almost runs in a single thread. Please let me know if you has a better idea to do LU decomposition.
 
 ## Limitations
 
-1. Currently only support CPUs with AVX2 instructions.
+1. Currently **only** support CPUs with AVX2 instructions.
 
-2. Only support `scipy.sparse.csr_matrix`, other sparse matrix will be converted to CSR.
+2. Native support only for `scipy.sparse.csr_matrix`, other sparse matrix will be converted to CSR format.
 
 3. Slight performance degradation when $n_\text{RHS}$  is not fourfold.
 
@@ -57,7 +59,7 @@ And then replace `scipy.sparse.linalg.solve_triangular` to `spsolve.solve_triang
 ## TODO
 
 - [ ] Implement `spsolve_triangular` for `np.complex128`.
-- [ ] Implement `solve` for general `scipy.sparse` matrices.
+- [x] Implement `solve` for general `scipy.sparse` matrices.
 
 ## Acknowledgments
 
