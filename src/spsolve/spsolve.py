@@ -6,11 +6,12 @@ from numpy import arange, ones, ndarray
 from scipy.sparse import issparse, spmatrix, csr_matrix, SparseEfficiencyWarning
 from scipy.sparse.linalg import spbandwidth, is_sptriangular, splu, SuperLU
 
+from .matmul import _matmul_csr
 from .spsolve_triangular import spsolve_triangular
 
 
 def spsolve(A: spmatrix, b: ndarray, overwrite_b: bool=False, permc_spec: str="COLAMD", use_umfpack: bool=True) -> ndarray:
-    warn("unfinished spsolve function", stacklevel=2)
+    # warn("unfinished spsolve function", stacklevel=2)
 
     # sanity check
     # non-square matrix can utilize QR solver, but I didn't find a sparse QR decomposition available,
@@ -30,19 +31,19 @@ def spsolve(A: spmatrix, b: ndarray, overwrite_b: bool=False, permc_spec: str="C
     # if lo_bandwidth == 0 or hi_bandwidth == 0:
     #     return spsolve_triangular(A, b, overwrite_b=overwrite_b, lower=(hi_bandwidth==0))
 
-    is_lo_tri, is_up_tri = is_sptriangular(A)
-    if is_lo_tri or is_up_tri:
-        return spsolve_triangular(A, b, lower=bool(is_lo_tri), overwrite_b=overwrite_b)
+    is_lower_triangular, is_upper_triangular = is_sptriangular(A)
+    if is_lower_triangular or is_upper_triangular:
+        return spsolve_triangular(A, b, lower=bool(is_lower_triangular), overwrite_b=overwrite_b)
 
     # if is permuted triangular
 
     # if symmetric or hermitian: chol? LDL?
 
     # LU solver
-    t_start = time.perf_counter()
+    # t_start = time.perf_counter()
     lu: SuperLU = splu(A, permc_spec=permc_spec)
-    t_elapsed = time.perf_counter() - t_start
-    print(f"LU decomposition finished in {1000*t_elapsed:.2f} ms")
+    # t_elapsed = time.perf_counter() - t_start
+    # print(f"LU decomposition finished in {1000*t_elapsed:.2f} ms")
 
     L = csr_matrix(lu.L)
     U = csr_matrix(lu.U)
@@ -54,7 +55,13 @@ def spsolve(A: spmatrix, b: ndarray, overwrite_b: bool=False, permc_spec: str="C
     spsolve_triangular(L, ans, lower=True, overwrite_b=True)
     spsolve_triangular(U, ans, lower=False, overwrite_b=True)
 
-    return Pc @ ans
+    if overwrite_b:
+        _matmul_csr(Pc, ans, b) # write Pc @ ans into b
+        ans = b
+    else:
+        ans = Pc @ ans
+
+    return ans
 
 
 if __name__ == "__main__":
