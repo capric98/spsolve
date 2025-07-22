@@ -12,7 +12,7 @@ void spsolve_triangular(
     nb::ndarray<const int, nb::ndim<1>, nb::c_contig>& indices,
     nb::ndarray<const int, nb::ndim<1>, nb::c_contig>& indptr,
     nb::ndarray<double, nb::ndim<2>, nb::c_contig>& b,
-    bool lower, int num_threads
+    bool lower, bool unit_diagonal, int num_threads
 );
 
 

@@ -26,7 +26,7 @@ void spsolve_triangular(
     nb::ndarray<const int, nb::ndim<1>, nb::c_contig>& indices,
     nb::ndarray<const int, nb::ndim<1>, nb::c_contig>& indptr,
     nb::ndarray<double, nb::ndim<2>, nb::c_contig>& b,
-    bool lower, int num_threads
+    bool lower, bool unit_diagonal, int num_threads
 ) {
     // get raw data pointers once at the beginning
     const auto* data_ptr    = data.data();
@@ -42,7 +42,7 @@ void spsolve_triangular(
     auto residue  = num_cols % 4;
     auto para_max = num_cols / 4 + residue;
 
-    volatile bool flag_ill_zero_diag = false;
+    // volatile bool flag_ill_zero_diag = false;
 
     // // when num_cols is small, grab more columns and use single column solver, to increase CPU usage
     // while ((para_max < 6) && (vec_cols > 4)) {
@@ -78,7 +78,7 @@ void spsolve_triangular(
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
                     if ((i != 0) && (data_lpos > data_rpos)) { continue; } // empty row
-                    if (i != indices_ptr[data_rpos]) { flag_ill_zero_diag = true; continue; }
+                    // if (i != indices_ptr[data_rpos]) { flag_ill_zero_diag = true; continue; }
 
                     b_i_ptr = b_ptr + i * num_cols + col;
                     b_i_vec = _mm256_load_pd(b_i_ptr);
@@ -90,7 +90,9 @@ void spsolve_triangular(
                         b_i_vec = _mm256_sub_pd(b_i_vec, _mm256_mul_pd(val_vec, b_j_vec));
                     }
 
-                    b_i_vec = _mm256_div_pd(b_i_vec, _mm256_set1_pd(data_ptr[data_rpos]));
+                    if (!unit_diagonal) {
+                        b_i_vec = _mm256_div_pd(b_i_vec, _mm256_set1_pd(data_ptr[data_rpos]));
+                    }
                     _mm256_store_pd(b_i_ptr, b_i_vec);
                 }
             }
@@ -102,7 +104,7 @@ void spsolve_triangular(
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
                     if ((i != 0) && (data_lpos > data_rpos)) { continue; } // empty row
-                    if (i != indices_ptr[data_rpos]) { flag_ill_zero_diag = true; continue; }
+                    // if (i != indices_ptr[data_rpos]) { flag_ill_zero_diag = true; continue; }
 
                     const auto& b_i = b_ptr + i * num_cols + col;
                     auto b_i_temp = *(b_i);
@@ -113,7 +115,11 @@ void spsolve_triangular(
                         b_i_temp -= v * b_ptr[j * num_cols + col];
                     }
 
-                    *(b_i) = b_i_temp / data_ptr[data_rpos];
+                    if (!unit_diagonal) {
+                        *(b_i) = b_i_temp / data_ptr[data_rpos];
+                    } else {
+                        *(b_i) = b_i_temp;
+                    }
 
                 }
             }
@@ -129,7 +135,7 @@ void spsolve_triangular(
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
                     if ((i != num_rows_1) && (data_lpos > data_rpos)) { continue; } // empty row
-                    if (i != indices_ptr[data_lpos]) { flag_ill_zero_diag = true; continue; }
+                    // if (i != indices_ptr[data_lpos]) { flag_ill_zero_diag = true; continue; }
 
                     b_i_ptr = b_ptr + i * num_cols + col;
                     b_i_vec = _mm256_load_pd(b_i_ptr);
@@ -141,7 +147,9 @@ void spsolve_triangular(
                         b_i_vec = _mm256_sub_pd(b_i_vec, _mm256_mul_pd(val_vec, b_j_vec));
                     }
 
-                    b_i_vec = _mm256_div_pd(b_i_vec, _mm256_set1_pd(data_ptr[data_lpos]));
+                    if (!unit_diagonal) {
+                        b_i_vec = _mm256_div_pd(b_i_vec, _mm256_set1_pd(data_ptr[data_lpos]));
+                    }
                     _mm256_store_pd(b_i_ptr, b_i_vec);
                 }
             }
@@ -154,7 +162,7 @@ void spsolve_triangular(
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
                     if ((i != num_rows_1) && (data_lpos > data_rpos)) { continue; } // empty row
-                    if (i != indices_ptr[data_lpos]) { flag_ill_zero_diag = true; continue; }
+                    // if (i != indices_ptr[data_lpos]) { flag_ill_zero_diag = true; continue; }
 
                     const auto& b_i = b_ptr + i * num_cols + col;
                     auto b_i_temp = *(b_i);
@@ -165,7 +173,11 @@ void spsolve_triangular(
                         b_i_temp -= v * b_ptr[j * num_cols + col];
                     }
 
-                    *(b_i) = b_i_temp / data_ptr[data_lpos];
+                    if (!unit_diagonal) {
+                        *(b_i) = b_i_temp / data_ptr[data_lpos];
+                    } else {
+                        *(b_i) = b_i_temp;
+                    }
 
                 }
             }
@@ -175,8 +187,8 @@ void spsolve_triangular(
 
     } // end of #pragma omp
 
-    if (flag_ill_zero_diag) {
-        throw std::invalid_argument("ill-conditioned matrix: non-empty row with diag element of 0");
-    }
+    // if (flag_ill_zero_diag) {
+    //     throw std::invalid_argument("ill-conditioned matrix: non-empty row with diag element of 0");
+    // }
 
 }

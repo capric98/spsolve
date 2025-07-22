@@ -28,9 +28,7 @@ def spsolve_triangular(A: spmatrix, b: ndarray, lower: bool=True, overwrite_b: b
     A_shape: tuple = A.shape # type: ignore
     assert(A_shape[0] == A_shape[1])
     assert(A_shape[0] == b.shape[0])
-
     if overwrite_A: warn("overwrite_A has no effect here", stacklevel=2)
-    if unit_diagonal: warn("unit_diagonal has no effect here", stacklevel=2)
 
 
     if data.dtype != float64:
@@ -77,7 +75,7 @@ def spsolve_triangular(A: spmatrix, b: ndarray, lower: bool=True, overwrite_b: b
     #     data = flip(data)
 
     # solve Ax=b in place where b is already copied into ans or overwrite_b is True
-    _spsolve_triangular(data, indices, indptr, ans, lower, OMP_NUM_THREADS)
+    _spsolve_triangular(data, indices, indptr, ans, lower, unit_diagonal, OMP_NUM_THREADS)
 
 
     if flag_C128_as_F64: ans = ans.view(dtype=b_dtype)

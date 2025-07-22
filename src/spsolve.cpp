@@ -16,6 +16,7 @@ NB_MODULE(_spsolve, m) {
         nb::arg("indptr"),
         nb::arg("b"),
         nb::arg("lower"),
+        nb::arg("unit_diagonal") = false,
         nb::arg("num_threads") = 0, // Default value for the argument
         nb::call_guard<nb::gil_scoped_release>(),
         "Solves a sparse triangular linear system (Lx=b or Ux=b).\n\n"
