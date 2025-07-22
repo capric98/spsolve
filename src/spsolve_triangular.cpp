@@ -105,14 +105,15 @@ void spsolve_triangular(
                     if (i != indices_ptr[data_rpos]) { flag_ill_zero_diag = true; continue; }
 
                     const auto& b_i = b_ptr + i * num_cols + col;
+                    auto b_i_temp = *(b_i);
 
                     for (int k = data_lpos; k < data_rpos; ++k) {
                         const auto& j = indices_ptr[k];
                         const auto& v = data_ptr[k];
-                        *(b_i) -= v * b_ptr[j * num_cols + col];
+                        b_i_temp -= v * b_ptr[j * num_cols + col];
                     }
 
-                    *(b_i) /= data_ptr[data_rpos];
+                    *(b_i) = b_i_temp / data_ptr[data_rpos];
 
                 }
             }
@@ -156,14 +157,15 @@ void spsolve_triangular(
                     if (i != indices_ptr[data_lpos]) { flag_ill_zero_diag = true; continue; }
 
                     const auto& b_i = b_ptr + i * num_cols + col;
+                    auto b_i_temp = *(b_i);
 
                     for (int k = data_rpos; k > data_lpos; --k) {
                         const auto& j = indices_ptr[k];
                         const auto& v = data_ptr[k];
-                        *(b_i) -= v * b_ptr[j * num_cols + col];
+                        b_i_temp -= v * b_ptr[j * num_cols + col];
                     }
 
-                    *(b_i) /= data_ptr[data_lpos];
+                    *(b_i) = b_i_temp / data_ptr[data_lpos];
 
                 }
             }
