@@ -7,11 +7,18 @@
 namespace nb = nanobind;
 
 
-void spsolve_triangular(
+void spsolve_triangular_C(
     nb::ndarray<const double,  nb::ndim<1>, nb::c_contig>& data,
     nb::ndarray<const int, nb::ndim<1>, nb::c_contig>& indices,
     nb::ndarray<const int, nb::ndim<1>, nb::c_contig>& indptr,
     nb::ndarray<double, nb::ndim<2>, nb::c_contig>& b,
+    bool lower, bool unit_diagonal, int num_threads
+);
+void spsolve_triangular_F(
+    nb::ndarray<const double,  nb::ndim<1>, nb::c_contig>& data,
+    nb::ndarray<const int, nb::ndim<1>, nb::c_contig>& indices,
+    nb::ndarray<const int, nb::ndim<1>, nb::c_contig>& indptr,
+    nb::ndarray<double, nb::ndim<2>, nb::f_contig>& b,
     bool lower, bool unit_diagonal, int num_threads
 );
 

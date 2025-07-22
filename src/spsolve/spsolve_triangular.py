@@ -3,8 +3,8 @@ from warnings import warn
 from numpy import iscomplexobj, ndarray, dtype, float64, complex128
 from scipy.sparse import issparse, isspmatrix_csr, spmatrix, csr_matrix, SparseEfficiencyWarning
 
-from .spparams import _SPSOLVE_ORDER, _CONTIG_FLAG_STR, OMP_NUM_THREADS
-from ._spsolve import spsolve_triangular as _spsolve_triangular # type: ignore
+from .spparams import _PREFER_ORDER, OMP_NUM_THREADS
+from ._spsolve import spsolve_triangular_C, spsolve_triangular_F # type: ignore
 
 
 def spsolve_triangular(A: spmatrix, b: ndarray, lower: bool=True, overwrite_b: bool=False, overwrite_A: bool=False, unit_diagonal: bool=False) -> ndarray:
@@ -31,13 +31,18 @@ def spsolve_triangular(A: spmatrix, b: ndarray, lower: bool=True, overwrite_b: b
     if overwrite_A: warn("overwrite_A has no effect here", stacklevel=2)
 
 
+    if (not b.data.c_contiguous) and (not b.data.f_contiguous):
+        b = b.copy(order=_PREFER_ORDER)
+        overwrite_b = True
+
+
     if data.dtype != float64:
         if iscomplexobj(data):
             raise Exception("complex A is not supported currently")
 
         overwrite_b = True
         warn(f"explictly made a copy of A from dtype='{data.dtype}' to dtype='{dtype(float64)}'", stacklevel=2)
-        data = data.astype(float64, copy=True, order=_SPSOLVE_ORDER)
+        data = data.astype(float64, copy=True, order=_PREFER_ORDER)
 
 
     flag_C128_as_F64 = False
@@ -48,6 +53,9 @@ def spsolve_triangular(A: spmatrix, b: ndarray, lower: bool=True, overwrite_b: b
             else:
                 if b_dtype == complex128:
                     flag_C128_as_F64 = True
+                    if b.data.f_contiguous:
+                        b = b.copy(order=_PREFER_ORDER) # cannot use float64 logic to solve complex F contiguous b
+                        overwrite_b = True
                     b = b.view(dtype=float64)
                 else:
                     raise Exception(f"'{dtype(b_dtype)}' b is not supported currently")
@@ -55,17 +63,13 @@ def spsolve_triangular(A: spmatrix, b: ndarray, lower: bool=True, overwrite_b: b
         else:
             warn(f"'b' has dtype='{b.dtype}', explicitly make a copy of dtype='{dtype(float64)}'", stacklevel=2)
             overwrite_b = True
-            b = b.astype(float64, copy=True, order=_SPSOLVE_ORDER)
+            b = b.astype(float64, copy=True, order=_PREFER_ORDER)
 
 
-    ans: ndarray = b if overwrite_b else b.copy(order=_SPSOLVE_ORDER)
+    ans: ndarray = b if overwrite_b else b.copy(order=_PREFER_ORDER) # b.copy(order="A")
 
-    if overwrite_b:
-        if not getattr(ans.data, _CONTIG_FLAG_STR):
-            warn(f"overwrite_b in enabled but 'b' is not {_SPSOLVE_ORDER} CONTIGUOUS", stacklevel=2)
-            ans = b.copy(order=_SPSOLVE_ORDER)
-    else:
-        ans = b.copy(order=_SPSOLVE_ORDER)
+    # only use spsolve_triangular_F when b is F Contiguous and overwrite_b is True
+    _spsolve_triangular = spsolve_triangular_C if ans.data.c_contiguous else spsolve_triangular_F
 
     ## Will it run faster by force lower? Introduce an overhead of flip but may be friendlier to the cache...
     # if not lower:

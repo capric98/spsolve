@@ -31,7 +31,8 @@ nanobind_add_module(
   NB_STATIC
   src/spsolve.h
   src/spsolve.cpp
-  src/spsolve_triangular.cpp
+  src/spsolve_triangular_C.cpp
+  src/spsolve_triangular_F.cpp
 )
 
 target_include_directories(_spsolve PRIVATE src)
