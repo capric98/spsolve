@@ -1,5 +1,3 @@
-import time
-
 from warnings import warn
 
 from numpy import arange, ones, ndarray
@@ -11,7 +9,7 @@ from .spsolve_triangular import spsolve_triangular
 
 
 def spsolve(A: spmatrix, b: ndarray, overwrite_b: bool=False, permc_spec: str="COLAMD", use_umfpack: bool=True) -> ndarray:
-    # warn("unfinished spsolve function", stacklevel=2)
+    warn("experimental spsolve, for general usage try pypardiso", SparseEfficiencyWarning, stacklevel=2)
 
     # sanity check
     # non-square matrix can utilize QR solver, but I didn't find a sparse QR decomposition available,
@@ -51,8 +49,9 @@ def spsolve(A: spmatrix, b: ndarray, overwrite_b: bool=False, permc_spec: str="C
     Pr = csr_matrix((ones(A_shape[0]), (lu.perm_r, arange(A_shape[0]))))
     Pc = csr_matrix((ones(A_shape[0]), (arange(A_shape[0]), lu.perm_c)))
 
+    # solve Ax=b via x = Pc @ ( U \ ( L \ (Pr@b) ) )
     ans = Pr @ b
-    spsolve_triangular(L, ans, lower=True, overwrite_b=True)
+    spsolve_triangular(L, ans, lower=True, overwrite_b=True, unit_diagonal=True) # LU decomposition should give unit_diagonal L?
     spsolve_triangular(U, ans, lower=False, overwrite_b=True)
 
     if overwrite_b:

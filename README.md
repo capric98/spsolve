@@ -15,7 +15,7 @@ pip install -U git+https://github.com/capric98/spsolve
 
 And then replace `scipy.sparse.linalg.solve_triangular()` to `spsolve.solve_triangular()` in your code.
 
-A `spsolve.spsolve()` function is available for replacement of `scipy.sparse.linalg.solve()`, currently it simply uses `scipy.sparse.linalg.splu` and then solve `Ax=b` via `x = Pc @ { U \ [ L \ (Pr@b) ] }`, while `splu` almost runs in a single thread. Please let me know if you has a better idea to do LU decomposition.
+A `spsolve.spsolve()` function is available for replacement of `scipy.sparse.linalg.solve()`, currently it simply uses `scipy.sparse.linalg.splu` and then solve `Ax=b` via `x = Pc @ { U \ [ L \ (Pr@b) ] }`, while `splu` almost runs in a single thread. Please let me know if you has a better idea to do LU decomposition. Try [PyPardiso](https://github.com/haasad/PyPardiso) for general using cases.
 
 ## Limitations
 
