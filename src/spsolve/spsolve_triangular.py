@@ -4,7 +4,7 @@ from numpy import iscomplexobj, ndarray, dtype, float64, complex128
 from scipy.sparse import issparse, isspmatrix_csr, spmatrix, csr_matrix, SparseEfficiencyWarning
 
 from .spparams import _PREFER_ORDER, OMP_NUM_THREADS
-from ._spsolve import spsolve_triangular_C, spsolve_triangular_F # type: ignore
+from ._spsolve import spsolve_triangular as _spsolve_triangular # type: ignore
 
 
 def spsolve_triangular(A: spmatrix, b: ndarray, lower: bool=True, overwrite_b: bool=False, overwrite_A: bool=False, unit_diagonal: bool=False) -> ndarray:
@@ -68,8 +68,6 @@ def spsolve_triangular(A: spmatrix, b: ndarray, lower: bool=True, overwrite_b: b
 
     ans: ndarray = b if overwrite_b else b.copy(order=_PREFER_ORDER) # b.copy(order="A")
 
-    # only use spsolve_triangular_F when b is F Contiguous and overwrite_b is True
-    _spsolve_triangular = spsolve_triangular_C if ans.data.c_contiguous else spsolve_triangular_F
 
     ## Will it run faster by force lower? Introduce an overhead of flip but may be friendlier to the cache...
     # if not lower:

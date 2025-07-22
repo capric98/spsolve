@@ -1,6 +1,5 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
-#include <immintrin.h>
 #include <omp.h>
 #include <stdexcept>
 
