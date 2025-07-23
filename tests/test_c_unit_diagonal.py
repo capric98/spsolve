@@ -6,7 +6,7 @@ from spsolve import spsolve_triangular
 from .spsolve_test_base import allclose, random_A, random_b, reset_rng, __REPEAT__
 
 
-def test_unit_diagonal():
+def test_c_unit_diagonal():
     reset_rng()
     for size in [10, 100, 900]:
         for density in [0.001, 0.01, 0.1, 1]:
