@@ -13,11 +13,11 @@ if __name__ == "__main__":
 
     unit = "ms"
     tscale = 1e3
-    n_ave = 1000
+    n_ave = 100
 
     size = 10000
     nrhs = 1000
-    density = 0.1
+    density = 0.01
 
     np.random.seed(0)
 

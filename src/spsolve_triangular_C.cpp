@@ -23,7 +23,6 @@ namespace nb = nanobind;
  * @param num_threads The number of OpenMP threads to use. If <= 0, it defaults to the maximum
  *        number of available threads.
  */
-// data, indices, indptr, ans, nnz, num_rows, lower, OMP_NUM_THREADS
 void spsolve_triangular_C(
     nb::ndarray<const double,  nb::ndim<1>, nb::c_contig>& data,
     nb::ndarray<const int, nb::ndim<1>, nb::c_contig>& indices,
@@ -41,9 +40,13 @@ void spsolve_triangular_C(
     const auto  num_cols = b.shape(1);
     double*     b_ptr    = b.data();
 
+#ifdef __AVX2__
     auto vec_cols = num_cols / 4 * 4;
     auto residue  = num_cols % 4;
     auto para_max = num_cols / 4 + residue;
+#else
+    auto para_max = num_cols;
+#endif
 
     // volatile bool flag_ill_zero_diag = false;
 
