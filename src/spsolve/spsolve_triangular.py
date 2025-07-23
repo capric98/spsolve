@@ -3,7 +3,7 @@ from warnings import warn
 from numpy import iscomplexobj, ndarray, dtype, float64, complex128
 from scipy.sparse import issparse, isspmatrix_csr, spmatrix, csr_matrix, SparseEfficiencyWarning
 
-from .spparms import get_max_threads, _PREFER_ORDER
+from .spparms import get_max_threads, get_prefer_order
 from .assure_contiguous import assure_contiguous
 from ._spsolve import spsolve_triangular as _spsolve_triangular # type: ignore
 
@@ -20,6 +20,7 @@ def spsolve_triangular(A: spmatrix, b: ndarray, lower: bool=True, overwrite_b: b
     indices: ndarray = assure_contiguous(A.indices) # type: ignore
     indptr:  ndarray = assure_contiguous(A.indptr)  # type: ignore
     nnz:         int = A.size                       # type: ignore
+    _PREFER_ORDER    = get_prefer_order()
 
 
     # sanity check
