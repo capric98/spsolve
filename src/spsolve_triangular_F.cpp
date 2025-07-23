@@ -61,7 +61,6 @@ void spsolve_triangular_F(
 
 
         double *b_i_ptr;
-        __m256d b_i_vec, b_j_vec, val_vec;
 
         if (lower) {
 
