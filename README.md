@@ -58,7 +58,7 @@ A `spsolve.spsolve()` function is available for replacement of `scipy.sparse.lin
 
 ## TODO
 
-- [ ] Add tests.
+- [x] Add tests.
 - [ ] Implement `spsolve_triangular` for `np.complex128`.
 - [ ] Implement `solve` for general `scipy.sparse` matrices.
 
