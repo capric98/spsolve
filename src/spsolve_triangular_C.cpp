@@ -1,8 +1,11 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
-#include <immintrin.h>
 #include <omp.h>
 #include <stdexcept>
+
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 
 namespace nb = nanobind;
 
@@ -64,12 +67,14 @@ void spsolve_triangular_C(
 #endif
     {
 
-
+#ifdef __AVX2__
         double *b_i_ptr;
         __m256d b_i_vec, b_j_vec, val_vec;
+#endif
 
         if (lower) {
 
+#ifdef __AVX2__
             // solve Lx=b using forward substitution
             #pragma omp for schedule(guided) nowait
             for (int col = 0; col < vec_cols; col += 4) {
@@ -96,9 +101,16 @@ void spsolve_triangular_C(
                     _mm256_store_pd(b_i_ptr, b_i_vec);
                 }
             }
+#endif
 
+
+#ifdef __AVX2__
             #pragma omp for schedule(guided) nowait
             for (int col = vec_cols; col < num_cols; ++col) {
+#else
+            #pragma omp for schedule(guided) nowait
+            for (int col = 0; col < num_cols; ++col) {
+#endif
                 // _mm256_maskload_pd, _mm256_masksave_pd are slow...
                 for (int i = 0; i < num_rows; ++i) {
                     const auto& data_lpos = ind_ptr[i];
@@ -126,6 +138,7 @@ void spsolve_triangular_C(
 
         } else {
 
+#ifdef __AVX2__
             // solve Ux=b using backward substitution
             #pragma omp for schedule(guided) nowait
             for (int col = 0; col < vec_cols; col += 4) {
@@ -153,9 +166,15 @@ void spsolve_triangular_C(
                     _mm256_store_pd(b_i_ptr, b_i_vec);
                 }
             }
+#endif
 
+#ifdef __AVX2__
             #pragma omp for schedule(guided) nowait
             for (int col = vec_cols; col < num_cols; ++col) {
+#else
+            #pragma omp for schedule(guided) nowait
+            for (int col = 0; col < num_cols; ++col) {
+#endif
                 // _mm256_maskload_pd, _mm256_masksave_pd are slow...
                 const auto num_rows_1 = num_rows-1;
                 for (int i = num_rows_1; i >= 0; --i) {
@@ -183,7 +202,6 @@ void spsolve_triangular_C(
             }
 
         }
-
 
     } // end of #pragma omp
 

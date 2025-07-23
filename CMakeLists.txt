@@ -24,6 +24,13 @@ execute_process(
 find_package(nanobind CONFIG REQUIRED)
 find_package(OpenMP REQUIRED)
 
+find_package(MKL)
+
+if(MKL_FOUND)
+  message(STATUS "Found MKL!")
+  add_compile_definitions(SP_USE_MKL)
+endif()
+
 
 nanobind_add_module(
   _spsolve
