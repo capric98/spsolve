@@ -3,7 +3,8 @@ from warnings import warn
 from numpy import iscomplexobj, ndarray, dtype, float64, complex128
 from scipy.sparse import issparse, isspmatrix_csr, spmatrix, csr_matrix, SparseEfficiencyWarning
 
-from .spparams import _PREFER_ORDER, OMP_NUM_THREADS
+from .spparms import get_max_threads, _PREFER_ORDER
+from .assure_contiguous import assure_contiguous
 from ._spsolve import spsolve_triangular as _spsolve_triangular # type: ignore
 
 
@@ -15,10 +16,10 @@ def spsolve_triangular(A: spmatrix, b: ndarray, lower: bool=True, overwrite_b: b
     if not A.has_sorted_indices: A.sort_indices() # type: ignore
 
 
-    data:    ndarray = A.data    # type: ignore
-    indices: ndarray = A.indices # type: ignore
-    indptr:  ndarray = A.indptr  # type: ignore
-    nnz:         int = A.size    # type: ignore
+    data:    ndarray = assure_contiguous(A.data)    # type: ignore
+    indices: ndarray = assure_contiguous(A.indices) # type: ignore
+    indptr:  ndarray = assure_contiguous(A.indptr)  # type: ignore
+    nnz:         int = A.size                       # type: ignore
 
 
     # sanity check
@@ -31,7 +32,7 @@ def spsolve_triangular(A: spmatrix, b: ndarray, lower: bool=True, overwrite_b: b
     if overwrite_A: warn("overwrite_A has no effect here", stacklevel=2)
 
 
-    if (not b.data.c_contiguous) and (not b.data.f_contiguous):
+    if not b.data.contiguous:
         b = b.copy(order=_PREFER_ORDER)
         overwrite_b = True
 
@@ -77,7 +78,7 @@ def spsolve_triangular(A: spmatrix, b: ndarray, lower: bool=True, overwrite_b: b
     #     data = flip(data)
 
     # solve Ax=b in place where b is already copied into ans or overwrite_b is True
-    _spsolve_triangular(data, indices, indptr, ans, lower, unit_diagonal, OMP_NUM_THREADS)
+    _spsolve_triangular(data, indices, indptr, ans, lower, unit_diagonal, get_max_threads())
 
 
     if flag_C128_as_F64: ans = ans.view(dtype=b_dtype)
