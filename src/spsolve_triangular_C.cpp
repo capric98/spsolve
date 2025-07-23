@@ -35,22 +35,22 @@ void spsolve_triangular_C(
     const auto* indices_ptr = indices.data();
     const auto* ind_ptr     = indptr.data();
 
-    const auto  nnz      = data.size();
-    const auto  num_rows = indptr.size() - 1;
-    const auto  num_cols = b.shape(1);
-    double*     b_ptr    = b.data();
+    const auto  nnz   = data.size();
+    const auto  M     = indptr.size() - 1; // size of A (M x N where M = N for square matrix)
+    const auto  nrhs  = b.shape(1);
+    double*     b_ptr = b.data();
 
 #ifdef __AVX2__
-    auto vec_cols = num_cols / 4 * 4;
-    auto residue  = num_cols % 4;
-    auto para_max = num_cols / 4 + residue;
+    auto vec_cols = nrhs / 4 * 4;
+    auto residue  = nrhs % 4;
+    auto para_max = nrhs / 4 + residue;
 #else
-    auto para_max = num_cols;
+    auto para_max = nrhs;
 #endif
 
     // volatile bool flag_ill_zero_diag = false;
 
-    // // when num_cols is small, grab more columns and use single column solver, to increase CPU usage
+    // // when nrhs is small, grab more columns and use single column solver, to increase CPU usage
     // while ((para_max < 6) && (vec_cols > 4)) {
     //     residue += 4;
     //     vec_cols -= 4;
@@ -82,18 +82,18 @@ void spsolve_triangular_C(
             #pragma omp for schedule(guided) nowait
             for (int col = 0; col < vec_cols; col += 4) {
                 // use AVX2
-                for (int i = 0; i < num_rows; ++i) {
+                for (int i = 0; i < M; ++i) {
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
                     if ((i != 0) && (data_lpos > data_rpos)) { continue; } // empty row
                     // if (i != indices_ptr[data_rpos]) { flag_ill_zero_diag = true; continue; }
 
-                    b_i_ptr = b_ptr + i * num_cols + col;
+                    b_i_ptr = b_ptr + i * nrhs + col;
                     b_i_vec = _mm256_load_pd(b_i_ptr);
 
                     for (int k = data_lpos; k < data_rpos; ++k) {
                         const auto& j = indices_ptr[k];
-                        b_j_vec = _mm256_load_pd(b_ptr + j * num_cols + col);
+                        b_j_vec = _mm256_load_pd(b_ptr + j * nrhs + col);
                         val_vec = _mm256_set1_pd(data_ptr[k]);
                         b_i_vec = _mm256_sub_pd(b_i_vec, _mm256_mul_pd(val_vec, b_j_vec));
                     }
@@ -109,25 +109,25 @@ void spsolve_triangular_C(
 
 #ifdef __AVX2__
             #pragma omp for schedule(guided) nowait
-            for (int col = vec_cols; col < num_cols; ++col) {
+            for (int col = vec_cols; col < nrhs; ++col) {
 #else
             #pragma omp for schedule(guided) nowait
-            for (int col = 0; col < num_cols; ++col) {
+            for (int col = 0; col < nrhs; ++col) {
 #endif
                 // _mm256_maskload_pd, _mm256_masksave_pd are slow...
-                for (int i = 0; i < num_rows; ++i) {
+                for (int i = 0; i < M; ++i) {
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
                     if ((i != 0) && (data_lpos > data_rpos)) { continue; } // empty row
                     // if (i != indices_ptr[data_rpos]) { flag_ill_zero_diag = true; continue; }
 
-                    const auto& b_i = b_ptr + i * num_cols + col;
+                    const auto& b_i = b_ptr + i * nrhs + col;
                     auto b_i_temp = *(b_i);
 
                     for (int k = data_lpos; k < data_rpos; ++k) {
                         const auto& j = indices_ptr[k];
                         const auto& v = data_ptr[k];
-                        b_i_temp -= v * b_ptr[j * num_cols + col];
+                        b_i_temp -= v * b_ptr[j * nrhs + col];
                     }
 
                     if (!unit_diagonal) {
@@ -146,19 +146,19 @@ void spsolve_triangular_C(
             #pragma omp for schedule(guided) nowait
             for (int col = 0; col < vec_cols; col += 4) {
                 // use AVX2
-                const auto num_rows_1 = num_rows-1;
-                for (int i = num_rows_1; i >= 0; --i) {
+                const auto M_1 = M-1;
+                for (int i = M_1; i >= 0; --i) {
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
-                    if ((i != num_rows_1) && (data_lpos > data_rpos)) { continue; } // empty row
+                    if ((i != M_1) && (data_lpos > data_rpos)) { continue; } // empty row
                     // if (i != indices_ptr[data_lpos]) { flag_ill_zero_diag = true; continue; }
 
-                    b_i_ptr = b_ptr + i * num_cols + col;
+                    b_i_ptr = b_ptr + i * nrhs + col;
                     b_i_vec = _mm256_load_pd(b_i_ptr);
 
                     for (int k = data_rpos; k > data_lpos; --k) {
                         const auto& j = indices_ptr[k];
-                        b_j_vec = _mm256_load_pd(b_ptr + j * num_cols + col);
+                        b_j_vec = _mm256_load_pd(b_ptr + j * nrhs + col);
                         val_vec = _mm256_set1_pd(data_ptr[k]);
                         b_i_vec = _mm256_sub_pd(b_i_vec, _mm256_mul_pd(val_vec, b_j_vec));
                     }
@@ -173,26 +173,26 @@ void spsolve_triangular_C(
 
 #ifdef __AVX2__
             #pragma omp for schedule(guided) nowait
-            for (int col = vec_cols; col < num_cols; ++col) {
+            for (int col = vec_cols; col < nrhs; ++col) {
 #else
             #pragma omp for schedule(guided) nowait
-            for (int col = 0; col < num_cols; ++col) {
+            for (int col = 0; col < nrhs; ++col) {
 #endif
                 // _mm256_maskload_pd, _mm256_masksave_pd are slow...
-                const auto num_rows_1 = num_rows-1;
-                for (int i = num_rows_1; i >= 0; --i) {
+                const auto M_1 = M-1;
+                for (int i = M_1; i >= 0; --i) {
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
-                    if ((i != num_rows_1) && (data_lpos > data_rpos)) { continue; } // empty row
+                    if ((i != M_1) && (data_lpos > data_rpos)) { continue; } // empty row
                     // if (i != indices_ptr[data_lpos]) { flag_ill_zero_diag = true; continue; }
 
-                    const auto& b_i = b_ptr + i * num_cols + col;
+                    const auto& b_i = b_ptr + i * nrhs + col;
                     auto b_i_temp = *(b_i);
 
                     for (int k = data_rpos; k > data_lpos; --k) {
                         const auto& j = indices_ptr[k];
                         const auto& v = data_ptr[k];
-                        b_i_temp -= v * b_ptr[j * num_cols + col];
+                        b_i_temp -= v * b_ptr[j * nrhs + col];
                     }
 
                     if (!unit_diagonal) {

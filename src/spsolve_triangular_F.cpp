@@ -19,7 +19,6 @@ namespace nb = nanobind;
  * @param num_threads The number of OpenMP threads to use. If <= 0, it defaults to the maximum
  *        number of available threads.
  */
-// data, indices, indptr, ans, nnz, num_rows, lower, OMP_NUM_THREADS
 void spsolve_triangular_F(
     nb::ndarray<const double,  nb::ndim<1>, nb::c_contig>& data,
     nb::ndarray<const int, nb::ndim<1>, nb::c_contig>& indices,
@@ -32,14 +31,14 @@ void spsolve_triangular_F(
     const auto* indices_ptr = indices.data();
     const auto* ind_ptr     = indptr.data();
 
-    const auto  nnz      = data.size();
-    const auto  num_rows = indptr.size() - 1;
-    const auto  num_cols = b.shape(1);
-    double*     b_ptr    = b.data();
+    const auto  nnz   = data.size();
+    const auto  M     = indptr.size() - 1; // size of A (M x N where M = N for square matrix)
+    const auto  nrhs  = b.shape(1);
+    double*     b_ptr = b.data();
 
     // volatile bool flag_ill_zero_diag = false;
 
-    // // when num_cols is small, grab more columns and use single column solver, to increase CPU usage
+    // // when nrhs is small, grab more columns and use single column solver, to increase CPU usage
     // while ((para_max < 6) && (vec_cols > 4)) {
     //     residue += 4;
     //     vec_cols -= 4;
@@ -49,7 +48,7 @@ void spsolve_triangular_F(
     if (num_threads <= 0) {
         num_threads = omp_get_max_threads();
     }
-    num_threads = (num_threads<num_cols) ? num_threads : num_cols;
+    num_threads = (num_threads<nrhs) ? num_threads : nrhs;
 
 
 #if defined(_OPENMP) && _OPENMP >= 201503
@@ -66,10 +65,10 @@ void spsolve_triangular_F(
 
             // solve Lx=b using forward substitution
             #pragma omp for schedule(guided) nowait
-            for (int col = 0; col < num_cols; ++col) {
-                const auto& b_col_ptr = b_ptr + col * num_rows;
+            for (int col = 0; col < nrhs; ++col) {
+                const auto& b_col_ptr = b_ptr + col * M;
                 // _mm256_maskload_pd, _mm256_masksave_pd are slow...
-                for (int i = 0; i < num_rows; ++i) {
+                for (int i = 0; i < M; ++i) {
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
                     if ((i != 0) && (data_lpos > data_rpos)) { continue; } // empty row
@@ -97,14 +96,14 @@ void spsolve_triangular_F(
 
             // solve Ux=b using backward substitution
             #pragma omp for schedule(guided) nowait
-            for (int col = 0; col < num_cols; ++col) {
+            for (int col = 0; col < nrhs; ++col) {
                 // _mm256_maskload_pd, _mm256_masksave_pd are slow...
-                const auto& num_rows_1 = num_rows-1;
-                const auto& b_col_ptr = b_ptr + col * num_rows;
-                for (int i = num_rows_1; i >= 0; --i) {
+                const auto& M_1 = M-1;
+                const auto& b_col_ptr = b_ptr + col * M;
+                for (int i = M_1; i >= 0; --i) {
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
-                    if ((i != num_rows_1) && (data_lpos > data_rpos)) { continue; } // empty row
+                    if ((i != M_1) && (data_lpos > data_rpos)) { continue; } // empty row
                     // if (i != indices_ptr[data_lpos]) { flag_ill_zero_diag = true; continue; }
 
                     const auto& b_i = b_col_ptr + i;
