@@ -19,7 +19,7 @@ if __name__ == "__main__":
 
     # A: size * size (sparse)
     # b: size * nrhs
-    A = scipy.sparse.csc_matrix(scipy.sparse.spdiags(5+np.random.rand(size), 0, size, size) + scipy.sparse.random(size, size, density))
+    A = scipy.sparse.csc_array(scipy.sparse.spdiags(5+np.random.rand(size), 0, size, size) + scipy.sparse.random(size, size, density))
     x = np.random.randn(size, nrhs) #+ 1j*np.random.randn(size, nrhs)
     b = A @ x
 

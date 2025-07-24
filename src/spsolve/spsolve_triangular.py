@@ -1,18 +1,18 @@
 from warnings import warn
 
 from numpy import iscomplexobj, ndarray, dtype, float64, complex128
-from scipy.sparse import issparse, isspmatrix_csr, spmatrix, csr_matrix, SparseEfficiencyWarning
+from scipy.sparse import issparse, sparray, csr_array, SparseEfficiencyWarning
 
 from .spparms import get_max_threads, get_prefer_order
 from .assure_contiguous import assure_contiguous
 from ._spsolve import spsolve_triangular as _spsolve_triangular # type: ignore
 
 
-def spsolve_triangular(A: spmatrix, b: ndarray, lower: bool=True, overwrite_b: bool=False, overwrite_A: bool=False, unit_diagonal: bool=False) -> ndarray:
-    if not issparse(A): raise ValueError(f"expect a scipy sparse matrix but got '{type(A)}'")
-    if not isspmatrix_csr(A):
-        warn("CSR matrix format is required. Converting to CSR matrix.", SparseEfficiencyWarning, stacklevel=2)
-        A = csr_matrix(A)
+def spsolve_triangular(A: sparray, b: ndarray, lower: bool=True, overwrite_b: bool=False, overwrite_A: bool=False, unit_diagonal: bool=False) -> ndarray:
+    if not issparse(A): raise ValueError(f"expect a scipy sparse array but got '{type(A)}'")
+    if A.format != "csr": # type: ignore
+        warn("CSR array format is required. Converting to CSR array.", SparseEfficiencyWarning, stacklevel=2)
+        A = csr_array(A)
     if not A.has_sorted_indices: A.sort_indices() # type: ignore
 
 

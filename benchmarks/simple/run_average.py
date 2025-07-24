@@ -27,7 +27,7 @@ if __name__ == "__main__":
         print(f"==========lower={lower}==========")
         # A: size * size (sparse)
         # b: size * nrhs
-        A = scipy.sparse.csr_matrix(scipy.sparse.tril(LUA) if lower else scipy.sparse.triu(LUA))
+        A = scipy.sparse.csr_array(scipy.sparse.tril(LUA) if lower else scipy.sparse.triu(LUA))
         x = np.random.randn(size, nrhs) #+ 1j*np.random.randn(size, nrhs)
         b = A @ x
 

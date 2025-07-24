@@ -1,8 +1,8 @@
 from numpy import ndarray
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_array
 from scipy.sparse._sparsetools import csr_matvecs
 
-def _matmul_csr(A: csr_matrix, b: ndarray, ans: ndarray):
+def _matmul_csr(A: csr_array, b: ndarray, ans: ndarray):
     M, N = A._shape_as_2d # type: ignore
     nrhs = b.shape[-1]
 

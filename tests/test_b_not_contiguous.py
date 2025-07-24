@@ -15,7 +15,7 @@ def test_b_not_contiguous_c():
 
     for _ in range(__REPEAT__):
         for lower in [True, False]:
-            A: sparse.csr_matrix = random_A(size, density, lower) # type: ignore
+            A: sparse.csr_array = random_A(size, density, lower) # type: ignore
             x = random_b(size, factor*nrhs)
             b = A @ x
             x = x[:, nrhs:(2*nrhs)]
@@ -41,7 +41,7 @@ def test_b_not_contiguous_f():
 
     for _ in range(__REPEAT__):
         for lower in [True, False]:
-            A: sparse.csr_matrix = random_A(size, density, lower) # type: ignore
+            A: sparse.csr_array = random_A(size, density, lower) # type: ignore
             x = random_b(factor*size, nrhs).copy(order="F")
             b = empty(x.shape, order="F")
 

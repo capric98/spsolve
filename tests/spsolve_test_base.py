@@ -10,12 +10,12 @@ def reset_rng():
     np.random.seed(0)
 
 
-def random_A(size, density: float = 0.01, lower: bool=True, sp_type: str="csr") -> scipy.sparse.spmatrix:
+def random_A(size, density: float = 0.01, lower: bool=True, sp_type: str="csr") -> scipy.sparse.sparray:
     # diagonal dominant
     A = scipy.sparse.spdiags(5+np.random.rand(size), 0, size, size) + scipy.sparse.random(size, size, density)
 
     A = scipy.sparse.tril(A) if lower else scipy.sparse.triu(A)
-    A = scipy.sparse.csr_matrix(A) if sp_type=="csr" else scipy.sparse.csc_matrix(A)
+    A = scipy.sparse.csr_array(A) if sp_type=="csr" else scipy.sparse.csc_array(A)
 
     return A
 

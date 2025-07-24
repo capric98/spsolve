@@ -14,7 +14,7 @@ def test_f_unit_diagonal():
                 for nrhs in [1, 2, 3, 4, 6, 8, 32, 100]:
                     for _ in range(__REPEAT__):
                         print(f"testing size={size}, density={density}, lower={lower}, nrhs={nrhs}", end="...")
-                        A: scipy.sparse.csr_matrix = random_A(size, density, lower) # type: ignore
+                        A: scipy.sparse.csr_array = random_A(size, density, lower) # type: ignore
                         A.data = A.data / size # make sure it's still diagonal dominant
 
                         for k in A.indptr:

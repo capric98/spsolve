@@ -14,7 +14,7 @@ def test_A_not_contiguous():
 
     for _ in range(__REPEAT__):
         for lower in [True, False]:
-            A: sparse.csr_matrix = random_A(size, density, lower) # type: ignore
+            A: sparse.csr_array = random_A(size, density, lower) # type: ignore
             x = random_b(size, nrhs)
 
             big_data = random_b(A.data.size, factor)

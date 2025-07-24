@@ -15,13 +15,13 @@ pip install -U git+https://github.com/capric98/spsolve
 
 And then replace `scipy.sparse.linalg.solve_triangular()` to `spsolve.solve_triangular()` in your code.
 
-A `spsolve.spsolve()` function is available for replacement of `scipy.sparse.linalg.solve()`, currently it simply uses `scipy.sparse.linalg.splu` and then solve `Ax=b` via `x = Pc @ { U \ [ L \ (Pr@b) ] }`, while `splu` almost runs in a single thread. Please let me know if you has a better idea to do LU decomposition. Try [PyPardiso](https://github.com/haasad/PyPardiso) for general using cases.
+A `spsolve.spsolve()` function is available for replacement of `scipy.sparse.linalg.solve()`, currently it simply uses `scipy.sparse.linalg.splu` and then solve `Ax=b` via `x = Pc @ { U \ [ L \ (Pr@b) ] }`, while `splu` almost runs in a single thread. Please let me know if you has a better idea to do LU decomposition. Try [PyPardiso](https://github.com/haasad/PyPardiso), [SLEPc](https://slepc.upv.es/), [Trilinos](https://github.com/trilinos/Trilinos), etc., for general using cases.
 
 ## Limitations
 
 1. Currently **only** support CPUs with AVX2 instructions.
 
-2. Native support only for `scipy.sparse.csr_matrix`, other sparse matrix will be converted to CSR format.
+2. Native support only for `scipy.sparse.csr_array`, other sparse array will be converted to CSR format.
 
 3. Slight performance degradation when $n_\text{RHS}$  is not fourfold.
 
@@ -37,8 +37,6 @@ A `spsolve.spsolve()` function is available for replacement of `scipy.sparse.lin
    | dtype | `np.complex128` |      |  `np.complex128`  |      |  `np.complex128`  | ❌ Will support later.                                        |
 
    All other data types will be cast to `np.float64` or `np.complex128`. For experts who benefit from low precision or require higher precision, it should be easy to modify this project.
-
-6. The project uses LP64 Interface, if you have very big matrices with indices exceed `int32`, maybe you should consider something else like [SLEPc](https://slepc.upv.es/), [Trilinos](https://github.com/trilinos/Trilinos), etc.
 
 ## Performance
 * Environment:
