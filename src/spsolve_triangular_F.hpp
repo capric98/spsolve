@@ -19,10 +19,11 @@ namespace nb = nanobind;
  * @param num_threads The number of OpenMP threads to use. If <= 0, it defaults to the maximum
  *        number of available threads.
  */
+template <typename INT>
 void spsolve_triangular_F(
     nb::ndarray<const double,  nb::ndim<1>, nb::c_contig>& data,
-    nb::ndarray<const int, nb::ndim<1>, nb::c_contig>& indices,
-    nb::ndarray<const int, nb::ndim<1>, nb::c_contig>& indptr,
+    nb::ndarray<const INT, nb::ndim<1>, nb::c_contig>& indices,
+    nb::ndarray<const INT, nb::ndim<1>, nb::c_contig>& indptr,
     nb::ndarray<double, nb::ndim<2>, nb::f_contig>& b,
     bool lower, bool unit_diagonal, int num_threads
 ) {
@@ -65,10 +66,10 @@ void spsolve_triangular_F(
 
             // solve Lx=b using forward substitution
             #pragma omp for schedule(guided) nowait
-            for (int col = 0; col < nrhs; ++col) {
+            for (INT col = 0; col < nrhs; ++col) {
                 const auto& b_col_ptr = b_ptr + col * M;
                 // _mm256_maskload_pd, _mm256_masksave_pd are slow...
-                for (int i = 0; i < M; ++i) {
+                for (INT i = 0; i < M; ++i) {
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
                     if ((i != 0) && (data_lpos > data_rpos)) { continue; } // empty row
@@ -77,7 +78,7 @@ void spsolve_triangular_F(
                     const auto& b_i = b_col_ptr + i;
                     auto b_i_temp = *(b_i);
 
-                    for (int k = data_lpos; k < data_rpos; ++k) {
+                    for (INT k = data_lpos; k < data_rpos; ++k) {
                         const auto& j = indices_ptr[k];
                         const auto& v = data_ptr[k];
                         b_i_temp -= v * b_col_ptr[j];
@@ -96,11 +97,11 @@ void spsolve_triangular_F(
 
             // solve Ux=b using backward substitution
             #pragma omp for schedule(guided) nowait
-            for (int col = 0; col < nrhs; ++col) {
+            for (INT col = 0; col < nrhs; ++col) {
                 // _mm256_maskload_pd, _mm256_masksave_pd are slow...
                 const auto& M_1 = M-1;
                 const auto& b_col_ptr = b_ptr + col * M;
-                for (int i = M_1; i >= 0; --i) {
+                for (INT i = M_1; i >= 0; --i) {
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
                     if ((i != M_1) && (data_lpos > data_rpos)) { continue; } // empty row
@@ -109,7 +110,7 @@ void spsolve_triangular_F(
                     const auto& b_i = b_col_ptr + i;
                     auto b_i_temp = *(b_i);
 
-                    for (int k = data_rpos; k > data_lpos; --k) {
+                    for (INT k = data_rpos; k > data_lpos; --k) {
                         const auto& j = indices_ptr[k];
                         const auto& v = data_ptr[k];
                         b_i_temp -= v * b_col_ptr[j];

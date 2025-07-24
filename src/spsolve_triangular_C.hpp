@@ -14,19 +14,20 @@ namespace nb = nanobind;
  *   This function is a C++/nanobind implementation of a sparse triangular solve,
  *   optimized with OpenMP for multi-threading and AVX2 for vectorization. It operates
  *   directly on NumPy arrays provided from Python.
- * @param rows NumPy array of row indices for the sparse matrix (COO format).
- * @param cols NumPy array of column indices for the sparse matrix (COO format).
- * @param vals NumPy array of non-zero values for the sparse matrix (COO format).
+ * @param rows NumPy array of row indices for the sparse matrix (COO format). // TODO: fix
+ * @param cols NumPy array of column indices for the sparse matrix (COO format). // TODO: fix
+ * @param vals NumPy array of non-zero values for the sparse matrix (COO format). // TODO: fix
  * @param b The right-hand side matrix, which will be modified in-place to store the solution.
  * @param nnz The number of non-zero elements in the sparse matrix.
  * @param lower If true, performs forward substitution. If false, performs backward substitution.
  * @param num_threads The number of OpenMP threads to use. If <= 0, it defaults to the maximum
  *        number of available threads.
  */
+template <typename INT>
 void spsolve_triangular_C(
     nb::ndarray<const double,  nb::ndim<1>, nb::c_contig>& data,
-    nb::ndarray<const int, nb::ndim<1>, nb::c_contig>& indices,
-    nb::ndarray<const int, nb::ndim<1>, nb::c_contig>& indptr,
+    nb::ndarray<const INT, nb::ndim<1>, nb::c_contig>& indices,
+    nb::ndarray<const INT, nb::ndim<1>, nb::c_contig>& indptr,
     nb::ndarray<double, nb::ndim<2>, nb::c_contig>& b,
     bool lower, bool unit_diagonal, int num_threads
 ) {
@@ -80,9 +81,9 @@ void spsolve_triangular_C(
 #ifdef __AVX2__
             // solve Lx=b using forward substitution
             #pragma omp for schedule(guided) nowait
-            for (int col = 0; col < vec_cols; col += 4) {
+            for (INT col = 0; col < vec_cols; col += 4) {
                 // use AVX2
-                for (int i = 0; i < M; ++i) {
+                for (INT i = 0; i < M; ++i) {
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
                     if ((i != 0) && (data_lpos > data_rpos)) { continue; } // empty row
@@ -91,7 +92,7 @@ void spsolve_triangular_C(
                     b_i_ptr = b_ptr + i * nrhs + col;
                     b_i_vec = _mm256_load_pd(b_i_ptr);
 
-                    for (int k = data_lpos; k < data_rpos; ++k) {
+                    for (INT k = data_lpos; k < data_rpos; ++k) {
                         const auto& j = indices_ptr[k];
                         b_j_vec = _mm256_load_pd(b_ptr + j * nrhs + col);
                         val_vec = _mm256_set1_pd(data_ptr[k]);
@@ -109,13 +110,13 @@ void spsolve_triangular_C(
 
 #ifdef __AVX2__
             #pragma omp for schedule(guided) nowait
-            for (int col = vec_cols; col < nrhs; ++col) {
+            for (INT col = vec_cols; col < nrhs; ++col) {
 #else
             #pragma omp for schedule(guided) nowait
-            for (int col = 0; col < nrhs; ++col) {
+            for (INT col = 0; col < nrhs; ++col) {
 #endif
                 // _mm256_maskload_pd, _mm256_masksave_pd are slow...
-                for (int i = 0; i < M; ++i) {
+                for (INT i = 0; i < M; ++i) {
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
                     if ((i != 0) && (data_lpos > data_rpos)) { continue; } // empty row
@@ -124,7 +125,7 @@ void spsolve_triangular_C(
                     const auto& b_i = b_ptr + i * nrhs + col;
                     auto b_i_temp = *(b_i);
 
-                    for (int k = data_lpos; k < data_rpos; ++k) {
+                    for (INT k = data_lpos; k < data_rpos; ++k) {
                         const auto& j = indices_ptr[k];
                         const auto& v = data_ptr[k];
                         b_i_temp -= v * b_ptr[j * nrhs + col];
@@ -144,10 +145,10 @@ void spsolve_triangular_C(
 #ifdef __AVX2__
             // solve Ux=b using backward substitution
             #pragma omp for schedule(guided) nowait
-            for (int col = 0; col < vec_cols; col += 4) {
+            for (INT col = 0; col < vec_cols; col += 4) {
                 // use AVX2
                 const auto M_1 = M-1;
-                for (int i = M_1; i >= 0; --i) {
+                for (INT i = M_1; i >= 0; --i) {
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
                     if ((i != M_1) && (data_lpos > data_rpos)) { continue; } // empty row
@@ -156,7 +157,7 @@ void spsolve_triangular_C(
                     b_i_ptr = b_ptr + i * nrhs + col;
                     b_i_vec = _mm256_load_pd(b_i_ptr);
 
-                    for (int k = data_rpos; k > data_lpos; --k) {
+                    for (INT k = data_rpos; k > data_lpos; --k) {
                         const auto& j = indices_ptr[k];
                         b_j_vec = _mm256_load_pd(b_ptr + j * nrhs + col);
                         val_vec = _mm256_set1_pd(data_ptr[k]);
@@ -173,14 +174,14 @@ void spsolve_triangular_C(
 
 #ifdef __AVX2__
             #pragma omp for schedule(guided) nowait
-            for (int col = vec_cols; col < nrhs; ++col) {
+            for (INT col = vec_cols; col < nrhs; ++col) {
 #else
             #pragma omp for schedule(guided) nowait
-            for (int col = 0; col < nrhs; ++col) {
+            for (INT col = 0; col < nrhs; ++col) {
 #endif
                 // _mm256_maskload_pd, _mm256_masksave_pd are slow...
                 const auto M_1 = M-1;
-                for (int i = M_1; i >= 0; --i) {
+                for (INT i = M_1; i >= 0; --i) {
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
                     if ((i != M_1) && (data_lpos > data_rpos)) { continue; } // empty row
@@ -189,7 +190,7 @@ void spsolve_triangular_C(
                     const auto& b_i = b_ptr + i * nrhs + col;
                     auto b_i_temp = *(b_i);
 
-                    for (int k = data_rpos; k > data_lpos; --k) {
+                    for (INT k = data_rpos; k > data_lpos; --k) {
                         const auto& j = indices_ptr[k];
                         const auto& v = data_ptr[k];
                         b_i_temp -= v * b_ptr[j * nrhs + col];
