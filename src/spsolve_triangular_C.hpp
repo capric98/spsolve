@@ -14,13 +14,13 @@ namespace nb = nanobind;
  *   This function is a C++/nanobind implementation of a sparse triangular solve,
  *   optimized with OpenMP for multi-threading and AVX2 for vectorization. It operates
  *   directly on NumPy arrays provided from Python.
- * @param rows NumPy array of row indices for the sparse matrix (COO format). // TODO: fix
- * @param cols NumPy array of column indices for the sparse matrix (COO format). // TODO: fix
- * @param vals NumPy array of non-zero values for the sparse matrix (COO format). // TODO: fix
- * @param b The right-hand side matrix, which will be modified in-place to store the solution.
- * @param nnz The number of non-zero elements in the sparse matrix.
- * @param lower If true, performs forward substitution. If false, performs backward substitution.
- * @param num_threads The number of OpenMP threads to use. If <= 0, it defaults to the maximum
+ * @param data:    NumPy array of non-zero values in the sparse array  (CSR format).
+ * @param indices: NumPy array of column indices for the sparse array  (CSR format).
+ * @param indptr:  NumPy array of index pointer array for the sparse array (CSR format).
+ * @param b: The right-hand side array, which will be modified in-place to store the solution.
+ * @param nnz: The number of non-zero elements in the sparse array .
+ * @param lower: If true, performs forward substitution. If false, performs backward substitution.
+ * @param num_threads: The number of OpenMP threads to use. If <= 0, it defaults to the maximum
  *        number of available threads.
  */
 template <typename INT>
