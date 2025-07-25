@@ -25,7 +25,7 @@ namespace nb = nanobind;
  */
 template <typename INT>
 void spsolve_triangular_C(
-    nb::ndarray<const double,  nb::ndim<1>, nb::c_contig>& data,
+    nb::ndarray<const double, nb::ndim<1>, nb::c_contig>& data,
     nb::ndarray<const INT, nb::ndim<1>, nb::c_contig>& indices,
     nb::ndarray<const INT, nb::ndim<1>, nb::c_contig>& indptr,
     nb::ndarray<double, nb::ndim<2>, nb::c_contig>& b,
@@ -71,10 +71,6 @@ void spsolve_triangular_C(
 #endif
     {
 
-#ifdef __AVX2__
-        double *b_i_ptr;
-        __m256d b_i_vec, b_j_vec, val_vec;
-#endif
 
         if (lower) {
 
@@ -83,6 +79,8 @@ void spsolve_triangular_C(
             #pragma omp for schedule(guided) nowait
             for (INT col = 0; col < vec_cols; col += 4) {
                 // use AVX2
+                double *b_i_ptr;
+                __m256d b_i_vec, b_j_vec, val_vec;
                 for (INT i = 0; i < M; ++i) {
                     const auto& data_lpos = ind_ptr[i];
                     const auto& data_rpos = ind_ptr[i+1] - 1;
@@ -147,6 +145,8 @@ void spsolve_triangular_C(
             #pragma omp for schedule(guided) nowait
             for (INT col = 0; col < vec_cols; col += 4) {
                 // use AVX2
+                double *b_i_ptr;
+                __m256d b_i_vec, b_j_vec, val_vec;
                 const auto M_1 = M-1;
                 for (INT i = M_1; i >= 0; --i) {
                     const auto& data_lpos = ind_ptr[i];

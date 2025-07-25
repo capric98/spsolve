@@ -21,7 +21,7 @@ namespace nb = nanobind;
  */
 template <typename INT>
 void spsolve_triangular_F(
-    nb::ndarray<const double,  nb::ndim<1>, nb::c_contig>& data,
+    nb::ndarray<const double, nb::ndim<1>, nb::c_contig>& data,
     nb::ndarray<const INT, nb::ndim<1>, nb::c_contig>& indices,
     nb::ndarray<const INT, nb::ndim<1>, nb::c_contig>& indptr,
     nb::ndarray<double, nb::ndim<2>, nb::f_contig>& b,
