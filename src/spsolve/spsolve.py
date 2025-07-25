@@ -6,9 +6,17 @@ from scipy.sparse.linalg import spbandwidth, is_sptriangular, splu, SuperLU
 
 from .matmul import _matmul_csr
 from .spsolve_triangular import spsolve_triangular
+from .spsolve_pardiso import solve
+
+from ._spsolve import is_built_with_mkl # type: ignore
 
 
-def spsolve(A: sparray, b: ndarray, overwrite_b: bool=False, permc_spec: str="COLAMD", use_umfpack: bool=True) -> ndarray:
+
+def spsolve(A: sparray, b: ndarray, overwrite_b: bool=False, permc_spec: str="COLAMD", **kwargs) -> ndarray:
+
+    if is_built_with_mkl():
+        return solve(A, b, **kwargs)
+
     warn("experimental spsolve, for general usage try pypardiso", SparseEfficiencyWarning, stacklevel=2)
 
     # sanity check

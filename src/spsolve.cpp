@@ -3,6 +3,12 @@
 #include <spsolve_triangular_C.hpp>
 #include <spsolve_triangular_F.hpp>
 
+#ifdef SP_USE_MKL
+#include <mkl.h>
+#include <spsolve_pardiso.hpp>
+#include <complex>
+#endif
+
 namespace nb = nanobind;
 
 
@@ -87,4 +93,33 @@ NB_MODULE(_spsolve, m) {
         "    lower (bool): If True, perform forward substitution. Otherwise, backward.\n"
         "    num_threads (int): Number of OpenMP threads to use. Defaults to max available."
     );
+
+
+#ifdef SP_USE_MKL
+
+    m.def("spsolve_pardiso", &spsolve_pardiso<double, double>,
+        nb::arg("data"), nb::arg("indices"), nb::arg("indptr"), nb::arg("b"), nb::arg("x"),
+        nb::arg("iparm"), nb::arg("M"), nb::arg("N"), nb::arg("nrhs"), nb::arg("mtype"),
+        nb::arg("num_threads") = 0
+    );
+    m.def("spsolve_pardiso", &spsolve_pardiso<double, std::complex<double>>,
+        nb::arg("data"), nb::arg("indices"), nb::arg("indptr"), nb::arg("b"), nb::arg("x"),
+        nb::arg("iparm"), nb::arg("M"), nb::arg("N"), nb::arg("nrhs"), nb::arg("mtype"),
+        nb::arg("num_threads") = 0
+    );
+    m.def("spsolve_pardiso", &spsolve_pardiso<std::complex<double>, double>,
+        nb::arg("data"), nb::arg("indices"), nb::arg("indptr"), nb::arg("b"), nb::arg("x"),
+        nb::arg("iparm"), nb::arg("M"), nb::arg("N"), nb::arg("nrhs"), nb::arg("mtype"),
+        nb::arg("num_threads") = 0
+    );
+    m.def("spsolve_pardiso", &spsolve_pardiso<std::complex<double>, std::complex<double>>,
+        nb::arg("data"), nb::arg("indices"), nb::arg("indptr"), nb::arg("b"), nb::arg("x"),
+        nb::arg("iparm"), nb::arg("M"), nb::arg("N"), nb::arg("nrhs"), nb::arg("mtype"),
+        nb::arg("num_threads") = 0
+    );
+
+#endif
+
+    m.def("is_built_with_mkl", &is_built_with_mkl);
+
 }

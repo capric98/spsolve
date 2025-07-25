@@ -1,8 +1,8 @@
-cmake_minimum_required(VERSION 3.18)
+cmake_minimum_required(VERSION 3.21)
 
 
 project(_spsolve LANGUAGES CXX)
-
+option(SP_USE_MKL "Enable to build with MKL support" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(DEV_MODULE Development.Module)
@@ -24,21 +24,19 @@ execute_process(
 find_package(nanobind CONFIG REQUIRED)
 find_package(OpenMP REQUIRED)
 
-find_package(MKL)
 
-if(MKL_FOUND)
-  message(STATUS "Found MKL!")
-  add_compile_definitions(SP_USE_MKL)
-endif()
-
+set(SPSOLVE_SOURCES
+  src/spsolve.cpp
+  src/spsolve_triangular_C.hpp
+  src/spsolve_triangular_F.hpp
+  src/spsolve_pardiso.hpp
+)
 
 nanobind_add_module(
   _spsolve
   STABLE_ABI
   NB_STATIC
-  src/spsolve.cpp
-  src/spsolve_triangular_C.hpp
-  src/spsolve_triangular_F.hpp
+  ${SPSOLVE_SOURCES}
 )
 
 target_include_directories(_spsolve PRIVATE src)
@@ -86,4 +84,37 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Intel")
 endif()
 
 target_link_libraries(_spsolve PRIVATE OpenMP::OpenMP_CXX)
+
+
+if(SP_USE_MKL)
+  set(MKL_INTERFACE_FULL "intel_lp64")
+  find_package(MKL CONFIG REQUIRED)
+  if(MKL_FOUND)
+    message(STATUS "Found MKL with: ${MKL_IMPORTED_TARGETS}")
+    add_compile_definitions(SP_USE_MKL)
+  else()
+    message(WARNFATAL_ERROR "MKL not found!")
+  endif()
+
+  # target_link_libraries(_spsolve PRIVATE MKL::MKL)
+  target_compile_options(_spsolve PRIVATE $<TARGET_PROPERTY:MKL::MKL,INTERFACE_COMPILE_OPTIONS>)
+  target_include_directories(_spsolve PRIVATE $<TARGET_PROPERTY:MKL::MKL,INTERFACE_INCLUDE_DIRECTORIES>)
+  target_link_libraries(_spsolve PRIVATE $<LINK_ONLY:MKL::MKL>)
+  install(FILES "$<TARGET_RUNTIME_DLLS:_spsolve>" DESTINATION spsolve)
+
+  if(WIN32)
+    set(MKL_HINTS
+      "${MKLROOT}"
+      "${ONEAPI_ROOT}/mkl/latest"
+    )
+    find_file(IOMP5_LIB NAMES libiomp5md.dll HINTS ${MKL_HINTS} DOC "Intel OpenMP Compatibility Library")
+    message(STATUS "Found OpenMP runtime: ${IOMP5_LIB}")
+    if(IOMP5_LIB)
+      install(FILES ${IOMP5_LIB} DESTINATION spsolve)
+    endif()
+  endif()
+
+endif()
+
+
 install(TARGETS _spsolve LIBRARY DESTINATION spsolve)
