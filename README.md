@@ -17,6 +17,12 @@ And then replace `scipy.sparse.linalg.solve_triangular()` to `spsolve.solve_tria
 
 A `spsolve.spsolve()` function is available for replacement of `scipy.sparse.linalg.solve()`, currently it simply uses `scipy.sparse.linalg.splu` and then solve `Ax=b` via `x = Pc @ { U \ [ L \ (Pr@b) ] }`, while `splu` almost runs in a single thread. Please let me know if you has a better idea to do LU decomposition. Try [PyPardiso](https://github.com/haasad/PyPardiso), [SLEPc](https://slepc.upv.es/), [Trilinos](https://github.com/trilinos/Trilinos), etc., for general using cases.
 
+An experimental Intel MKL PARDISO based `spsolve()` can be used if user has Intel MKL installed before hand, and build the project with explicitly flag set:
+
+```
+pip install -U git+https://github.com/capric98/spsolve --config-setting=cmake.args="-DSP_USE_MKL=ON"
+```
+
 ## Limitations
 
 1. Currently **only** support CPUs with AVX2 instructions.
@@ -46,9 +52,9 @@ A `spsolve.spsolve()` function is available for replacement of `scipy.sparse.lin
 
 * Comparison between SciPy, MATLAB and spsolve:
 
-  * $\mathbf{A}$: $10000\times10000$ sparse matrix with density of $10\%$, non-zero main diagonal dominant
+  * $\mathbf{A}$: $10000\times10000$ sparse array with density of 10%, non-zero main diagonal dominant, then use `scipy.sparse.(tril|triu)` to get a triangular sparse array, stored in CSR format
 
-  * $\mathbf{b}$: $10000\times n_\text{RHS}$ dense matrix
+  * $\mathbf{b}$: $10000\times n_\text{RHS}$ dense `np.ndarray`
 
   * Each function runs 1000 times and uses the averaged time of single solve.
 
