@@ -1,13 +1,3 @@
-
-bool is_built_with_mkl() {
-#ifdef SP_USE_MKL
-    return true;
-#else
-    return false;
-#endif
-}
-
-
 #ifdef SP_USE_MKL
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>

@@ -12,6 +12,15 @@
 namespace nb = nanobind;
 
 
+bool is_built_with_mkl() {
+#ifdef SP_USE_MKL
+    return true;
+#else
+    return false;
+#endif
+}
+
+
 // --- Nanobind Module Definition ---
 // This macro creates the entry point for the Python module.
 NB_MODULE(_spsolve, m) {
