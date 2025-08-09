@@ -88,11 +88,11 @@ void spsolve_triangular_C(
                     // if (i != indices_ptr[data_rpos]) { flag_ill_zero_diag = true; continue; }
 
                     b_i_ptr = b_ptr + i * nrhs + col;
-                    b_i_vec = _mm256_load_pd(b_i_ptr);
+                    b_i_vec = _mm256_loadu_pd(b_i_ptr);
 
                     for (INT k = data_lpos; k < data_rpos; ++k) {
                         const auto& j = indices_ptr[k];
-                        b_j_vec = _mm256_load_pd(b_ptr + j * nrhs + col);
+                        b_j_vec = _mm256_loadu_pd(b_ptr + j * nrhs + col);
                         val_vec = _mm256_set1_pd(data_ptr[k]);
                         b_i_vec = _mm256_sub_pd(b_i_vec, _mm256_mul_pd(val_vec, b_j_vec));
                     }
@@ -100,7 +100,7 @@ void spsolve_triangular_C(
                     if (!unit_diagonal) {
                         b_i_vec = _mm256_div_pd(b_i_vec, _mm256_set1_pd(data_ptr[data_rpos]));
                     }
-                    _mm256_store_pd(b_i_ptr, b_i_vec);
+                    _mm256_storeu_pd(b_i_ptr, b_i_vec);
                 }
             }
 #endif
@@ -155,11 +155,11 @@ void spsolve_triangular_C(
                     // if (i != indices_ptr[data_lpos]) { flag_ill_zero_diag = true; continue; }
 
                     b_i_ptr = b_ptr + i * nrhs + col;
-                    b_i_vec = _mm256_load_pd(b_i_ptr);
+                    b_i_vec = _mm256_loadu_pd(b_i_ptr);
 
                     for (INT k = data_rpos; k > data_lpos; --k) {
                         const auto& j = indices_ptr[k];
-                        b_j_vec = _mm256_load_pd(b_ptr + j * nrhs + col);
+                        b_j_vec = _mm256_loadu_pd(b_ptr + j * nrhs + col);
                         val_vec = _mm256_set1_pd(data_ptr[k]);
                         b_i_vec = _mm256_sub_pd(b_i_vec, _mm256_mul_pd(val_vec, b_j_vec));
                     }
@@ -167,7 +167,7 @@ void spsolve_triangular_C(
                     if (!unit_diagonal) {
                         b_i_vec = _mm256_div_pd(b_i_vec, _mm256_set1_pd(data_ptr[data_lpos]));
                     }
-                    _mm256_store_pd(b_i_ptr, b_i_vec);
+                    _mm256_storeu_pd(b_i_ptr, b_i_vec);
                 }
             }
 #endif
