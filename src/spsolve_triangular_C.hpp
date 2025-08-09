@@ -2,6 +2,7 @@
 #include <nanobind/ndarray.h>
 #include <omp.h>
 #include <stdexcept>
+#include <tuple>
 
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -23,13 +24,13 @@ namespace nb = nanobind;
  * @param num_threads: The number of OpenMP threads to use. If <= 0, it defaults to the maximum
  *        number of available threads.
  */
-template <typename INT>
-void spsolve_triangular_C(
+template <typename INT, bool lower, bool unit_diagonal, bool fully_aligned>
+void spsolve_triangular_C_impl(
     nb::ndarray<const double, nb::ndim<1>, nb::c_contig>& data,
     nb::ndarray<const INT, nb::ndim<1>, nb::c_contig>& indices,
     nb::ndarray<const INT, nb::ndim<1>, nb::c_contig>& indptr,
     nb::ndarray<double, nb::ndim<2>, nb::c_contig>& b,
-    bool lower, bool unit_diagonal, int num_threads
+    int num_threads
 ) {
     // get raw data pointers once at the beginning
     const auto* data_ptr    = data.data();
@@ -72,7 +73,7 @@ void spsolve_triangular_C(
     {
 
 
-        if (lower) {
+        if constexpr (lower) {
 
 #ifdef __AVX2__
             // solve Lx=b using forward substitution
@@ -88,7 +89,11 @@ void spsolve_triangular_C(
                     // if (i != indices_ptr[data_rpos]) { flag_ill_zero_diag = true; continue; }
 
                     b_i_ptr = b_ptr + i * nrhs + col;
-                    b_i_vec = _mm256_loadu_pd(b_i_ptr);
+                    if constexpr (fully_aligned) {
+                        b_i_vec = _mm256_load_pd(b_i_ptr);
+                    } else {
+                        b_i_vec = _mm256_loadu_pd(b_i_ptr);
+                    }
 
                     for (INT k = data_lpos; k < data_rpos; ++k) {
                         const auto& j = indices_ptr[k];
@@ -97,10 +102,14 @@ void spsolve_triangular_C(
                         b_i_vec = _mm256_sub_pd(b_i_vec, _mm256_mul_pd(val_vec, b_j_vec));
                     }
 
-                    if (!unit_diagonal) {
+                    if constexpr (!unit_diagonal) {
                         b_i_vec = _mm256_div_pd(b_i_vec, _mm256_set1_pd(data_ptr[data_rpos]));
                     }
-                    _mm256_storeu_pd(b_i_ptr, b_i_vec);
+                    if constexpr (fully_aligned) {
+                        _mm256_store_pd(b_i_ptr, b_i_vec);
+                    } else {
+                        _mm256_storeu_pd(b_i_ptr, b_i_vec);
+                    }
                 }
             }
 #endif
@@ -129,7 +138,7 @@ void spsolve_triangular_C(
                         b_i_temp -= v * b_ptr[j * nrhs + col];
                     }
 
-                    if (!unit_diagonal) {
+                    if constexpr (!unit_diagonal) {
                         *(b_i) = b_i_temp / data_ptr[data_rpos];
                     } else {
                         *(b_i) = b_i_temp;
@@ -155,7 +164,11 @@ void spsolve_triangular_C(
                     // if (i != indices_ptr[data_lpos]) { flag_ill_zero_diag = true; continue; }
 
                     b_i_ptr = b_ptr + i * nrhs + col;
-                    b_i_vec = _mm256_loadu_pd(b_i_ptr);
+                    if constexpr (fully_aligned) {
+                        b_i_vec = _mm256_load_pd(b_i_ptr);
+                    } else {
+                        b_i_vec = _mm256_loadu_pd(b_i_ptr);
+                    }
 
                     for (INT k = data_rpos; k > data_lpos; --k) {
                         const auto& j = indices_ptr[k];
@@ -164,10 +177,14 @@ void spsolve_triangular_C(
                         b_i_vec = _mm256_sub_pd(b_i_vec, _mm256_mul_pd(val_vec, b_j_vec));
                     }
 
-                    if (!unit_diagonal) {
+                    if constexpr (!unit_diagonal) {
                         b_i_vec = _mm256_div_pd(b_i_vec, _mm256_set1_pd(data_ptr[data_lpos]));
                     }
-                    _mm256_storeu_pd(b_i_ptr, b_i_vec);
+                    if constexpr (fully_aligned) {
+                        _mm256_store_pd(b_i_ptr, b_i_vec);
+                    } else {
+                        _mm256_storeu_pd(b_i_ptr, b_i_vec);
+                    }
                 }
             }
 #endif
@@ -196,7 +213,7 @@ void spsolve_triangular_C(
                         b_i_temp -= v * b_ptr[j * nrhs + col];
                     }
 
-                    if (!unit_diagonal) {
+                    if constexpr (!unit_diagonal) {
                         *(b_i) = b_i_temp / data_ptr[data_lpos];
                     } else {
                         *(b_i) = b_i_temp;
@@ -212,5 +229,94 @@ void spsolve_triangular_C(
     // if (flag_ill_zero_diag) {
     //     throw std::invalid_argument("ill-conditioned matrix: non-empty row with diag element of 0");
     // }
+
+}
+
+
+
+void spsolve_triangular_C(
+    nb::ndarray<const double, nb::ndim<1>, nb::c_contig>& data,
+    nb::ndarray<nb::ndim<1>, nb::c_contig>& indices_flex,
+    nb::ndarray<nb::ndim<1>, nb::c_contig>& indptr_flex,
+    nb::ndarray<double, nb::ndim<2>, nb::c_contig>& b,
+    bool lower, bool unit_diagonal, int num_threads
+) {
+
+    if (indices_flex.dtype() != indptr_flex.dtype()) {
+        throw nb::type_error("The 'indices' and 'indptr' arrays must have the same dtype.");
+    }
+
+    bool fully_aligned = (reinterpret_cast<uintptr_t>(b.data()) % 32 == 0) && (b.shape(1) % 4 == 0);
+    auto dispatch_tuple = std::make_tuple(lower, unit_diagonal, fully_aligned);
+
+
+    // dispatch
+    if (indices_flex.dtype() == nb::dtype<int32_t>()) {
+
+        auto indices = (nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig>) indices_flex;
+        auto indptr  = (nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig>) indptr_flex;
+
+        if(dispatch_tuple == std::make_tuple(false, false, false)) {
+          spsolve_triangular_C_impl<int32_t, false, false, false>(data, indices, indptr, b, num_threads);
+
+        } else if (dispatch_tuple == std::make_tuple(false, false, true)) {
+                  spsolve_triangular_C_impl<int32_t, false, false, true>(data, indices, indptr, b, num_threads);
+
+        } else if (dispatch_tuple == std::make_tuple(false, true, false)) {
+                  spsolve_triangular_C_impl<int32_t, false, true, false>(data, indices, indptr, b, num_threads);
+
+        } else if (dispatch_tuple == std::make_tuple(false, true, true)) {
+                  spsolve_triangular_C_impl<int32_t, false, true, true>(data, indices, indptr, b, num_threads);
+
+        } else if (dispatch_tuple == std::make_tuple(true, false, false)) {
+                  spsolve_triangular_C_impl<int32_t, true, false, false>(data, indices, indptr, b, num_threads);
+
+        } else if (dispatch_tuple == std::make_tuple(true, false, true)) {
+                  spsolve_triangular_C_impl<int32_t, true, false, true>(data, indices, indptr, b, num_threads);
+
+        } else if (dispatch_tuple == std::make_tuple(true, true, false)) {
+                  spsolve_triangular_C_impl<int32_t, true, true, false>(data, indices, indptr, b, num_threads);
+
+        } else if (dispatch_tuple == std::make_tuple(true, true, true)) {
+                  spsolve_triangular_C_impl<int32_t, true, true, true>(data, indices, indptr, b, num_threads);
+
+        }
+
+    } else if (indices_flex.dtype() == nb::dtype<int64_t>()) {
+
+        auto indices = (nb::ndarray<const int64_t, nb::ndim<1>, nb::c_contig>) indices_flex;
+        auto indptr  = (nb::ndarray<const int64_t, nb::ndim<1>, nb::c_contig>) indptr_flex;
+
+        if(dispatch_tuple == std::make_tuple(false, false, false)) {
+          spsolve_triangular_C_impl<int64_t, false, false, false>(data, indices, indptr, b, num_threads);
+
+        } else if (dispatch_tuple == std::make_tuple(false, false, true)) {
+                  spsolve_triangular_C_impl<int64_t, false, false, true>(data, indices, indptr, b, num_threads);
+
+        } else if (dispatch_tuple == std::make_tuple(false, true, false)) {
+                  spsolve_triangular_C_impl<int64_t, false, true, false>(data, indices, indptr, b, num_threads);
+
+        } else if (dispatch_tuple == std::make_tuple(false, true, true)) {
+                  spsolve_triangular_C_impl<int64_t, false, true, true>(data, indices, indptr, b, num_threads);
+
+        } else if (dispatch_tuple == std::make_tuple(true, false, false)) {
+                  spsolve_triangular_C_impl<int64_t, true, false, false>(data, indices, indptr, b, num_threads);
+
+        } else if (dispatch_tuple == std::make_tuple(true, false, true)) {
+                  spsolve_triangular_C_impl<int64_t, true, false, true>(data, indices, indptr, b, num_threads);
+
+        } else if (dispatch_tuple == std::make_tuple(true, true, false)) {
+                  spsolve_triangular_C_impl<int64_t, true, true, false>(data, indices, indptr, b, num_threads);
+
+        } else if (dispatch_tuple == std::make_tuple(true, true, true)) {
+                  spsolve_triangular_C_impl<int64_t, true, true, true>(data, indices, indptr, b, num_threads);
+        }
+
+    } else {
+
+        throw nb::type_error("The 'indices' and 'indptr' arrays have unsupported dtype.");
+
+    }
+
 
 }
