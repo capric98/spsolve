@@ -15,9 +15,7 @@ pip install -U git+https://github.com/capric98/spsolve
 
 And then replace `scipy.sparse.linalg.solve_triangular()` to `spsolve.solve_triangular()` in your code.
 
-A `spsolve.spsolve()` function is available for replacement of `scipy.sparse.linalg.solve()`, currently it simply uses `scipy.sparse.linalg.splu` and then solve `Ax=b` via `x = Pc @ { U \ [ L \ (Pr@b) ] }`, while `splu` almost runs in a single thread. Please let me know if you has a better idea to do LU decomposition. Try [PyPardiso](https://github.com/haasad/PyPardiso), [SLEPc](https://slepc.upv.es/), [Trilinos](https://github.com/trilinos/Trilinos), etc., for general using cases.
-
-An experimental Intel MKL PARDISO based `spsolve()` can be used if user has Intel MKL installed before hand, and build the project with explicitly flag set:
+A `spsolve.spsolve()` function is available for replacement of `scipy.sparse.linalg.solve()`, no speedup is expected because it currently uses a single-threaded `scipy.sparse.linalg.splu` and then solve `Ax=b` via `x = Pc @ { U \ [ L \ (Pr@b) ] }`. Try [PyPardiso](https://github.com/haasad/PyPardiso), [SLEPc](https://slepc.upv.es/), [Trilinos](https://github.com/trilinos/Trilinos), etc. for general using cases, or try the experimental Intel MKL PARDISO based `spsolve()` if user has Intel MKL installed before hand, and build this project with explicitly flag set:
 
 ```
 pip install -U git+https://github.com/capric98/spsolve --config-setting=cmake.args="-DSP_USE_MKL=ON"
@@ -25,7 +23,7 @@ pip install -U git+https://github.com/capric98/spsolve --config-setting=cmake.ar
 
 ## Limitations
 
-1. Currently **only** support CPUs with AVX2 instructions.
+1. For CPUs without AVX2 instructions, it will fallback to a non-vectorized implementation.
 
 2. Native support only for `scipy.sparse.csr_array`, other sparse array will be converted to CSR format.
 
@@ -33,16 +31,18 @@ pip install -U git+https://github.com/capric98/spsolve --config-setting=cmake.ar
 
 4. Not fully parallel when $n_\text{RHS}$ is small.
 
-5. Limited data type supported:
+5. Limited data type supported, lack of motivation to support `np.complex128` currently:
 
    |       |       $A$       |  \   |        $b$        |  =   |        $x$        |                                                              |
    | ----: | :-------------: | :--: | :---------------: | :--: | :---------------: | :----------------------------------------------------------- |
    | dtype |  `np.float64`   |      |   `np.float64`    |      |   `np.float64`    | ✅                                                            |
    | dtype |  `np.float64`   |      | ``np.complex128`` |      | ``np.complex128`` | ✅ View `b` as double and solve a $2\times n_\text{RHS}$ problem. |
-   | dtype | `np.complex128` |      |   `np.float64`    |      | ``np.complex128`` | ❌ Will support later.                                        |
-   | dtype | `np.complex128` |      |  `np.complex128`  |      |  `np.complex128`  | ❌ Will support later.                                        |
+   | dtype | `np.complex128` |      |   `np.float64`    |      | ``np.complex128`` | ❌                                                            |
+   | dtype | `np.complex128` |      |  `np.complex128`  |      |  `np.complex128`  | ❌                                                            |
 
    All other data types will be cast to `np.float64` or `np.complex128`. For experts who benefit from low precision or require higher precision, it should be easy to modify this project.
+
+6. For experimental PARDISO solver, it can actually reuse the factorized result of the sparse matrix, however I did not implement the logic
 
 ## Performance
 * Environment:
@@ -62,9 +62,12 @@ pip install -U git+https://github.com/capric98/spsolve --config-setting=cmake.ar
 
 ## TODO
 
-- [x] Add tests.
 - [ ] Implement `spsolve_triangular` for `np.complex128`.
-- [ ] Implement `solve` for general `scipy.sparse` matrices.
+- [ ] Implement `solve` for general `scipy.sparse` matrices. **Difficulties:**
+  * For a general case of $\mathbf{A}\mathbf{x}=\mathbf{b}$, it usually requires a factorization of A so that it can be solved by utilizing triangular solver multiple times, for a symmetric or Hermitian matrix it may be factorized by $\mathbf{A}=\mathbf{L}\mathbf{L}^*$ (Cholesky decomposition) and for general matrix it can be $\mathbf{A}=\mathbf{L}\mathbf{U}$ (LU decomposition). However the direct decomposition will introduce fill-in and sometimes it's catastrophic, making the decomposed matrix almost dense.
+  * To reduce fill-in, we need algorithm to generate an optimized permutation so that the decomposition of $\mathbf{P}(\mathbf{A}\mathbf{Q})$, where $\mathbf{Q}$ is a permutation and $\mathbf{P}$ is a pivoting for numerical stability (I guess). This kind of algorithm is complicated, for example, COLAMD from [SuiteSparse](https://github.com/DrTimothyAldenDavis/SuiteSparse) or Nested Dissection. I did not find a out-of-the-box solution to do the factorization (though COLAMD is BSD licensed, UMFPACK from SuiteSparse is LGPL licensed which is incompatible with BSD), which means it still requires some coding to make it works.
+  * Another thing is, AFAIK, COLAMD is fast but single-threaded, while nested dissection can be parallelized. Since this project is aiming to be a light-weight, out-of-the-box solution for a single machine, I have no idea which is better for this using case.
+  * Overall, I guess I would not implement this in a very long time :(
 
 ## Acknowledgments
 
