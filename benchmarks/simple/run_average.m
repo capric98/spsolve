@@ -1,8 +1,8 @@
 n_ave = 1000;
 
 size = 10000;
-nrhs = 24;
-density = 0.1;
+nrhs = 1000;
+density = 0.01;
 
 rng(0);
 

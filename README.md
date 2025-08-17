@@ -15,7 +15,7 @@ pip install -U git+https://github.com/capric98/spsolve
 
 And then replace `scipy.sparse.linalg.solve_triangular()` to `spsolve.solve_triangular()` in your code.
 
-A `spsolve.spsolve()` function is available for replacement of `scipy.sparse.linalg.solve()`, no speedup is expected because it currently uses a single-threaded `scipy.sparse.linalg.splu` and then solve `Ax=b` via `x = Pc @ { U \ [ L \ (Pr@b) ] }`. Try [PyPardiso](https://github.com/haasad/PyPardiso), [SLEPc](https://slepc.upv.es/), [Trilinos](https://github.com/trilinos/Trilinos), etc. for general using cases, or try the experimental Intel MKL PARDISO based `spsolve()` if user has Intel MKL installed before hand, and build this project with explicitly flag set:
+A `spsolve.spsolve()` function is available for replacement of `scipy.sparse.linalg.solve()`, no speedup is expected because it currently uses a single-threaded `scipy.sparse.linalg.splu` and then solve `Ax=b` via `x = Pc @ { U \ [ L \ (Pr@b) ] }`. Try [PyPardiso](https://github.com/haasad/PyPardiso), [PETSc](https://petsc.org/), [SuiteSparse](https://github.com/DrTimothyAldenDavis/SuiteSparse), etc. for general using cases, or try the experimental Intel MKL PARDISO based `spsolve()` if user has Intel MKL installed before hand, and build this project with explicitly flag set:
 
 ```
 pip install -U git+https://github.com/capric98/spsolve --config-setting=cmake.args="-DSP_USE_MKL=ON"
