@@ -66,7 +66,10 @@ void spsolve_triangular_C_impl(
 
 
 #if defined(_OPENMP) && _OPENMP >= 201503
-    #pragma omp parallel num_threads(num_threads) proc_bind(spread)
+    // for _OPENMP >= 201503, I'd like to assume it is not running on Windows
+    // HT or SMT may be disabled, in which case we should use "close" to enhance locality
+    // maybe it's' better to comment out proc_bind and let user to use OMP_PROC_BIND env instead
+    #pragma omp parallel num_threads(num_threads) // proc_bind(close)
 #else
     #pragma omp parallel num_threads(num_threads)
 #endif
