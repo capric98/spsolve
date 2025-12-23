@@ -7,6 +7,7 @@ dependencies = [
     "numpy >= 2.0.0",
     "scipy >= 1.15.0",
     "psutil ~= 7.0.0",
+    "mkl >= 2025.1.0",
 ]
 
 description = "A sparse (triangular) linear equations solver that is compatible with scipy.sparse.linalg.spsolve_triangular"
@@ -28,6 +29,9 @@ requires = [
     "cmake >= 3.18",
     "nanobind >=2.8.0",
     "scikit-build-core >= 0.11.5",
+    "mkl >= 2025.1.0",
+    "mkl-include >= 2025.1.0",
+    "mkl-devel >= 2025.1.0",
 ]
 build-backend = "scikit_build_core.build"
 

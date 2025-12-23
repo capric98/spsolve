@@ -87,30 +87,76 @@ target_link_libraries(_spsolve PRIVATE OpenMP::OpenMP_CXX)
 
 
 if(SP_USE_MKL)
-  set(MKL_INTERFACE_FULL "intel_lp64")
-  find_package(MKL CONFIG REQUIRED)
-  if(MKL_FOUND)
-    message(STATUS "Found MKL with: ${MKL_IMPORTED_TARGETS}")
+  # execute_process(
+  #   COMMAND "${Python_EXECUTABLE}" cmake_debug.py
+  #   OUTPUT_VARIABLE PYTHON_DEBUG_MSG
+  #   OUTPUT_STRIP_TRAILING_WHITESPACE
+  # )
+  # message(STATUS "Python DBG: ${PYTHON_DEBUG_MSG}")
+
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -c "import os, sys; print(os.path.join(sys.prefix, 'Library'), end='')"
+    OUTPUT_VARIABLE PYTHON_LIB_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+  
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -c "import nanobind; from os.path import dirname, join; print(join(dirname(dirname(dirname(dirname(nanobind.source_dir())))), 'Library'))"
+    OUTPUT_VARIABLE PYTHON_BUILD_LIB_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+
+  set(MKL_SEARCH_PATHS
+    "${PYTHON_LIB_DIR}"
+    "${PYTHON_BUILD_LIB_DIR}"
+  )
+
+  message(STATUS "MKL Search Paths: ${MKL_SEARCH_PATHS}")
+
+  find_path(MKL_INCLUDE_DIR NAMES mkl.h
+    HINTS ${MKL_SEARCH_PATHS}
+    PATH_SUFFIXES include
+    DOC "MKL Include Directory"
+  )
+
+  message(STATUS "MKL Include Directory: ${MKL_INCLUDE_DIR}")
+
+  find_library(MKL_LIBRARY NAMES mkl_rt mkl_rt.2
+    HINTS ${MKL_SEARCH_PATHS}
+    PATH_SUFFIXES lib libs bin
+    DOC "MKL Runtime Library"
+  )
+
+  if(MKL_INCLUDE_DIR AND MKL_LIBRARY)
+    message(STATUS "Found MKL headers: ${MKL_INCLUDE_DIR}")
+    message(STATUS "Found MKL library: ${MKL_LIBRARY}")
     add_compile_definitions(SP_USE_MKL)
+    
+    target_include_directories(_spsolve PRIVATE ${MKL_INCLUDE_DIR})
+    target_link_libraries(_spsolve PRIVATE ${MKL_LIBRARY})
   else()
-    message(WARNFATAL_ERROR "MKL not found!")
+    message(FATAL_ERROR "MKL not found in ${MKL_SEARCH_PATHS}. Make sure mkl and mkl-include are installed.")
   endif()
 
-  # target_link_libraries(_spsolve PRIVATE MKL::MKL)
-  target_compile_options(_spsolve PRIVATE $<TARGET_PROPERTY:MKL::MKL,INTERFACE_COMPILE_OPTIONS>)
-  target_include_directories(_spsolve PRIVATE $<TARGET_PROPERTY:MKL::MKL,INTERFACE_INCLUDE_DIRECTORIES>)
-  target_link_libraries(_spsolve PRIVATE $<LINK_ONLY:MKL::MKL>)
-  install(FILES "$<TARGET_RUNTIME_DLLS:_spsolve>" DESTINATION spsolve)
-
   if(WIN32)
-    set(MKL_HINTS
-      "${MKLROOT}"
-      "${ONEAPI_ROOT}/mkl/latest"
+    # Find OpenMP runtime (libiomp5md.dll) in the Python environment
+    find_file(IOMP5_LIB NAMES libiomp5md.dll 
+      HINTS ${MKL_SEARCH_PATHS} 
+      PATH_SUFFIXES Library/bin bin
+      DOC "Intel OpenMP Compatibility Library"
     )
-    find_file(IOMP5_LIB NAMES libiomp5md.dll HINTS ${MKL_HINTS} DOC "Intel OpenMP Compatibility Library")
     message(STATUS "Found OpenMP runtime: ${IOMP5_LIB}")
     if(IOMP5_LIB)
       install(FILES ${IOMP5_LIB} DESTINATION spsolve)
+    endif()
+    
+    # Try to install mkl_rt.dll if found (it's often in Library/bin on Windows)
+    find_file(MKL_RT_DLL NAMES mkl_rt.dll mkl_rt.2.dll
+      HINTS ${MKL_SEARCH_PATHS}
+      PATH_SUFFIXES Library/bin bin
+    )
+    if(MKL_RT_DLL)
+      install(FILES ${MKL_RT_DLL} DESTINATION spsolve)
     endif()
   endif()
 
