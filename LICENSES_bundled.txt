@@ -1,0 +1,6 @@
+----
+
+The spsolve links against Intel(R) oneAPI Math Kernel Library (oneMKL) by default.
+Intel oneMKL is licensed under the Intel Simplified Software License (ISSL).
+See https://software.intel.com/sites/landingpage/pintool/intel-simplified-software-license.txt
+for details.
