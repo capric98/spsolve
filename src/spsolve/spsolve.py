@@ -6,7 +6,7 @@ from scipy.sparse.linalg import spbandwidth, is_sptriangular, splu, SuperLU
 
 from .matmul import _matmul_csr
 from .spsolve_triangular import spsolve_triangular
-from .spsolve_pardiso import solve
+from .spsolve_pardiso import solve as pardiso_solve
 
 from ._spsolve import is_built_with_mkl # type: ignore
 
@@ -15,9 +15,7 @@ from ._spsolve import is_built_with_mkl # type: ignore
 def spsolve(A: sparray, b: ndarray, overwrite_b: bool=False, permc_spec: str="COLAMD", **kwargs) -> ndarray:
 
     if is_built_with_mkl():
-        return solve(A, b, **kwargs)
-
-    warn("experimental spsolve, for general usage try pypardiso", SparseEfficiencyWarning, stacklevel=2)
+        return pardiso_solve(A, b, **kwargs)
 
     # sanity check
     # non-square matrix can utilize QR solver, but I didn't find a sparse QR decomposition available,

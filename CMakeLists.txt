@@ -138,28 +138,6 @@ if(SP_USE_MKL)
     message(FATAL_ERROR "MKL not found in ${MKL_SEARCH_PATHS}. Make sure mkl and mkl-include are installed.")
   endif()
 
-  if(WIN32)
-    # Find OpenMP runtime (libiomp5md.dll) in the Python environment
-    find_file(IOMP5_LIB NAMES libiomp5md.dll 
-      HINTS ${MKL_SEARCH_PATHS} 
-      PATH_SUFFIXES Library/bin bin
-      DOC "Intel OpenMP Compatibility Library"
-    )
-    message(STATUS "Found OpenMP runtime: ${IOMP5_LIB}")
-    if(IOMP5_LIB)
-      install(FILES ${IOMP5_LIB} DESTINATION spsolve)
-    endif()
-    
-    # Try to install mkl_rt.dll if found (it's often in Library/bin on Windows)
-    find_file(MKL_RT_DLL NAMES mkl_rt.dll mkl_rt.2.dll
-      HINTS ${MKL_SEARCH_PATHS}
-      PATH_SUFFIXES Library/bin bin
-    )
-    if(MKL_RT_DLL)
-      install(FILES ${MKL_RT_DLL} DESTINATION spsolve)
-    endif()
-  endif()
-
 endif()
 
 
