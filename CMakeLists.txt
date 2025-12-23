@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.21)
 
 
 project(_spsolve LANGUAGES CXX)
-option(SP_USE_MKL "Enable to build with MKL support" OFF)
+option(SP_USE_MKL "Enable to build with MKL support" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(DEV_MODULE Development.Module)
@@ -86,6 +86,7 @@ endif()
 target_link_libraries(_spsolve PRIVATE OpenMP::OpenMP_CXX)
 
 
+# Use MKL by default
 if(SP_USE_MKL)
   # execute_process(
   #   COMMAND "${Python_EXECUTABLE}" cmake_debug.py
