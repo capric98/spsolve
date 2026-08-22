@@ -1,91 +1,155 @@
+from __future__ import annotations
+
+from typing import Any
 from warnings import warn
 
-from numpy import iscomplexobj, ndarray, dtype, float64, complex128
-from scipy.sparse import issparse, sparray, csr_array, SparseEfficiencyWarning
+import numpy as np
+from numpy.typing import ArrayLike, NDArray
+from scipy.sparse import SparseEfficiencyWarning, csr_array, issparse
 
+from ._spsolve import spsolve_triangular as _spsolve_triangular  # type: ignore
 from .spparms import get_max_threads, get_prefer_order
-from .assure_contiguous import assure_contiguous
-from ._spsolve import spsolve_triangular as _spsolve_triangular # type: ignore
 
 
-def spsolve_triangular(A: sparray, b: ndarray, lower: bool=True, overwrite_b: bool=False, overwrite_A: bool=False, unit_diagonal: bool=False) -> ndarray:
-    if not issparse(A): raise ValueError(f"expect a scipy sparse array but got '{type(A)}'")
-    if A.format != "csr": # type: ignore
-        warn("CSR array format is required. Converting to CSR array.", SparseEfficiencyWarning, stacklevel=2)
-        A = csr_array(A)
-    if not A.has_sorted_indices: A.sort_indices() # type: ignore
+def _prepare_csr(A: Any) -> csr_array:
+    if getattr(A, "format", None) != "csr":
+        warn(
+            "CSR format is required; converting a copy to CSR",
+            SparseEfficiencyWarning,
+            stacklevel=3,
+        )
+    if np.issubdtype(A.dtype, np.complexfloating):
+        raise TypeError("native triangular solve currently supports real A only")
+    if not (np.issubdtype(A.dtype, np.number) or A.dtype == np.bool_):
+        raise TypeError(f"A must have a numeric dtype, got {A.dtype}")
+
+    is_csr = getattr(A, "format", None) == "csr"
+    index_dtype_ok = is_csr and A.indices.dtype in (
+        np.dtype(np.int32),
+        np.dtype(np.int64),
+    )
+    needs_copy = (
+        not is_csr
+        or A.dtype != np.float64
+        or not A.data.flags.c_contiguous
+        or not A.indices.flags.c_contiguous
+        or not A.indptr.flags.c_contiguous
+        or not index_dtype_ok
+        or A.indices.dtype != A.indptr.dtype
+    )
+    matrix = csr_array(A, dtype=np.float64, copy=needs_copy)
+    if not matrix.data.flags.c_contiguous:
+        matrix.data = np.ascontiguousarray(matrix.data)
+    if (
+        matrix.indices.dtype not in (np.dtype(np.int32), np.dtype(np.int64))
+        or matrix.indices.dtype != matrix.indptr.dtype
+    ):
+        matrix.indices = np.ascontiguousarray(matrix.indices, dtype=np.int64)
+        matrix.indptr = np.ascontiguousarray(matrix.indptr, dtype=np.int64)
+    if not matrix.indices.flags.c_contiguous:
+        matrix.indices = np.ascontiguousarray(matrix.indices)
+    if not matrix.indptr.flags.c_contiguous:
+        matrix.indptr = np.ascontiguousarray(matrix.indptr)
+    return matrix
 
 
-    data:    ndarray = assure_contiguous(A.data)    # type: ignore
-    indices: ndarray = assure_contiguous(A.indices) # type: ignore
-    indptr:  ndarray = assure_contiguous(A.indptr)  # type: ignore
-    nnz:         int = A.size                       # type: ignore
-    _PREFER_ORDER    = get_prefer_order()
+def _work_order(rhs: NDArray[Any]) -> str:
+    if rhs.ndim == 2 and rhs.flags.f_contiguous and not rhs.flags.c_contiguous:
+        return "F"
+    return "F" if get_prefer_order() == "F" else "C"
 
 
-    # sanity check
-    assert(nnz == data.size)
-    assert(nnz == indices.size)
+def spsolve_triangular(
+    A: Any,
+    b: ArrayLike,
+    lower: bool = True,
+    overwrite_b: bool = False,
+    overwrite_A: bool = False,
+    unit_diagonal: bool = False,
+    *,
+    num_threads: int | None = None,
+) -> NDArray[np.float64] | NDArray[np.complex128]:
+    """Solve a real sparse triangular system for one or many dense RHSs.
 
-    A_shape: tuple = A.shape # type: ignore
-    assert(A_shape[0] == A_shape[1])
-    assert(A_shape[0] == b.shape[0])
-    if overwrite_A: warn("overwrite_A has no effect here", stacklevel=2)
+    Work is parallelized over independent RHS blocks. A one-dimensional RHS is
+    accepted and the returned shape always matches ``b``. With
+    ``unit_diagonal=True``, stored diagonal entries are ignored and missing
+    diagonal entries are treated as one.
+    """
+    if not issparse(A):
+        raise TypeError(f"expected a SciPy sparse matrix or array, got {type(A)!r}")
+    if len(A.shape) != 2 or A.shape[0] != A.shape[1]:
+        raise ValueError(f"expected a square sparse matrix, got shape={A.shape}")
 
+    rhs = np.asarray(b)
+    if rhs.ndim not in (1, 2):
+        raise ValueError("b must be a one- or two-dimensional dense array")
+    if rhs.shape[0] != A.shape[0]:
+        raise ValueError(f"b has {rhs.shape[0]} rows, expected {A.shape[0]}")
+    if not (np.issubdtype(rhs.dtype, np.number) or rhs.dtype == np.bool_):
+        raise TypeError(f"b must have a numeric dtype, got {rhs.dtype}")
 
-    if not b.data.contiguous:
-        b = b.copy(order=_PREFER_ORDER)
-        overwrite_b = True
+    # The native kernel never changes A; overwrite_A remains an accepted SciPy
+    # compatibility argument. A compatible CSR is borrowed read-only, while
+    # conversion or dtype/layout repair uses a private copy.
+    del overwrite_A
+    matrix = _prepare_csr(A)
+    vector_rhs = rhs.ndim == 1
+    rhs_columns = 1 if vector_rhs else rhs.shape[1]
+    complex_rhs = np.iscomplexobj(rhs)
+    result_dtype = np.dtype(np.complex128 if complex_rhs else np.float64)
+    threads = get_max_threads() if num_threads is None else int(num_threads)
+    if threads < 1:
+        raise ValueError("num_threads must be at least one")
 
+    can_overwrite = (
+        overwrite_b
+        and isinstance(b, np.ndarray)
+        and b.dtype == result_dtype
+        and b.flags.writeable
+        and (b.flags.c_contiguous or b.flags.f_contiguous)
+    )
+    # A multi-column Fortran complex array cannot be reinterpreted as a
+    # two-dimensional float64 RHS without copying.
+    if (
+        complex_rhs
+        and rhs.ndim == 2
+        and rhs.flags.f_contiguous
+        and not rhs.flags.c_contiguous
+    ):
+        can_overwrite = False
 
-    if data.dtype != float64:
-        if iscomplexobj(data):
-            raise Exception("complex A is not supported currently")
+    if can_overwrite:
+        work = b
+    else:
+        order = "C" if complex_rhs else _work_order(rhs)
+        work = np.array(rhs, dtype=result_dtype, order=order, copy=True)
+    work_2d = work.reshape(A.shape[0], rhs_columns) if vector_rhs else work
 
-        overwrite_b = True
-        warn(f"explictly made a copy of A from dtype='{data.dtype}' to dtype='{dtype(float64)}'", stacklevel=2)
-        data = data.astype(float64, copy=True, order=_PREFER_ORDER)
+    if complex_rhs:
+        if not work_2d.flags.c_contiguous:
+            work_2d = np.array(work_2d, dtype=np.complex128, order="C", copy=True)
+            can_overwrite = False
+        native_rhs = work_2d.view(np.float64).reshape(A.shape[0], 2 * rhs_columns)
+    else:
+        native_rhs = work_2d
 
+    try:
+        _spsolve_triangular(
+            matrix.data,
+            matrix.indices,
+            matrix.indptr,
+            native_rhs,
+            bool(lower),
+            bool(unit_diagonal),
+            threads,
+        )
+    except RuntimeError as error:
+        if "singular" in str(error).lower():
+            raise np.linalg.LinAlgError(str(error)) from error
+        raise
 
-    flag_C128_as_F64 = False
-    if (b_dtype:=b.dtype) != float64:
-        if iscomplexobj(b):
-            if iscomplexobj(data):
-                raise Exception("complex A\\b is not supported currently")
-            else:
-                if b_dtype == complex128:
-                    flag_C128_as_F64 = True
-                    if b.data.f_contiguous:
-                        b = b.copy(order=_PREFER_ORDER) # cannot use float64 logic to solve complex F contiguous b
-                        overwrite_b = True
-                    b = b.view(dtype=float64)
-                else:
-                    raise Exception(f"'{dtype(b_dtype)}' b is not supported currently")
-
-        else:
-            warn(f"'b' has dtype='{b.dtype}', explicitly make a copy of dtype='{dtype(float64)}'", stacklevel=2)
-            overwrite_b = True
-            b = b.astype(float64, copy=True, order=_PREFER_ORDER)
-
-
-    ans: ndarray = b if overwrite_b else b.copy(order=_PREFER_ORDER) # b.copy(order="A")
-
-
-    ## Will it run faster by force lower? Introduce an overhead of flip but may be friendlier to the cache...
-    # if not lower:
-    #     lower = True
-    #     rows = flip(rows)
-    #     cols = flip(cols)
-    #     data = flip(data)
-
-    # solve Ax=b in place where b is already copied into ans or overwrite_b is True
-    _spsolve_triangular(data, indices, indptr, ans, lower, unit_diagonal, get_max_threads())
-
-
-    if flag_C128_as_F64: ans = ans.view(dtype=b_dtype)
-
-    return ans
-
-
-if __name__ == "__main__":
-    pass
+    result = work_2d[:, 0] if vector_rhs else work_2d
+    if can_overwrite:
+        return b
+    return result

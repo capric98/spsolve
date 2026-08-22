@@ -1,73 +1,76 @@
-from warnings import warn
+from __future__ import annotations
 
-from numpy import arange, ones, ndarray
-from scipy.sparse import issparse, sparray, csr_array, SparseEfficiencyWarning
-from scipy.sparse.linalg import spbandwidth, is_sptriangular, splu, SuperLU
+from typing import Any
 
-from .matmul import _matmul_csr
+import numpy as np
+from numpy.typing import NDArray
+from scipy.sparse import issparse, sparray
+from scipy.sparse.linalg import is_sptriangular
+
+from .sparse_lu import Backend, PermcSpec, SparseLU, _validate_backend, splu
 from .spsolve_triangular import spsolve_triangular
-from .spsolve_pardiso import solve as pardiso_solve
-
-from ._spsolve import is_built_with_mkl # type: ignore
 
 
+def spsolve(
+    A: sparray,
+    b: NDArray[Any],
+    overwrite_b: bool = False,
+    permc_spec: PermcSpec | None = "COLAMD",
+    *,
+    num_threads: int | None = None,
+    backend: Backend = "auto",
+    check_finite: bool = True,
+    iterative_refinement: bool = True,
+) -> NDArray[Any]:
+    """Solve ``A @ x = b`` with a sparse LU factorization."""
+    if not issparse(A):
+        raise TypeError(f"expected a SciPy sparse matrix or array, got {type(A)!r}")
+    if len(A.shape) != 2 or A.shape[0] != A.shape[1]:
+        raise ValueError(f"expected a square sparse matrix, got shape={A.shape}")
 
-def spsolve(A: sparray, b: ndarray, overwrite_b: bool=False, permc_spec: str="COLAMD", **kwargs) -> ndarray:
+    rhs = np.asarray(b)
+    if rhs.ndim not in (1, 2):
+        raise ValueError("b must be a one- or two-dimensional dense array")
+    if rhs.shape[0] != A.shape[0]:
+        raise ValueError(f"b has {rhs.shape[0]} rows, expected {A.shape[0]}")
 
-    if is_built_with_mkl():
-        return pardiso_solve(A, b, **kwargs)
+    selected_backend = _validate_backend(backend)
 
-    # sanity check
-    # non-square matrix can utilize QR solver, but I didn't find a sparse QR decomposition available,
-    # let it throw exception currently...
-    assert(issparse(A))
-    A_shape = A.shape # type: ignore
-    assert(A_shape[0] == A_shape[1])
-    assert(A_shape[0] == b.shape[0])
+    # Preserve the established fast path for triangular float64 systems.
+    if selected_backend != "scipy" and A.dtype == np.float64:
+        is_lower, is_upper = is_sptriangular(A)
+        if is_lower or is_upper:
+            return spsolve_triangular(
+                A,
+                rhs,
+                lower=bool(is_lower),
+                overwrite_b=overwrite_b,
+                num_threads=num_threads,
+            )
 
-    # lo_bandwidth, hi_bandwidth = spbandwidth(A)
+    factor = splu(
+        A,
+        permc_spec=permc_spec,
+        num_threads=num_threads,
+        backend=selected_backend,
+        check_finite=check_finite,
+    )
+    if isinstance(factor, SparseLU):
+        return factor.solve(
+            rhs,
+            overwrite_b=overwrite_b,
+            num_threads=num_threads,
+            iterative_refinement=iterative_refinement,
+        )
 
-    # if lo_bandwidth == hi_bandwidth == 0:
-    #     # diagonal solver
-    #     warn("diagonal solver is not implemented, use triangular solver instead", stacklevel=2)
-    #     return spsolve_triangular(A, b, overwrite_b=overwrite_b, lower=True)
-
-    # if lo_bandwidth == 0 or hi_bandwidth == 0:
-    #     return spsolve_triangular(A, b, overwrite_b=overwrite_b, lower=(hi_bandwidth==0))
-
-    is_lower_triangular, is_upper_triangular = is_sptriangular(A)
-    if is_lower_triangular or is_upper_triangular:
-        return spsolve_triangular(A, b, lower=bool(is_lower_triangular), overwrite_b=overwrite_b)
-
-    # if is permuted triangular
-
-    # if symmetric or hermitian: chol? LDL?
-
-    # LU solver
-    # t_start = time.perf_counter()
-    lu: SuperLU = splu(A, permc_spec=permc_spec)
-    # t_elapsed = time.perf_counter() - t_start
-    # print(f"LU decomposition finished in {1000*t_elapsed:.2f} ms")
-
-    L = csr_array(lu.L)
-    U = csr_array(lu.U)
-
-    Pr = csr_array((ones(A_shape[0]), (lu.perm_r, arange(A_shape[0]))))
-    Pc = csr_array((ones(A_shape[0]), (arange(A_shape[0]), lu.perm_c)))
-
-    # solve Ax=b via x = Pc @ ( U \ ( L \ (Pr@b) ) )
-    ans = Pr @ b
-    spsolve_triangular(L, ans, lower=True, overwrite_b=True, unit_diagonal=True) # LU decomposition should give unit_diagonal L?
-    spsolve_triangular(U, ans, lower=False, overwrite_b=True)
-
-    if overwrite_b:
-        _matmul_csr(Pc, ans, b) # write Pc @ ans into b
-        ans = b
-    else:
-        ans = Pc @ ans
-
-    return ans
-
-
-if __name__ == "__main__":
-    pass
+    solution = np.asarray(factor.solve(rhs))
+    if (
+        overwrite_b
+        and isinstance(b, np.ndarray)
+        and b.flags.writeable
+        and b.shape == solution.shape
+        and b.dtype == solution.dtype
+    ):
+        np.copyto(b, solution)
+        return b
+    return solution

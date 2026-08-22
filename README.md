@@ -1,77 +1,101 @@
 # spsolve
 
-`spsolve` is a sparse linear equations solver that is compatible with `scipy.sparse.linalg.spsolve_triangular`.
+`spsolve` is a lightweight sparse direct solver for Python. It provides a
+clean-room, reusable, multithreaded sparse LU implementation for general real
+matrices and a fast native triangular solver. The native extension does not
+link against Intel MKL or another external solver library; SciPy remains the
+sparse-container compatibility layer and explicit fallback.
 
-It implements a naïve forward / backward substitution solver which:
+The native LU backend is currently opt-in. The default `"auto"` backend uses
+SciPy SuperLU for general matrices until the documented performance promotion
+gate passes consistently; triangular float64 systems continue to use the
+native fast path.
 
-1. Use AVX2 instructions to vectorize the calculation.
-2. Use OpenMP to parallel when $\mathbf{b}$ has many columns. Achieve the best performance when $n_\text{RHS} \ge 4 \times n_\text{cores}$
-
-## Usage
+## Install
 
 ```bash
 pip install -U git+https://github.com/capric98/spsolve
 ```
 
-And then replace `scipy.sparse.linalg.solve_triangular()` to `spsolve.solve_triangular()` in your code.
+The build needs a C++20 compiler. OpenMP is detected automatically; without it,
+triangular kernels fall back to serial while LU still uses `std::thread`.
+Wheels and ordinary builds target baseline x64 CPUs; use
+`-DSP_ARCH_NATIVE=ON` only for a machine-local build.
 
-A `spsolve.spsolve()` function is available for replacement of `scipy.sparse.linalg.solve()`, which uses Intel MKL PARDISO solver which is highly optimized for sparse direct solving. (TODO: make PARDISO factorization reusable like [PyPardiso](https://github.com/haasad/PyPardiso))
+## General sparse LU
 
-Note: It requires `mkl` which will be installed automatically.
+```python
+import numpy as np
+from scipy.sparse import csc_array
+from spsolve import factorized, splu, spsolve
 
-## Limitations
+A = csc_array([
+    [4.0, 1.0, 0.0],
+    [2.0, 3.0, 1.0],
+    [1.0, 0.0, 2.0],
+])
+b = np.array([1.0, 2.0, 3.0])
 
-1. For CPUs without AVX2 instructions, it will fallback to a non-vectorized implementation.
+# Stable default: SciPy SuperLU for a general matrix.
+x = spsolve(A, b)
 
-2. Native support only for `scipy.sparse.csr_array`, other sparse array will be converted to CSR format.
+# Experimental native float64 factorization, reusable for many RHSs.
+lu = splu(
+    A,
+    backend="native",
+    permc_spec="MMD_AT_PLUS_A",
+    num_threads=8,
+)
+x = lu.solve(b)
+x_transpose = lu.solve(b, trans="T")
 
-3. Slight performance degradation when $n_\text{RHS}$  is not fourfold.
+solve_A = factorized(A, backend="native", num_threads=8)
+x_again = solve_A(b)
+```
 
-4. Not fully parallel when $n_\text{RHS}$ is small.
+Native factors expose `shape`, `dtype`, `nnz`, `perm_r`, `perm_c`, lazy `L`
+and `U` sparse arrays, equilibration scales, and timing/fill statistics. Row and
+column scaling, threshold partial pivoting, exact singular detection, and up to
+two iterative-refinement steps are enabled by default.
 
-5. Limited data type supported, lack of motivation to support `np.complex128` currently:
+## Triangular solve
 
-   |       |       $A$       |  \   |        $b$        |  =   |        $x$        |                                                              |
-   | ----: | :-------------: | :--: | :---------------: | :--: | :---------------: | :----------------------------------------------------------- |
-   | dtype |  `np.float64`   |      |   `np.float64`    |      |   `np.float64`    | ✅                                                            |
-   | dtype |  `np.float64`   |      | ``np.complex128`` |      | ``np.complex128`` | ✅ View `b` as double and solve a $2\times n_\text{RHS}$ problem. |
-   | dtype | `np.complex128` |      |   `np.float64`    |      | ``np.complex128`` | ❌                                                            |
-   | dtype | `np.complex128` |      |  `np.complex128`  |      |  `np.complex128`  | ❌                                                            |
+```python
+from spsolve import spsolve_triangular
 
-   All other data types will be cast to `np.float64` or `np.complex128`. For experts who benefit from low precision or require higher precision, it should be easy to modify this project.
+x = spsolve_triangular(A_triangular, b, lower=True, num_threads=8)
+```
 
-6. For experimental PARDISO solver, it can actually reuse the factorized result of the sparse matrix, however I did not implement the logic
+The triangular solver accepts vector or matrix RHSs, C- or Fortran-contiguous
+layouts, real or complex RHSs with a real matrix, and implicit unit diagonals.
+Parallel work is across independent RHS blocks.
 
-## Performance
-* Environment:
-  * Intel Core i5-13600K, P-Cores @5.2GHz, Windows 10 LTSC
-  * Python 3.13.5: `OMP_NUM_THREADS=6`, manually bind to physical P-Cores, `overwrite_b=True`
-  * MATLAB R2025a: `maxNumCompThreads=6` (default)
+## Backend policy and limitations
 
-* Comparison between SciPy, MATLAB and spsolve:
+- `backend="auto"`: SciPy for general matrices; native for the established
+  triangular float64 fast path.
+- `backend="native"`: experimental native LU for float64 matrices. Ordering
+  choices are `NATURAL`, clean-room approximate `COLAMD`, and
+  `MMD_AT_PLUS_A`.
+- `backend="scipy"`: explicit SciPy SuperLU fallback, including complex and
+  non-float64 problems supported by SciPy.
 
-  * $\mathbf{A}$: $10000\times10000$ sparse array with density of 10%, non-zero main diagonal dominant, then use `scipy.sparse.(tril|triu)` to get a triangular sparse array, stored in CSR format
+Sparse LU exposes limited parallelism for narrow-front or already triangular
+matrices because pivots are dependency ordered. Irregular matrices with wide
+fronts benefit most. The native implementation remains opt-in because it does
+not yet consistently match SuperLU's mature supernodal performance.
 
-  * $\mathbf{b}$: $10000\times n_\text{RHS}$ dense `np.ndarray`
+See [the implementation notes](docs/native-lu.md), [API notes](docs/api.md),
+and [benchmark gate](docs/benchmarking.md) for details.
 
-  * Each function runs 1000 times and uses the averaged time of single solve.
+## Development
 
-![](./benchmarks/static/speedup.png)
+```bash
+python -m unittest discover -v -s tests -t .
+python benchmarks/factorization.py --quick
+python benchmarks/factorization.py --threads 8 --gate
+```
 
-## TODO
-
-- [ ] Implement `spsolve_triangular` for `np.complex128`.
-- [ ] Implement `solve` for general `scipy.sparse` matrices. **Difficulties:**
-  * For a general case of $\mathbf{A}\mathbf{x}=\mathbf{b}$, it usually requires a factorization of A so that it can be solved by utilizing triangular solver multiple times, for a symmetric or Hermitian matrix it may be factorized by $\mathbf{A}=\mathbf{L}\mathbf{L}^*$ (Cholesky decomposition) and for general matrix it can be $\mathbf{A}=\mathbf{L}\mathbf{U}$ (LU decomposition). However the direct decomposition will introduce fill-in and sometimes it's catastrophic, making the decomposed matrix almost dense.
-  * To reduce fill-in, we need algorithm to generate an optimized permutation so that the decomposition of $\mathbf{P}(\mathbf{A}\mathbf{Q})$, where $\mathbf{Q}$ is a permutation and $\mathbf{P}$ is a pivoting for numerical stability (I guess). This kind of algorithm is complicated, for example, COLAMD from [SuiteSparse](https://github.com/DrTimothyAldenDavis/SuiteSparse) or Nested Dissection. I did not find a out-of-the-box solution to do the factorization (though COLAMD is BSD licensed, UMFPACK from SuiteSparse is LGPL licensed which is incompatible with BSD), which means it still requires some coding to make it works.
-  * Another thing is, AFAIK, COLAMD is fast but single-threaded, while nested dissection can be parallelized. Since this project is aiming to be a light-weight, out-of-the-box solution for a single machine, I have no idea which is better for this using case.
-  * Overall, I guess I would not implement this in a very long time :(
-
-## Acknowledgments
-
-* [MATLAB: mldivide, \\](https://www.mathworks.com/help/matlab/ref/double.mldivide.html)
-* [NumPy](https://numpy.org/)
-* [OpenMP](https://www.openmp.org/)
-* [SciPy](https://scipy.org/)
-* [nanobind](https://github.com/wjakob/nanobind)
-* [psutil](https://github.com/giampaolo/psutil)
+The project is BSD-licensed. NumPy, SciPy, nanobind, CMake, the platform C++
+runtime, and optional OpenMP are the only runtime/build foundations; no solver
+source is vendored.

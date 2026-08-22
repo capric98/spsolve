@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.13"]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Build and install
+        run: python -m pip install .
+      - name: Test installed package
+        run: python -m unittest discover -v -s tests -t .
+      - name: Benchmark smoke test
+        run: python benchmarks/factorization.py --quick --repeats 1 --warmups 0
