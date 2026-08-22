@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(_spsolve LANGUAGES CXX)
+project(_spsolve LANGUAGES C CXX)
 
 option(SP_USE_OPENMP "Enable OpenMP parallelism" ON)
 option(SP_ARCH_NATIVE "Enable host-specific compiler optimizations" OFF)
@@ -26,6 +26,45 @@ execute_process(
 find_package(nanobind CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
+set(ORDERING_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/suitesparse_ordering")
+add_library(spsolve_ordering STATIC
+  "${ORDERING_DIR}/suitesparse_config_shim.c"
+  "${ORDERING_DIR}/amd_1.c"
+  "${ORDERING_DIR}/amd_2.c"
+  "${ORDERING_DIR}/amd_aat.c"
+  "${ORDERING_DIR}/amd_control.c"
+  "${ORDERING_DIR}/amd_defaults.c"
+  "${ORDERING_DIR}/amd_dump.c"
+  "${ORDERING_DIR}/amd_info.c"
+  "${ORDERING_DIR}/amd_order.c"
+  "${ORDERING_DIR}/amd_post_tree.c"
+  "${ORDERING_DIR}/amd_postorder.c"
+  "${ORDERING_DIR}/amd_preprocess.c"
+  "${ORDERING_DIR}/amd_valid.c"
+  "${ORDERING_DIR}/amd_l1.c"
+  "${ORDERING_DIR}/amd_l2.c"
+  "${ORDERING_DIR}/amd_l_aat.c"
+  "${ORDERING_DIR}/amd_l_control.c"
+  "${ORDERING_DIR}/amd_l_defaults.c"
+  "${ORDERING_DIR}/amd_l_dump.c"
+  "${ORDERING_DIR}/amd_l_info.c"
+  "${ORDERING_DIR}/amd_l_order.c"
+  "${ORDERING_DIR}/amd_l_post_tree.c"
+  "${ORDERING_DIR}/amd_l_postorder.c"
+  "${ORDERING_DIR}/amd_l_preprocess.c"
+  "${ORDERING_DIR}/amd_l_valid.c"
+  "${ORDERING_DIR}/colamd.c"
+  "${ORDERING_DIR}/colamd_l.c"
+)
+target_include_directories(spsolve_ordering PUBLIC "${ORDERING_DIR}")
+target_compile_definitions(spsolve_ordering PRIVATE NPRINT NDEBUG)
+set_target_properties(spsolve_ordering PROPERTIES
+  C_STANDARD 11
+  C_STANDARD_REQUIRED ON
+  POSITION_INDEPENDENT_CODE ON
+  C_VISIBILITY_PRESET hidden
+)
+
 if(SP_USE_OPENMP)
   find_package(OpenMP QUIET)
 endif()
@@ -42,7 +81,8 @@ nanobind_add_module(
 )
 
 target_include_directories(_spsolve PRIVATE src)
-target_link_libraries(_spsolve PRIVATE Threads::Threads)
+target_include_directories(_spsolve PRIVATE "${ORDERING_DIR}")
+target_link_libraries(_spsolve PRIVATE Threads::Threads spsolve_ordering)
 
 if(MSVC)
   target_compile_options(_spsolve PRIVATE /O2 /EHsc)

@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 from numpy.testing import assert_allclose, assert_array_equal
-from scipy.sparse import csc_array, diags, random_array
+from scipy.sparse import csc_array, diags, random_array, tril
 
 from spsolve import SparseLU, factorized, splu
 
@@ -21,6 +21,207 @@ def general_matrix(n: int, density: float, seed: int) -> csc_array:
 
 
 class SparseLUTests(unittest.TestCase):
+    def assert_factor_identity(self, matrix, factor, *, atol=2e-13):
+        self.assertEqual(factor.nnz, factor.L.nnz + factor.U.nnz)
+        scaled = csc_array(
+            matrix.multiply(factor.row_scale[:, None]).multiply(
+                factor.col_scale[None, :]
+            )
+        )
+        permuted = scaled[factor.perm_r, :][:, factor.perm_c]
+        assert_allclose(
+            (permuted - factor.L @ factor.U).toarray(),
+            0.0,
+            atol=atol,
+        )
+
+    def test_adaptive_numeric_engines_and_stats(self):
+        n = 300
+        symmetric = csc_array(
+            diags(
+                [-np.ones(n - 1), 4.0 * np.ones(n), -np.ones(n - 1)],
+                [-1, 0, 1],
+                format="csc",
+            )
+        )
+        spd = splu(
+            symmetric,
+            backend="native",
+            permc_spec="MMD_AT_PLUS_A",
+            num_threads=8,
+        )
+        self.assertEqual(spd.stats["ordering_backend"], "SuiteSparse AMD 3.3.4")
+        self.assertEqual(spd.stats["numeric_engine"], "symmetric-ldlt-csc")
+        self.assertEqual(spd.stats["threading_backend"], "serial")
+        self.assertEqual(spd.stats["pivot_swaps"], 0)
+        self.assertGreater(spd.stats["supernodes"], 0)
+        self.assertGreaterEqual(spd.stats["max_supernode_width"], 1)
+        assert_array_equal(spd.perm_r, spd.perm_c)
+        self.assert_factor_identity(symmetric, spd)
+        expected = np.linspace(-1.0, 1.0, n)
+        assert_allclose(spd.solve(symmetric @ expected), expected, atol=1e-12)
+        assert_allclose(
+            spd.solve(symmetric.T @ expected, trans="T"),
+            expected,
+            atol=1e-12,
+        )
+
+        nonsymmetric = csc_array(
+            diags(
+                [-np.ones(n - 1), 4.0 * np.ones(n), 0.25 * np.ones(n - 2)],
+                [-1, 0, 2],
+                format="csc",
+            )
+        )
+        narrow = splu(
+            nonsymmetric,
+            backend="native",
+            permc_spec="MMD_AT_PLUS_A",
+            num_threads=8,
+        )
+        self.assertEqual(narrow.stats["numeric_engine"], "left-looking-csc")
+        self.assert_factor_identity(nonsymmetric, narrow)
+        assert_allclose(narrow.solve(nonsymmetric @ expected), expected, atol=1e-12)
+        assert_allclose(
+            narrow.solve(nonsymmetric.T @ expected, trans="T"),
+            expected,
+            atol=1e-12,
+        )
+
+        for name in (
+            "symbolic_seconds",
+            "numeric_seconds",
+            "assembly_seconds",
+            "peak_workspace_bytes",
+            "ordering_estimated_l_nnz",
+            "ordering_estimated_max_front",
+        ):
+            self.assertIn(name, narrow.stats)
+
+        spd_colamd = splu(
+            symmetric,
+            backend="native",
+            permc_spec="COLAMD",
+            num_threads=8,
+        )
+        self.assertEqual(spd_colamd.stats["numeric_engine"], "symmetric-ldlt-csc")
+        self.assertEqual(
+            spd_colamd.stats["ordering_backend"],
+            "SuiteSparse COLAMD 3.3.5",
+        )
+        self.assert_factor_identity(symmetric, spd_colamd)
+
+        narrow_colamd = splu(
+            nonsymmetric,
+            backend="native",
+            permc_spec="COLAMD",
+            num_threads=8,
+        )
+        self.assertEqual(narrow_colamd.stats["numeric_engine"], "left-looking-csc")
+        self.assertIn("AMD 3.3.4 classifier", narrow_colamd.stats["ordering_backend"])
+        self.assert_factor_identity(nonsymmetric, narrow_colamd)
+
+    def test_adaptive_csc_engines_on_random_patterns(self):
+        for seed in range(5):
+            with self.subTest(kind="spd", seed=seed):
+                rng = np.random.default_rng(seed)
+                lower = tril(
+                    random_array(
+                        (70, 70),
+                        density=0.04,
+                        format="csc",
+                        rng=rng,
+                        data_sampler=lambda size: rng.uniform(-0.5, 0.5, size),
+                    ),
+                    k=-1,
+                    format="csc",
+                )
+                off_diagonal = lower + lower.T
+                diagonal = np.asarray(abs(off_diagonal).sum(axis=1)).ravel() + 1.0
+                matrix = csc_array(
+                    off_diagonal + diags(diagonal, format="csc"),
+                    dtype=np.float64,
+                )
+                serial = splu(
+                    matrix,
+                    backend="native",
+                    permc_spec="MMD_AT_PLUS_A",
+                    num_threads=1,
+                )
+                threaded = splu(
+                    matrix,
+                    backend="native",
+                    permc_spec="MMD_AT_PLUS_A",
+                    num_threads=8,
+                )
+                self.assertEqual(serial.stats["numeric_engine"], "symmetric-ldlt-csc")
+                assert_array_equal(serial.perm_r, threaded.perm_r)
+                assert_array_equal(serial.perm_c, threaded.perm_c)
+                self.assert_factor_identity(matrix, threaded)
+
+            with self.subTest(kind="nonsymmetric", seed=seed):
+                matrix = general_matrix(70, 0.05, seed + 200)
+                row_order = np.random.default_rng(seed + 400).permutation(70)
+                matrix = csc_array(matrix[row_order, :])
+                serial = splu(
+                    matrix,
+                    backend="native",
+                    permc_spec="MMD_AT_PLUS_A",
+                    num_threads=1,
+                )
+                threaded = splu(
+                    matrix,
+                    backend="native",
+                    permc_spec="MMD_AT_PLUS_A",
+                    num_threads=8,
+                )
+                self.assertEqual(serial.stats["numeric_engine"], "left-looking-csc")
+                self.assertGreater(serial.stats["pivot_swaps"], 0)
+                assert_array_equal(serial.perm_r, threaded.perm_r)
+                assert_array_equal(serial.perm_c, threaded.perm_c)
+                self.assert_factor_identity(matrix, threaded)
+
+    def test_symmetric_indefinite_falls_back_to_pivoted_lu(self):
+        matrix = csc_array([[0.0, 1.0], [1.0, 0.0]])
+        factor = splu(
+            matrix,
+            backend="native",
+            permc_spec="MMD_AT_PLUS_A",
+            num_threads=4,
+        )
+        self.assertNotEqual(factor.stats["numeric_engine"], "symmetric-ldlt-csc")
+        expected = np.array([2.0, -3.0])
+        assert_allclose(factor.solve(matrix @ expected), expected)
+
+    def test_vendored_orderings_accept_both_index_widths(self):
+        matrix = general_matrix(45, 0.08, 99)
+        expected = np.arange(matrix.shape[0], dtype=np.float64)
+        for ordering in ("MMD_AT_PLUS_A", "COLAMD"):
+            factors = []
+            for dtype in (np.int32, np.int64):
+                converted = csc_array(
+                    (
+                        matrix.data.copy(),
+                        matrix.indices.astype(dtype),
+                        matrix.indptr.astype(dtype),
+                    ),
+                    shape=matrix.shape,
+                )
+                factors.append(
+                    splu(
+                        converted,
+                        backend="native",
+                        permc_spec=ordering,
+                    )
+                )
+            assert_array_equal(factors[0].perm_c, factors[1].perm_c)
+            for factor in factors:
+                assert_allclose(
+                    factor.solve(matrix @ expected),
+                    expected,
+                    atol=1e-11,
+                )
+
     def test_factor_identity_and_public_metadata(self):
         matrix = general_matrix(40, 0.12, 10)
         for ordering in ("NATURAL", "COLAMD", "MMD_AT_PLUS_A"):
@@ -37,17 +238,7 @@ class SparseLUTests(unittest.TestCase):
                 self.assertEqual(factor.nnz, factor.L.nnz + factor.U.nnz)
                 assert_allclose(factor.L.diagonal(), 1.0)
 
-                scaled = csc_array(
-                    matrix.multiply(factor.row_scale[:, None]).multiply(
-                        factor.col_scale[None, :]
-                    )
-                )
-                permuted = scaled[factor.perm_r, :][:, factor.perm_c]
-                assert_allclose(
-                    (permuted - factor.L @ factor.U).toarray(),
-                    0.0,
-                    atol=2e-14,
-                )
+                self.assert_factor_identity(matrix, factor, atol=2e-14)
                 self.assertEqual(factor.stats["shape"], matrix.shape)
                 self.assertEqual(factor.stats["ordering"], ordering)
                 self.assertGreaterEqual(factor.stats["row_updates"], 0)

@@ -26,8 +26,9 @@ The native object provides:
 - `shape`, `dtype`, and factor `nnz`;
 - immutable `perm_r`, `perm_c`, `row_scale`, and `col_scale` arrays;
 - lazily materialized CSC `L` and `U`;
-- a `stats` dictionary with ordering/factor times, fill, pivot and threading
-  counters.
+- a `stats` dictionary with ordering, symbolic, numeric, assembly, and total
+  factor times; ordering and numeric-engine names; fill and AMD estimates;
+  pivot/threading counters; and workspace/front diagnostics.
 
 `trans` accepts `N`, `T`, and `H`; `H` equals `T` for a real factor. A native
 factor accepts real numeric vector or matrix RHSs and returns `float64`.

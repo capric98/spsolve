@@ -1,5 +1,8 @@
 #include "sparse_lu.hpp"
 
+#include "amd.h"
+#include "colamd.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -8,12 +11,12 @@
 #include <condition_variable>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <numeric>
-#include <queue>
 #include <stdexcept>
 #include <thread>
-#include <unordered_set>
+#include <type_traits>
 #include <utility>
 
 #include <nanobind/stl/shared_ptr.h>
@@ -235,203 +238,144 @@ std::vector<std::vector<index_t>> build_pattern_rows(
     return rows;
 }
 
-[[nodiscard]] std::vector<index_t> eliminate_minimum_degree(
-    std::vector<std::unordered_set<index_t>> adjacency,
-    std::vector<index_t> dense_penalty,
-    std::vector<index_t> column_count,
+template <typename Int>
+[[nodiscard]] std::vector<index_t> checked_permutation(
+    const std::vector<Int>& raw,
     index_t n,
-    std::size_t directed_edges,
-    std::size_t dense_limit,
-    std::size_t edge_budget
+    const char* name
 ) {
-    struct HeapItem {
-        index_t score;
-        index_t count;
-        index_t col;
-        bool operator>(const HeapItem& other) const noexcept {
-            if (score != other.score) return score > other.score;
-            if (count != other.count) return count > other.count;
-            return col > other.col;
+    std::vector<index_t> permutation(static_cast<std::size_t>(n));
+    std::vector<unsigned char> seen(static_cast<std::size_t>(n), 0);
+    for (index_t position = 0; position < n; ++position) {
+        const index_t col = static_cast<index_t>(raw[static_cast<std::size_t>(position)]);
+        if (col < 0 || col >= n || seen[static_cast<std::size_t>(col)] != 0) {
+            throw std::runtime_error(std::string(name) + " returned an invalid permutation");
         }
-    };
-
-    auto score_of = [&](index_t col) -> index_t {
-        return static_cast<index_t>(adjacency[static_cast<std::size_t>(col)].size()) +
-               dense_penalty[static_cast<std::size_t>(col)];
-    };
-
-    std::priority_queue<HeapItem, std::vector<HeapItem>, std::greater<>> heap;
-    std::vector<unsigned char> active(static_cast<std::size_t>(n), 1);
-    for (index_t col = 0; col < n; ++col) {
-        heap.push({score_of(col), column_count[static_cast<std::size_t>(col)], col});
+        seen[static_cast<std::size_t>(col)] = 1;
+        permutation[static_cast<std::size_t>(position)] = col;
     }
-
-    std::vector<index_t> permutation;
-    permutation.reserve(static_cast<std::size_t>(n));
-
-    while (static_cast<index_t>(permutation.size()) < n) {
-        HeapItem item{};
-        bool found = false;
-        while (!heap.empty()) {
-            item = heap.top();
-            heap.pop();
-            if (!active[static_cast<std::size_t>(item.col)]) continue;
-            if (item.score != score_of(item.col)) continue;
-            found = true;
-            break;
-        }
-        if (!found) {
-            for (index_t col = 0; col < n; ++col) {
-                if (active[static_cast<std::size_t>(col)]) {
-                    item = {score_of(col), column_count[static_cast<std::size_t>(col)], col};
-                    found = true;
-                    break;
-                }
-            }
-        }
-        if (!found) {
-            throw std::runtime_error("column ordering failed to select all columns");
-        }
-
-        const index_t pivot = item.col;
-        active[static_cast<std::size_t>(pivot)] = 0;
-        permutation.push_back(pivot);
-
-        std::vector<index_t> neighbors;
-        neighbors.reserve(adjacency[static_cast<std::size_t>(pivot)].size());
-        for (const index_t col : adjacency[static_cast<std::size_t>(pivot)]) {
-            if (active[static_cast<std::size_t>(col)]) neighbors.push_back(col);
-        }
-        std::sort(neighbors.begin(), neighbors.end());
-
-        for (const index_t col : neighbors) {
-            adjacency[static_cast<std::size_t>(col)].erase(pivot);
-        }
-
-        const bool materialize_fill = neighbors.size() <= dense_limit &&
-            directed_edges + neighbors.size() * neighbors.size() <= edge_budget;
-        if (materialize_fill) {
-            for (std::size_t a = 0; a < neighbors.size(); ++a) {
-                const index_t ca = neighbors[a];
-                for (std::size_t b = a + 1; b < neighbors.size(); ++b) {
-                    const index_t cb = neighbors[b];
-                    if (adjacency[static_cast<std::size_t>(ca)].insert(cb).second) {
-                        adjacency[static_cast<std::size_t>(cb)].insert(ca);
-                        directed_edges += 2;
-                    }
-                }
-            }
-        } else {
-            const index_t penalty = static_cast<index_t>(neighbors.size() / 8);
-            for (const index_t col : neighbors) {
-                dense_penalty[static_cast<std::size_t>(col)] += penalty;
-            }
-        }
-
-        adjacency[static_cast<std::size_t>(pivot)].clear();
-        for (const index_t col : neighbors) {
-            heap.push({score_of(col), column_count[static_cast<std::size_t>(col)], col});
-        }
-    }
-
     return permutation;
 }
 
-// A clean-room column minimum-degree implementation. It constructs the sparse
-// column-intersection graph while pruning dense rows, then performs lazy exact
-// degree updates subject to a memory guard. The guard deliberately degrades to
-// an approximate degree rather than allowing ordering memory to become dense.
-[[nodiscard]] std::vector<index_t> column_amd_order(
-    const std::vector<std::vector<index_t>>& pattern_rows,
+template <typename Int>
+[[nodiscard]] std::vector<index_t> suitesparse_amd_order(
+    const Int* indices,
+    const Int* indptr,
     index_t n,
-    index_t nnz
+    double& estimated_l_nnz,
+    double& estimated_max_front
 ) {
-    if (n == 0) return {};
-    const auto dense_limit = static_cast<std::size_t>(
-        std::max<index_t>(16, std::min<index_t>(128,
-            static_cast<index_t>(10.0 * std::sqrt(static_cast<double>(n)))))
-    );
-    const std::size_t edge_budget = static_cast<std::size_t>(
-        std::max<index_t>(100'000, std::min<index_t>(20'000'000, 16 * nnz + 8 * n))
-    );
-    std::vector<std::unordered_set<index_t>> adjacency(static_cast<std::size_t>(n));
-    std::vector<index_t> dense_penalty(static_cast<std::size_t>(n), 0);
-    std::vector<index_t> column_count(static_cast<std::size_t>(n), 0);
-    std::size_t directed_edges = 0;
-
-    for (const auto& row : pattern_rows) {
-        for (const index_t col : row) {
-            ++column_count[static_cast<std::size_t>(col)];
+    double info[AMD_INFO]{};
+    if constexpr (std::is_same_v<Int, std::int32_t>) {
+        if (n > std::numeric_limits<std::int32_t>::max()) {
+            throw std::runtime_error("matrix is too large for 32-bit AMD ordering");
         }
-        if (row.size() > dense_limit) {
-            for (const index_t col : row) {
-                dense_penalty[static_cast<std::size_t>(col)] +=
-                    static_cast<index_t>(std::min<std::size_t>(row.size(), dense_limit));
-            }
-            continue;
+        std::vector<std::int32_t> permutation(static_cast<std::size_t>(n));
+        const int status = amd_order(
+            static_cast<std::int32_t>(n), indptr, indices,
+            permutation.data(), nullptr, info);
+        if (status != AMD_OK && status != AMD_OK_BUT_JUMBLED) {
+            throw std::runtime_error("AMD ordering failed with status " +
+                std::to_string(status));
         }
-        for (std::size_t a = 0; a < row.size(); ++a) {
-            for (std::size_t b = a + 1; b < row.size(); ++b) {
-                if (directed_edges + 2 > edge_budget) break;
-                const index_t ca = row[a];
-                const index_t cb = row[b];
-                if (adjacency[static_cast<std::size_t>(ca)].insert(cb).second) {
-                    adjacency[static_cast<std::size_t>(cb)].insert(ca);
-                    directed_edges += 2;
-                }
-            }
+        estimated_l_nnz = info[AMD_LNZ] + static_cast<double>(n);
+        estimated_max_front = info[AMD_DMAX];
+        return checked_permutation(permutation, n, "AMD");
+    } else {
+        std::vector<std::int64_t> permutation(static_cast<std::size_t>(n));
+        const int status = amd_l_order(
+            n, indptr, indices, permutation.data(), nullptr, info);
+        if (status != AMD_OK && status != AMD_OK_BUT_JUMBLED) {
+            throw std::runtime_error("AMD ordering failed with status " +
+                std::to_string(status));
         }
+        estimated_l_nnz = info[AMD_LNZ] + static_cast<double>(n);
+        estimated_max_front = info[AMD_DMAX];
+        return checked_permutation(permutation, n, "AMD");
     }
-    return eliminate_minimum_degree(
-        std::move(adjacency), std::move(dense_penalty), std::move(column_count),
-        n, directed_edges, dense_limit, edge_budget);
 }
 
-// Minimum degree on the structural graph of A + A^T is often a better choice
-// for PDE-like or nearly symmetric matrices. It is also cheaper to construct
-// than the column-intersection graph used above.
-[[nodiscard]] std::vector<index_t> symmetric_amd_order(
-    const std::vector<std::vector<index_t>>& pattern_rows,
+template <typename Int>
+[[nodiscard]] std::vector<index_t> suitesparse_colamd_order(
+    const Int* indices,
+    const Int* indptr,
     index_t n,
     index_t nnz
 ) {
-    if (n == 0) return {};
-    const auto dense_limit = static_cast<std::size_t>(
-        std::max<index_t>(16, std::min<index_t>(128,
-            static_cast<index_t>(10.0 * std::sqrt(static_cast<double>(n)))))
-    );
-    const std::size_t edge_budget = static_cast<std::size_t>(
-        std::max<index_t>(100'000, std::min<index_t>(20'000'000, 16 * nnz + 8 * n))
-    );
-    std::vector<std::unordered_set<index_t>> adjacency(static_cast<std::size_t>(n));
-    std::vector<index_t> dense_penalty(static_cast<std::size_t>(n), 0);
-    std::vector<index_t> column_count(static_cast<std::size_t>(n), 0);
-    std::size_t directed_edges = 0;
-
-    for (index_t row = 0; row < n; ++row) {
-        for (const index_t col : pattern_rows[static_cast<std::size_t>(row)]) {
-            ++column_count[static_cast<std::size_t>(col)];
-            if (row == col) continue;
-            if (directed_edges + 2 > edge_budget) {
-                ++dense_penalty[static_cast<std::size_t>(row)];
-                ++dense_penalty[static_cast<std::size_t>(col)];
-                continue;
+    const std::size_t recommended = [&] {
+        if constexpr (std::is_same_v<Int, std::int32_t>) {
+            if (n > std::numeric_limits<std::int32_t>::max() ||
+                nnz > std::numeric_limits<std::int32_t>::max()) {
+                return std::size_t{0};
             }
-            if (adjacency[static_cast<std::size_t>(row)].insert(col).second) {
-                adjacency[static_cast<std::size_t>(col)].insert(row);
-                directed_edges += 2;
-            }
+            return colamd_recommended(
+                static_cast<std::int32_t>(nnz), static_cast<std::int32_t>(n),
+                static_cast<std::int32_t>(n));
+        } else {
+            return colamd_l_recommended(nnz, n, n);
         }
+    }();
+    if (recommended == 0 || recommended >
+        static_cast<std::size_t>(std::numeric_limits<Int>::max())) {
+        throw std::runtime_error("COLAMD workspace size overflowed");
     }
-    return eliminate_minimum_degree(
-        std::move(adjacency), std::move(dense_penalty), std::move(column_count),
-        n, directed_edges, dense_limit, edge_budget);
+
+    std::vector<Int> workspace(recommended, Int{0});
+    std::copy(indices, indices + nnz, workspace.begin());
+    std::vector<Int> pointers(static_cast<std::size_t>(n + 1));
+    std::copy(indptr, indptr + n + 1, pointers.begin());
+    double knobs[COLAMD_KNOBS]{};
+    Int stats[COLAMD_STATS]{};
+    int ok = 0;
+    if constexpr (std::is_same_v<Int, std::int32_t>) {
+        colamd_set_defaults(knobs);
+        ok = colamd(
+            static_cast<std::int32_t>(n), static_cast<std::int32_t>(n),
+            static_cast<std::int32_t>(recommended), workspace.data(), pointers.data(),
+            knobs, stats);
+    } else {
+        colamd_l_set_defaults(knobs);
+        ok = colamd_l(n, n, static_cast<std::int64_t>(recommended),
+            workspace.data(), pointers.data(), knobs, stats);
+    }
+    if (ok == 0) {
+        throw std::runtime_error("COLAMD ordering failed with status " +
+            std::to_string(static_cast<index_t>(stats[COLAMD_STATUS])));
+    }
+    return checked_permutation(pointers, n, "COLAMD");
 }
 
 [[nodiscard]] const Entry* find_entry(const std::vector<Entry>& row, index_t col) {
     const auto it = std::lower_bound(row.begin(), row.end(), col,
         [](const Entry& entry, index_t needle) { return entry.col < needle; });
     return (it != row.end() && it->col == col) ? &*it : nullptr;
+}
+
+[[nodiscard]] std::tuple<std::vector<double>, std::vector<index_t>, std::vector<index_t>>
+csc_to_csr(
+    index_t n,
+    const std::vector<index_t>& col_ptr,
+    const std::vector<index_t>& row_indices,
+    const std::vector<double>& values
+) {
+    std::vector<index_t> row_ptr(static_cast<std::size_t>(n + 1), 0);
+    for (const index_t row : row_indices) {
+        ++row_ptr[static_cast<std::size_t>(row + 1)];
+    }
+    std::partial_sum(row_ptr.begin(), row_ptr.end(), row_ptr.begin());
+    std::vector<index_t> next = row_ptr;
+    std::vector<index_t> columns(values.size());
+    std::vector<double> output(values.size());
+    for (index_t col = 0; col < n; ++col) {
+        for (index_t p = col_ptr[static_cast<std::size_t>(col)];
+             p < col_ptr[static_cast<std::size_t>(col + 1)]; ++p) {
+            const index_t row = row_indices[static_cast<std::size_t>(p)];
+            const index_t destination = next[static_cast<std::size_t>(row)]++;
+            columns[static_cast<std::size_t>(destination)] = col;
+            output[static_cast<std::size_t>(destination)] = values[static_cast<std::size_t>(p)];
+        }
+    }
+    return {std::move(output), std::move(columns), std::move(row_ptr)};
 }
 
 [[nodiscard]] double work_row_value(const WorkRow& row, index_t col) {
@@ -563,6 +507,458 @@ void update_dense_row(
 }
 
 template <typename Int>
+[[nodiscard]] bool is_numerically_symmetric(
+    const double* data,
+    const Int* indices,
+    const Int* indptr,
+    index_t n
+) {
+    constexpr double tolerance = 16.0 * std::numeric_limits<double>::epsilon();
+    for (index_t col = 0; col < n; ++col) {
+        for (index_t p = static_cast<index_t>(indptr[col]);
+             p < static_cast<index_t>(indptr[col + 1]); ++p) {
+            const index_t row = static_cast<index_t>(indices[p]);
+            const Int* first = indices + static_cast<index_t>(indptr[row]);
+            const Int* last = indices + static_cast<index_t>(indptr[row + 1]);
+            const Int needle = static_cast<Int>(col);
+            const Int* transpose = std::lower_bound(first, last, needle);
+            if (transpose == last || *transpose != needle) return false;
+            const index_t transpose_position = static_cast<index_t>(transpose - indices);
+            const double left = data[p];
+            const double right = data[transpose_position];
+            const double scale = std::max({1.0, std::abs(left), std::abs(right)});
+            if (std::abs(left - right) > tolerance * scale) return false;
+        }
+    }
+    return true;
+}
+
+template <typename Int>
+[[nodiscard]] bool try_factorize_symmetric_positive_definite(
+    const std::shared_ptr<NativeSparseLU>& result,
+    const double* data,
+    const Int* indices,
+    const Int* indptr,
+    index_t n
+) {
+    const auto symbolic_start = Clock::now();
+    if (!is_numerically_symmetric(data, indices, indptr, n)) return false;
+
+    std::vector<index_t> inverse_permutation(static_cast<std::size_t>(n));
+    for (index_t k = 0; k < n; ++k) {
+        inverse_permutation[static_cast<std::size_t>(
+            result->perm_c_[static_cast<std::size_t>(k)])] = k;
+    }
+
+    std::vector<index_t> parent(static_cast<std::size_t>(n), -1);
+    std::vector<index_t> column_counts(static_cast<std::size_t>(n), 0);
+    std::vector<index_t> flags(static_cast<std::size_t>(n), -1);
+    for (index_t k = 0; k < n; ++k) {
+        flags[static_cast<std::size_t>(k)] = k;
+        const index_t original_col = result->perm_c_[static_cast<std::size_t>(k)];
+        for (index_t p = static_cast<index_t>(indptr[original_col]);
+             p < static_cast<index_t>(indptr[original_col + 1]); ++p) {
+            index_t node = inverse_permutation[static_cast<std::size_t>(indices[p])];
+            if (node >= k) continue;
+            while (flags[static_cast<std::size_t>(node)] != k) {
+                if (parent[static_cast<std::size_t>(node)] < 0) {
+                    parent[static_cast<std::size_t>(node)] = k;
+                }
+                ++column_counts[static_cast<std::size_t>(node)];
+                flags[static_cast<std::size_t>(node)] = k;
+                node = parent[static_cast<std::size_t>(node)];
+            }
+        }
+    }
+
+    std::vector<index_t> strict_col_ptr(static_cast<std::size_t>(n + 1), 0);
+    for (index_t k = 0; k < n; ++k) {
+        const index_t current = strict_col_ptr[static_cast<std::size_t>(k)];
+        const index_t count = column_counts[static_cast<std::size_t>(k)];
+        if (count > std::numeric_limits<index_t>::max() - current) {
+            throw std::overflow_error("symmetric factor size overflowed");
+        }
+        strict_col_ptr[static_cast<std::size_t>(k + 1)] = current + count;
+    }
+    const index_t strict_nnz = strict_col_ptr.back();
+    result->symbolic_seconds_ = std::chrono::duration<double>(
+        Clock::now() - symbolic_start).count();
+
+    const auto numeric_start = Clock::now();
+    std::vector<index_t> strict_rows(static_cast<std::size_t>(strict_nnz));
+    std::vector<double> strict_values(static_cast<std::size_t>(strict_nnz));
+    std::vector<double> diagonal(static_cast<std::size_t>(n), 0.0);
+    std::vector<double> accumulator(static_cast<std::size_t>(n), 0.0);
+    std::vector<index_t> pattern(static_cast<std::size_t>(n));
+    std::vector<index_t> path(static_cast<std::size_t>(n));
+    std::fill(flags.begin(), flags.end(), -1);
+    std::fill(column_counts.begin(), column_counts.end(), 0);
+
+    std::vector<double> symmetric_scale(static_cast<std::size_t>(n));
+    for (index_t row = 0; row < n; ++row) {
+        symmetric_scale[static_cast<std::size_t>(row)] =
+            std::sqrt(result->row_scale_[static_cast<std::size_t>(row)]);
+    }
+
+    std::uint64_t numeric_updates = 0;
+    for (index_t k = 0; k < n; ++k) {
+        index_t top = n;
+        flags[static_cast<std::size_t>(k)] = k;
+        accumulator[static_cast<std::size_t>(k)] = 0.0;
+        const index_t original_col = result->perm_c_[static_cast<std::size_t>(k)];
+        for (index_t p = static_cast<index_t>(indptr[original_col]);
+             p < static_cast<index_t>(indptr[original_col + 1]); ++p) {
+            const index_t original_row = static_cast<index_t>(indices[p]);
+            index_t node = inverse_permutation[static_cast<std::size_t>(original_row)];
+            if (node > k) continue;
+            accumulator[static_cast<std::size_t>(node)] += data[p] *
+                symmetric_scale[static_cast<std::size_t>(original_row)] *
+                symmetric_scale[static_cast<std::size_t>(original_col)];
+
+            index_t length = 0;
+            while (flags[static_cast<std::size_t>(node)] != k) {
+                path[static_cast<std::size_t>(length++)] = node;
+                flags[static_cast<std::size_t>(node)] = k;
+                node = parent[static_cast<std::size_t>(node)];
+            }
+            while (length > 0) {
+                pattern[static_cast<std::size_t>(--top)] =
+                    path[static_cast<std::size_t>(--length)];
+            }
+        }
+
+        double pivot = accumulator[static_cast<std::size_t>(k)];
+        accumulator[static_cast<std::size_t>(k)] = 0.0;
+        for (index_t position = top; position < n; ++position) {
+            const index_t source = pattern[static_cast<std::size_t>(position)];
+            const double source_value = accumulator[static_cast<std::size_t>(source)];
+            accumulator[static_cast<std::size_t>(source)] = 0.0;
+            const index_t first = strict_col_ptr[static_cast<std::size_t>(source)];
+            const index_t last = first + column_counts[static_cast<std::size_t>(source)];
+            numeric_updates += static_cast<std::uint64_t>(last - first);
+            for (index_t q = first; q < last; ++q) {
+                accumulator[static_cast<std::size_t>(
+                    strict_rows[static_cast<std::size_t>(q)])] -=
+                    strict_values[static_cast<std::size_t>(q)] * source_value;
+            }
+            const double denominator = diagonal[static_cast<std::size_t>(source)];
+            if (!(denominator > 0.0) || !std::isfinite(denominator)) return false;
+            const double multiplier = source_value / denominator;
+            pivot -= multiplier * source_value;
+            const index_t destination = last;
+            strict_rows[static_cast<std::size_t>(destination)] = k;
+            strict_values[static_cast<std::size_t>(destination)] = multiplier;
+            ++column_counts[static_cast<std::size_t>(source)];
+        }
+        if (!(pivot > 0.0) || !std::isfinite(pivot)) return false;
+        diagonal[static_cast<std::size_t>(k)] = pivot;
+    }
+    result->numeric_seconds_ = std::chrono::duration<double>(
+        Clock::now() - numeric_start).count();
+
+    index_t supernode_count = 0;
+    index_t maximum_supernode_width = 1;
+    for (index_t first_col = 0; first_col < n;) {
+        index_t last_col = first_col + 1;
+        while (last_col < n) {
+            const index_t previous = last_col - 1;
+            const index_t previous_count =
+                column_counts[static_cast<std::size_t>(previous)];
+            const index_t current_count =
+                column_counts[static_cast<std::size_t>(last_col)];
+            if (parent[static_cast<std::size_t>(previous)] != last_col ||
+                previous_count != current_count + 1 || previous_count == 0) {
+                break;
+            }
+            const index_t previous_first =
+                strict_col_ptr[static_cast<std::size_t>(previous)];
+            const index_t current_first =
+                strict_col_ptr[static_cast<std::size_t>(last_col)];
+            if (strict_rows[static_cast<std::size_t>(previous_first)] != last_col ||
+                !std::equal(
+                    strict_rows.begin() + previous_first + 1,
+                    strict_rows.begin() + previous_first + previous_count,
+                    strict_rows.begin() + current_first)) {
+                break;
+            }
+            ++last_col;
+        }
+        ++supernode_count;
+        maximum_supernode_width = std::max(
+            maximum_supernode_width, last_col - first_col);
+        first_col = last_col;
+    }
+
+    const auto assembly_start = Clock::now();
+    result->column_storage_ = true;
+    result->symmetric_ldlt_ = true;
+    result->numeric_engine_ = "symmetric-ldlt-csc";
+    result->l_col_ptr_ = std::move(strict_col_ptr);
+    result->l_row_indices_ = std::move(strict_rows);
+    result->l_values_ = std::move(strict_values);
+    result->ldlt_diagonal_ = std::move(diagonal);
+
+    result->perm_r_ = result->perm_c_;
+    result->pivot_swaps_ = 0;
+    result->row_scale_ = symmetric_scale;
+    result->col_scale_ = symmetric_scale;
+    if (strict_nnz > std::numeric_limits<index_t>::max() - n ||
+        strict_nnz + n > std::numeric_limits<index_t>::max() / 2) {
+        throw std::overflow_error("symmetric factor size overflowed");
+    }
+    result->factor_nnz_ = 2 * (strict_nnz + n);
+    result->fill_ratio_ = result->input_nnz_ == 0
+        ? 0.0
+        : static_cast<double>(result->factor_nnz_) /
+            static_cast<double>(result->input_nnz_);
+    result->row_updates_ = static_cast<index_t>(std::min<std::uint64_t>(
+        numeric_updates, static_cast<std::uint64_t>(std::numeric_limits<index_t>::max())));
+    result->supernodes_ = supernode_count;
+    result->max_supernode_width_ = maximum_supernode_width;
+    result->largest_front_ = std::max(
+        maximum_supernode_width,
+        static_cast<index_t>(result->ordering_estimated_max_front_));
+    result->peak_workspace_bytes_ = static_cast<std::uint64_t>(n) *
+        (3 * sizeof(double) + 8 * sizeof(index_t)) +
+        static_cast<std::uint64_t>(strict_nnz) *
+        (sizeof(double) + sizeof(index_t));
+    result->assembly_seconds_ = std::chrono::duration<double>(
+        Clock::now() - assembly_start).count();
+    result->factor_seconds_ = result->symbolic_seconds_ +
+        result->numeric_seconds_ + result->assembly_seconds_;
+    return true;
+}
+
+template <typename Int>
+void factorize_left_looking(
+    const std::shared_ptr<NativeSparseLU>& result,
+    const double* data,
+    const Int* indices,
+    const Int* indptr,
+    index_t n,
+    double diag_pivot_thresh
+) {
+    const auto numeric_start = Clock::now();
+    result->numeric_engine_ = "left-looking-csc";
+    result->column_storage_ = true;
+    result->l_col_ptr_.assign(static_cast<std::size_t>(n + 1), 0);
+    result->u_col_ptr_.assign(static_cast<std::size_t>(n + 1), 0);
+
+    const double estimate = std::max<double>(
+        static_cast<double>(2 * n), result->ordering_estimated_l_nnz_);
+    const std::size_t reserve = static_cast<std::size_t>(std::min<double>(
+        estimate * 1.15 + static_cast<double>(n),
+        static_cast<double>(std::numeric_limits<std::size_t>::max() / 4)));
+    result->l_row_indices_.reserve(reserve);
+    result->l_values_.reserve(reserve);
+    result->u_row_indices_.reserve(reserve);
+    result->u_values_.reserve(reserve);
+
+    std::vector<double> values(static_cast<std::size_t>(n), 0.0);
+    std::vector<index_t> inverse_row_permutation(static_cast<std::size_t>(n), -1);
+    std::vector<index_t> reach(static_cast<std::size_t>(n));
+    std::vector<index_t> node_stack(static_cast<std::size_t>(n));
+    std::vector<index_t> edge_stack(static_cast<std::size_t>(n));
+    std::vector<index_t> mark(static_cast<std::size_t>(n), -1);
+    std::vector<index_t> row_at_position(static_cast<std::size_t>(n));
+    std::vector<index_t> position_of_row(static_cast<std::size_t>(n));
+    std::iota(row_at_position.begin(), row_at_position.end(), index_t{0});
+    std::iota(position_of_row.begin(), position_of_row.end(), index_t{0});
+
+    result->peak_workspace_bytes_ = static_cast<std::uint64_t>(n) *
+        (sizeof(double) + 6 * sizeof(index_t));
+
+    auto depth_first_reach = [&](index_t root, index_t top, index_t generation) {
+        index_t head = 0;
+        node_stack[0] = root;
+        while (head >= 0) {
+            const index_t row = node_stack[static_cast<std::size_t>(head)];
+            const index_t factor_col =
+                inverse_row_permutation[static_cast<std::size_t>(row)];
+            if (mark[static_cast<std::size_t>(row)] != generation) {
+                mark[static_cast<std::size_t>(row)] = generation;
+                edge_stack[static_cast<std::size_t>(head)] = factor_col < 0
+                    ? 0
+                    : result->l_col_ptr_[static_cast<std::size_t>(factor_col)] + 1;
+            }
+
+            const index_t edge_end = factor_col < 0
+                ? 0
+                : result->l_col_ptr_[static_cast<std::size_t>(factor_col + 1)];
+            bool descended = false;
+            auto& edge = edge_stack[static_cast<std::size_t>(head)];
+            while (edge < edge_end) {
+                const index_t next = result->l_row_indices_[static_cast<std::size_t>(edge++)];
+                if (mark[static_cast<std::size_t>(next)] == generation) continue;
+                node_stack[static_cast<std::size_t>(++head)] = next;
+                descended = true;
+                break;
+            }
+            if (!descended) {
+                reach[static_cast<std::size_t>(--top)] = row;
+                --head;
+            }
+        }
+        return top;
+    };
+
+    for (index_t factor_col = 0; factor_col < n; ++factor_col) {
+        result->l_col_ptr_[static_cast<std::size_t>(factor_col)] =
+            static_cast<index_t>(result->l_values_.size());
+        result->u_col_ptr_[static_cast<std::size_t>(factor_col)] =
+            static_cast<index_t>(result->u_values_.size());
+
+        const index_t original_col =
+            result->perm_c_[static_cast<std::size_t>(factor_col)];
+        index_t top = n;
+        for (index_t p = static_cast<index_t>(indptr[original_col]);
+             p < static_cast<index_t>(indptr[original_col + 1]); ++p) {
+            const index_t row = static_cast<index_t>(indices[p]);
+            if (mark[static_cast<std::size_t>(row)] != factor_col) {
+                top = depth_first_reach(row, top, factor_col);
+            }
+        }
+
+        for (index_t p = top; p < n; ++p) {
+            values[static_cast<std::size_t>(reach[static_cast<std::size_t>(p)])] = 0.0;
+        }
+        for (index_t p = static_cast<index_t>(indptr[original_col]);
+             p < static_cast<index_t>(indptr[original_col + 1]); ++p) {
+            const index_t row = static_cast<index_t>(indices[p]);
+            values[static_cast<std::size_t>(row)] += data[p] *
+                result->row_scale_[static_cast<std::size_t>(row)] *
+                result->col_scale_[static_cast<std::size_t>(original_col)];
+        }
+
+        for (index_t p = top; p < n; ++p) {
+            const index_t row = reach[static_cast<std::size_t>(p)];
+            const index_t source_col =
+                inverse_row_permutation[static_cast<std::size_t>(row)];
+            if (source_col < 0) continue;
+            const double coefficient = values[static_cast<std::size_t>(row)];
+            const index_t first =
+                result->l_col_ptr_[static_cast<std::size_t>(source_col)] + 1;
+            const index_t last =
+                result->l_col_ptr_[static_cast<std::size_t>(source_col + 1)];
+            result->row_updates_ += last - first;
+            for (index_t q = first; q < last; ++q) {
+                const index_t target =
+                    result->l_row_indices_[static_cast<std::size_t>(q)];
+                double& target_value = values[static_cast<std::size_t>(target)];
+                target_value -= result->l_values_[static_cast<std::size_t>(q)] *
+                    coefficient;
+                if (!std::isfinite(target_value)) {
+                    throw std::runtime_error(
+                        "non-finite value generated during LU factorization");
+                }
+            }
+        }
+
+        index_t pivot_row = -1;
+        double maximum_value = 0.0;
+        for (index_t p = top; p < n; ++p) {
+            const index_t row = reach[static_cast<std::size_t>(p)];
+            if (inverse_row_permutation[static_cast<std::size_t>(row)] >= 0) continue;
+            const double magnitude = std::abs(values[static_cast<std::size_t>(row)]);
+            if (magnitude > maximum_value ||
+                (magnitude == maximum_value && magnitude != 0.0 &&
+                 (pivot_row < 0 ||
+                  position_of_row[static_cast<std::size_t>(row)] <
+                  position_of_row[static_cast<std::size_t>(pivot_row)]))) {
+                maximum_value = magnitude;
+                pivot_row = row;
+            }
+        }
+        if (pivot_row < 0 || maximum_value == 0.0 || !std::isfinite(maximum_value)) {
+            throw std::runtime_error(
+                "factor is exactly singular at column " + std::to_string(factor_col));
+        }
+
+        const index_t preferred_row = original_col;
+        if (inverse_row_permutation[static_cast<std::size_t>(preferred_row)] < 0) {
+            const double preferred = values[static_cast<std::size_t>(preferred_row)];
+            if (preferred != 0.0 &&
+                std::abs(preferred) >= diag_pivot_thresh * maximum_value) {
+                pivot_row = preferred_row;
+            }
+        }
+        const double pivot_value = values[static_cast<std::size_t>(pivot_row)];
+        if (pivot_value == 0.0 || !std::isfinite(pivot_value)) {
+            throw std::runtime_error(
+                "factor is exactly singular at column " + std::to_string(factor_col));
+        }
+
+        for (index_t p = top; p < n; ++p) {
+            const index_t row = reach[static_cast<std::size_t>(p)];
+            const index_t pivot_position =
+                inverse_row_permutation[static_cast<std::size_t>(row)];
+            const double value = values[static_cast<std::size_t>(row)];
+            if (pivot_position >= 0 && value != 0.0) {
+                result->u_row_indices_.push_back(pivot_position);
+                result->u_values_.push_back(value);
+            }
+        }
+        result->u_row_indices_.push_back(factor_col);
+        result->u_values_.push_back(pivot_value);
+
+        const index_t old_position =
+            position_of_row[static_cast<std::size_t>(pivot_row)];
+        const index_t displaced_row =
+            row_at_position[static_cast<std::size_t>(factor_col)];
+        std::swap(row_at_position[static_cast<std::size_t>(factor_col)],
+                  row_at_position[static_cast<std::size_t>(old_position)]);
+        position_of_row[static_cast<std::size_t>(pivot_row)] = factor_col;
+        position_of_row[static_cast<std::size_t>(displaced_row)] = old_position;
+        if (old_position != factor_col) ++result->pivot_swaps_;
+        inverse_row_permutation[static_cast<std::size_t>(pivot_row)] = factor_col;
+
+        result->l_row_indices_.push_back(pivot_row);
+        result->l_values_.push_back(1.0);
+        for (index_t p = top; p < n; ++p) {
+            const index_t row = reach[static_cast<std::size_t>(p)];
+            if (row == pivot_row ||
+                inverse_row_permutation[static_cast<std::size_t>(row)] >= 0) {
+                values[static_cast<std::size_t>(row)] = 0.0;
+                continue;
+            }
+            const double value = values[static_cast<std::size_t>(row)] / pivot_value;
+            if (value != 0.0) {
+                if (!std::isfinite(value)) {
+                    throw std::runtime_error(
+                        "non-finite multiplier generated during LU factorization");
+                }
+                result->l_row_indices_.push_back(row);
+                result->l_values_.push_back(value);
+            }
+            values[static_cast<std::size_t>(row)] = 0.0;
+        }
+        values[static_cast<std::size_t>(pivot_row)] = 0.0;
+        result->largest_front_ = std::max(
+            result->largest_front_, n - top);
+    }
+
+    result->l_col_ptr_[static_cast<std::size_t>(n)] =
+        static_cast<index_t>(result->l_values_.size());
+    result->u_col_ptr_[static_cast<std::size_t>(n)] =
+        static_cast<index_t>(result->u_values_.size());
+    for (index_t& row : result->l_row_indices_) {
+        row = inverse_row_permutation[static_cast<std::size_t>(row)];
+        if (row < 0) throw std::runtime_error("LU row permutation is incomplete");
+    }
+    result->perm_r_ = std::move(row_at_position);
+    result->factor_nnz_ = static_cast<index_t>(
+        result->l_values_.size() + result->u_values_.size());
+    result->fill_ratio_ = result->input_nnz_ == 0
+        ? 0.0
+        : static_cast<double>(result->factor_nnz_) /
+            static_cast<double>(result->input_nnz_);
+    result->supernodes_ = n;
+    result->numeric_seconds_ = std::chrono::duration<double>(
+        Clock::now() - numeric_start).count();
+    result->factor_seconds_ = result->numeric_seconds_;
+}
+
+template <typename Int>
 std::shared_ptr<NativeSparseLU> factorize_typed(
     const double* data,
     const Int* indices,
@@ -602,15 +998,19 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
         return result;
     }
 
-    const auto pattern_rows = build_pattern_rows(indices, indptr, n);
     const auto ordering_start = Clock::now();
     if (ordering == "NATURAL") {
         result->perm_c_.resize(static_cast<std::size_t>(n));
         std::iota(result->perm_c_.begin(), result->perm_c_.end(), index_t{0});
+        result->ordering_backend_ = "builtin";
     } else if (ordering == "COLAMD") {
-        result->perm_c_ = column_amd_order(pattern_rows, n, data_size);
+        result->perm_c_ = suitesparse_colamd_order(indices, indptr, n, data_size);
+        result->ordering_backend_ = "SuiteSparse COLAMD 3.3.5";
     } else {
-        result->perm_c_ = symmetric_amd_order(pattern_rows, n, data_size);
+        result->perm_c_ = suitesparse_amd_order(
+            indices, indptr, n, result->ordering_estimated_l_nnz_,
+            result->ordering_estimated_max_front_);
+        result->ordering_backend_ = "SuiteSparse AMD 3.3.4";
     }
     result->ordering_seconds_ = std::chrono::duration<double>(
         Clock::now() - ordering_start).count();
@@ -656,6 +1056,41 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
         result->col_scale_[static_cast<std::size_t>(col)] = scale;
     }
 
+    if (try_factorize_symmetric_positive_definite(
+            result, data, indices, indptr, n)) {
+        return result;
+    }
+
+    if (ordering == "COLAMD") {
+        // COLAMD does not expose frontal-size estimates. Run AMD's symbolic
+        // analysis as a cheap classifier while retaining the requested COLAMD
+        // permutation. Symmetric positive-definite inputs return above and do
+        // not pay for this second ordering pass.
+        const auto estimate_start = Clock::now();
+        (void)suitesparse_amd_order(
+            indices, indptr, n, result->ordering_estimated_l_nnz_,
+            result->ordering_estimated_max_front_);
+        result->ordering_backend_ += " + AMD 3.3.4 classifier";
+        result->ordering_seconds_ += std::chrono::duration<double>(
+            Clock::now() - estimate_start).count();
+    }
+
+    const double predicted_factor_nnz =
+        2.0 * result->ordering_estimated_l_nnz_;
+    const double predicted_fill = data_size == 0
+        ? 0.0
+        : predicted_factor_nnz / static_cast<double>(data_size);
+    const bool use_left_looking = ordering != "NATURAL" &&
+        result->ordering_estimated_max_front_ > 0.0 &&
+        result->ordering_estimated_max_front_ <= 192.0 &&
+        predicted_fill <= 20.0;
+    if (use_left_looking) {
+        factorize_left_looking(
+            result, data, indices, indptr, n, diag_pivot_thresh);
+        return result;
+    }
+
+    const auto pattern_rows = build_pattern_rows(indices, indptr, n);
     std::vector<WorkRow> rows(static_cast<std::size_t>(n));
     std::vector<std::vector<index_t>> active_columns(static_cast<std::size_t>(n));
     for (index_t new_col = 0; new_col < n; ++new_col) {
@@ -860,6 +1295,7 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
 
     result->factor_seconds_ = std::chrono::duration<double>(
         Clock::now() - factor_start).count();
+    result->numeric_seconds_ = result->factor_seconds_;
     result->perm_r_ = row_at_position;
     result->l_rows_.resize(static_cast<std::size_t>(n));
     result->factor_nnz_ = 0;
@@ -968,32 +1404,122 @@ void NativeSparseLU::solve_inplace(
                 }
             }
 
-            for (index_t row = 0; row < n_; ++row) {
-                const auto& lower = l_rows_[static_cast<std::size_t>(row)];
-                for (const Entry& entry : lower) {
-                    if (entry.col >= row) break;
-                    for (index_t col = first_rhs; col < last_rhs; ++col) {
-                        work[static_cast<std::size_t>(row * nrhs + col)] -=
-                            entry.value * work[static_cast<std::size_t>(entry.col * nrhs + col)];
+            if (column_storage_) {
+                if (symmetric_ldlt_) {
+                    for (index_t factor_col = 0; factor_col < n_; ++factor_col) {
+                        const index_t first =
+                            l_col_ptr_[static_cast<std::size_t>(factor_col)];
+                        const index_t last =
+                            l_col_ptr_[static_cast<std::size_t>(factor_col + 1)];
+                        for (index_t p = first; p < last; ++p) {
+                            const index_t row =
+                                l_row_indices_[static_cast<std::size_t>(p)];
+                            const double value = l_values_[static_cast<std::size_t>(p)];
+                            for (index_t col = first_rhs; col < last_rhs; ++col) {
+                                work[static_cast<std::size_t>(row * nrhs + col)] -=
+                                    value * work[static_cast<std::size_t>(
+                                        factor_col * nrhs + col)];
+                            }
+                        }
+                    }
+                    for (index_t factor_col = 0; factor_col < n_; ++factor_col) {
+                        const double diagonal =
+                            ldlt_diagonal_[static_cast<std::size_t>(factor_col)];
+                        for (index_t col = first_rhs; col < last_rhs; ++col) {
+                            work[static_cast<std::size_t>(factor_col * nrhs + col)] /=
+                                diagonal;
+                        }
+                    }
+                    for (index_t factor_col = n_; factor_col-- > 0;) {
+                        const index_t first =
+                            l_col_ptr_[static_cast<std::size_t>(factor_col)];
+                        const index_t last =
+                            l_col_ptr_[static_cast<std::size_t>(factor_col + 1)];
+                        for (index_t p = first; p < last; ++p) {
+                            const index_t row =
+                                l_row_indices_[static_cast<std::size_t>(p)];
+                            const double value = l_values_[static_cast<std::size_t>(p)];
+                            for (index_t col = first_rhs; col < last_rhs; ++col) {
+                                work[static_cast<std::size_t>(factor_col * nrhs + col)] -=
+                                    value * work[static_cast<std::size_t>(row * nrhs + col)];
+                            }
+                        }
+                    }
+                } else {
+                    for (index_t factor_col = 0; factor_col < n_; ++factor_col) {
+                        const index_t first =
+                            l_col_ptr_[static_cast<std::size_t>(factor_col)] + 1;
+                        const index_t last =
+                            l_col_ptr_[static_cast<std::size_t>(factor_col + 1)];
+                        for (index_t p = first; p < last; ++p) {
+                            const index_t row =
+                                l_row_indices_[static_cast<std::size_t>(p)];
+                            const double value = l_values_[static_cast<std::size_t>(p)];
+                            for (index_t col = first_rhs; col < last_rhs; ++col) {
+                                work[static_cast<std::size_t>(row * nrhs + col)] -=
+                                    value * work[static_cast<std::size_t>(
+                                        factor_col * nrhs + col)];
+                            }
+                        }
+                    }
+                    for (index_t factor_col = n_; factor_col-- > 0;) {
+                        const index_t first =
+                            u_col_ptr_[static_cast<std::size_t>(factor_col)];
+                        const index_t last =
+                            u_col_ptr_[static_cast<std::size_t>(factor_col + 1)];
+                        if (last <= first ||
+                            u_row_indices_[static_cast<std::size_t>(last - 1)] !=
+                                factor_col ||
+                            u_values_[static_cast<std::size_t>(last - 1)] == 0.0) {
+                            throw std::runtime_error(
+                                "factor contains a zero U diagonal");
+                        }
+                        const double diagonal =
+                            u_values_[static_cast<std::size_t>(last - 1)];
+                        for (index_t col = first_rhs; col < last_rhs; ++col) {
+                            work[static_cast<std::size_t>(factor_col * nrhs + col)] /=
+                                diagonal;
+                        }
+                        for (index_t p = first; p + 1 < last; ++p) {
+                            const index_t row =
+                                u_row_indices_[static_cast<std::size_t>(p)];
+                            const double value = u_values_[static_cast<std::size_t>(p)];
+                            for (index_t col = first_rhs; col < last_rhs; ++col) {
+                                work[static_cast<std::size_t>(row * nrhs + col)] -=
+                                    value * work[static_cast<std::size_t>(
+                                        factor_col * nrhs + col)];
+                            }
+                        }
                     }
                 }
-            }
+            } else {
+                for (index_t row = 0; row < n_; ++row) {
+                    const auto& lower = l_rows_[static_cast<std::size_t>(row)];
+                    for (const Entry& entry : lower) {
+                        if (entry.col >= row) break;
+                        for (index_t col = first_rhs; col < last_rhs; ++col) {
+                            work[static_cast<std::size_t>(row * nrhs + col)] -=
+                                entry.value * work[static_cast<std::size_t>(entry.col * nrhs + col)];
+                        }
+                    }
+                }
 
-            for (index_t row = n_; row-- > 0;) {
-                const auto& upper = u_rows_[static_cast<std::size_t>(row)];
-                const Entry* diagonal = find_entry(upper, row);
-                if (diagonal == nullptr || diagonal->value == 0.0) {
-                    throw std::runtime_error("factor contains a zero U diagonal");
-                }
-                for (const Entry& entry : upper) {
-                    if (entry.col <= row) continue;
-                    for (index_t col = first_rhs; col < last_rhs; ++col) {
-                        work[static_cast<std::size_t>(row * nrhs + col)] -=
-                            entry.value * work[static_cast<std::size_t>(entry.col * nrhs + col)];
+                for (index_t row = n_; row-- > 0;) {
+                    const auto& upper = u_rows_[static_cast<std::size_t>(row)];
+                    const Entry* diagonal = find_entry(upper, row);
+                    if (diagonal == nullptr || diagonal->value == 0.0) {
+                        throw std::runtime_error("factor contains a zero U diagonal");
                     }
-                }
-                for (index_t col = first_rhs; col < last_rhs; ++col) {
-                    work[static_cast<std::size_t>(row * nrhs + col)] /= diagonal->value;
+                    for (const Entry& entry : upper) {
+                        if (entry.col <= row) continue;
+                        for (index_t col = first_rhs; col < last_rhs; ++col) {
+                            work[static_cast<std::size_t>(row * nrhs + col)] -=
+                                entry.value * work[static_cast<std::size_t>(entry.col * nrhs + col)];
+                        }
+                    }
+                    for (index_t col = first_rhs; col < last_rhs; ++col) {
+                        work[static_cast<std::size_t>(row * nrhs + col)] /= diagonal->value;
+                    }
                 }
             }
 
@@ -1015,33 +1541,122 @@ void NativeSparseLU::solve_inplace(
                 }
             }
 
-            // U^T is lower triangular. Scatter each solved component forward.
-            for (index_t row = 0; row < n_; ++row) {
-                const auto& upper = u_rows_[static_cast<std::size_t>(row)];
-                const Entry* diagonal = find_entry(upper, row);
-                if (diagonal == nullptr || diagonal->value == 0.0) {
-                    throw std::runtime_error("factor contains a zero U diagonal");
-                }
-                for (index_t col = first_rhs; col < last_rhs; ++col) {
-                    work[static_cast<std::size_t>(row * nrhs + col)] /= diagonal->value;
-                }
-                for (const Entry& entry : upper) {
-                    if (entry.col <= row) continue;
-                    for (index_t col = first_rhs; col < last_rhs; ++col) {
-                        work[static_cast<std::size_t>(entry.col * nrhs + col)] -=
-                            entry.value * work[static_cast<std::size_t>(row * nrhs + col)];
+            if (column_storage_) {
+                if (symmetric_ldlt_) {
+                    for (index_t factor_col = 0; factor_col < n_; ++factor_col) {
+                        const index_t first =
+                            l_col_ptr_[static_cast<std::size_t>(factor_col)];
+                        const index_t last =
+                            l_col_ptr_[static_cast<std::size_t>(factor_col + 1)];
+                        for (index_t p = first; p < last; ++p) {
+                            const index_t row =
+                                l_row_indices_[static_cast<std::size_t>(p)];
+                            const double value = l_values_[static_cast<std::size_t>(p)];
+                            for (index_t col = first_rhs; col < last_rhs; ++col) {
+                                work[static_cast<std::size_t>(row * nrhs + col)] -=
+                                    value * work[static_cast<std::size_t>(
+                                        factor_col * nrhs + col)];
+                            }
+                        }
+                    }
+                    for (index_t factor_col = 0; factor_col < n_; ++factor_col) {
+                        const double diagonal =
+                            ldlt_diagonal_[static_cast<std::size_t>(factor_col)];
+                        for (index_t col = first_rhs; col < last_rhs; ++col) {
+                            work[static_cast<std::size_t>(factor_col * nrhs + col)] /=
+                                diagonal;
+                        }
+                    }
+                    for (index_t factor_col = n_; factor_col-- > 0;) {
+                        const index_t first =
+                            l_col_ptr_[static_cast<std::size_t>(factor_col)];
+                        const index_t last =
+                            l_col_ptr_[static_cast<std::size_t>(factor_col + 1)];
+                        for (index_t p = first; p < last; ++p) {
+                            const index_t row =
+                                l_row_indices_[static_cast<std::size_t>(p)];
+                            const double value = l_values_[static_cast<std::size_t>(p)];
+                            for (index_t col = first_rhs; col < last_rhs; ++col) {
+                                work[static_cast<std::size_t>(factor_col * nrhs + col)] -=
+                                    value * work[static_cast<std::size_t>(row * nrhs + col)];
+                            }
+                        }
+                    }
+                } else {
+                    for (index_t factor_col = 0; factor_col < n_; ++factor_col) {
+                        const index_t first =
+                            u_col_ptr_[static_cast<std::size_t>(factor_col)];
+                        const index_t last =
+                            u_col_ptr_[static_cast<std::size_t>(factor_col + 1)];
+                        if (last <= first ||
+                            u_values_[static_cast<std::size_t>(last - 1)] == 0.0) {
+                            throw std::runtime_error(
+                                "factor contains a zero U diagonal");
+                        }
+                        for (index_t p = first; p + 1 < last; ++p) {
+                            const index_t row =
+                                u_row_indices_[static_cast<std::size_t>(p)];
+                            const double value =
+                                u_values_[static_cast<std::size_t>(p)];
+                            for (index_t col = first_rhs; col < last_rhs; ++col) {
+                                work[static_cast<std::size_t>(factor_col * nrhs + col)] -=
+                                    value * work[static_cast<std::size_t>(
+                                        row * nrhs + col)];
+                            }
+                        }
+                        const double diagonal =
+                            u_values_[static_cast<std::size_t>(last - 1)];
+                        for (index_t col = first_rhs; col < last_rhs; ++col) {
+                            work[static_cast<std::size_t>(factor_col * nrhs + col)] /=
+                                diagonal;
+                        }
+                    }
+                    for (index_t factor_col = n_; factor_col-- > 0;) {
+                        const index_t first =
+                            l_col_ptr_[static_cast<std::size_t>(factor_col)] + 1;
+                        const index_t last =
+                            l_col_ptr_[static_cast<std::size_t>(factor_col + 1)];
+                        for (index_t p = first; p < last; ++p) {
+                            const index_t row =
+                                l_row_indices_[static_cast<std::size_t>(p)];
+                            const double value = l_values_[static_cast<std::size_t>(p)];
+                            for (index_t col = first_rhs; col < last_rhs; ++col) {
+                                work[static_cast<std::size_t>(factor_col * nrhs + col)] -=
+                                    value * work[static_cast<std::size_t>(
+                                        row * nrhs + col)];
+                            }
+                        }
                     }
                 }
-            }
-
-            // L^T is unit upper triangular.
-            for (index_t row = n_; row-- > 0;) {
-                const auto& lower = l_rows_[static_cast<std::size_t>(row)];
-                for (const Entry& entry : lower) {
-                    if (entry.col >= row) break;
+            } else {
+                // U^T is lower triangular. Scatter each solved component forward.
+                for (index_t row = 0; row < n_; ++row) {
+                    const auto& upper = u_rows_[static_cast<std::size_t>(row)];
+                    const Entry* diagonal = find_entry(upper, row);
+                    if (diagonal == nullptr || diagonal->value == 0.0) {
+                        throw std::runtime_error("factor contains a zero U diagonal");
+                    }
                     for (index_t col = first_rhs; col < last_rhs; ++col) {
-                        work[static_cast<std::size_t>(entry.col * nrhs + col)] -=
-                            entry.value * work[static_cast<std::size_t>(row * nrhs + col)];
+                        work[static_cast<std::size_t>(row * nrhs + col)] /= diagonal->value;
+                    }
+                    for (const Entry& entry : upper) {
+                        if (entry.col <= row) continue;
+                        for (index_t col = first_rhs; col < last_rhs; ++col) {
+                            work[static_cast<std::size_t>(entry.col * nrhs + col)] -=
+                                entry.value * work[static_cast<std::size_t>(row * nrhs + col)];
+                        }
+                    }
+                }
+
+                // L^T is unit upper triangular.
+                for (index_t row = n_; row-- > 0;) {
+                    const auto& lower = l_rows_[static_cast<std::size_t>(row)];
+                    for (const Entry& entry : lower) {
+                        if (entry.col >= row) break;
+                        for (index_t col = first_rhs; col < last_rhs; ++col) {
+                            work[static_cast<std::size_t>(entry.col * nrhs + col)] -=
+                                entry.value * work[static_cast<std::size_t>(row * nrhs + col)];
+                        }
                     }
                 }
             }
@@ -1060,6 +1675,32 @@ void NativeSparseLU::solve_inplace(
 
 std::tuple<std::vector<double>, std::vector<index_t>, std::vector<index_t>>
 NativeSparseLU::export_l_csr() const {
+    if (column_storage_) {
+        if (symmetric_ldlt_) {
+            std::vector<double> values;
+            std::vector<index_t> rows;
+            std::vector<index_t> column_ptr(
+                static_cast<std::size_t>(n_ + 1), 0);
+            values.reserve(static_cast<std::size_t>(l_values_.size() + n_));
+            rows.reserve(static_cast<std::size_t>(l_row_indices_.size() + n_));
+            for (index_t col = 0; col < n_; ++col) {
+                column_ptr[static_cast<std::size_t>(col)] =
+                    static_cast<index_t>(values.size());
+                rows.push_back(col);
+                values.push_back(1.0);
+                const index_t first = l_col_ptr_[static_cast<std::size_t>(col)];
+                const index_t last = l_col_ptr_[static_cast<std::size_t>(col + 1)];
+                for (index_t p = first; p < last; ++p) {
+                    rows.push_back(l_row_indices_[static_cast<std::size_t>(p)]);
+                    values.push_back(l_values_[static_cast<std::size_t>(p)]);
+                }
+            }
+            column_ptr[static_cast<std::size_t>(n_)] =
+                static_cast<index_t>(values.size());
+            return csc_to_csr(n_, column_ptr, rows, values);
+        }
+        return csc_to_csr(n_, l_col_ptr_, l_row_indices_, l_values_);
+    }
     std::vector<double> data;
     std::vector<index_t> indices;
     std::vector<index_t> indptr(static_cast<std::size_t>(n_ + 1), 0);
@@ -1077,6 +1718,32 @@ NativeSparseLU::export_l_csr() const {
 
 std::tuple<std::vector<double>, std::vector<index_t>, std::vector<index_t>>
 NativeSparseLU::export_u_csr() const {
+    if (column_storage_) {
+        if (symmetric_ldlt_) {
+            std::vector<double> data;
+            std::vector<index_t> indices;
+            std::vector<index_t> indptr(static_cast<std::size_t>(n_ + 1), 0);
+            data.reserve(static_cast<std::size_t>(l_values_.size() + n_));
+            indices.reserve(static_cast<std::size_t>(l_row_indices_.size() + n_));
+            for (index_t row = 0; row < n_; ++row) {
+                const double diagonal =
+                    ldlt_diagonal_[static_cast<std::size_t>(row)];
+                indices.push_back(row);
+                data.push_back(diagonal);
+                const index_t first = l_col_ptr_[static_cast<std::size_t>(row)];
+                const index_t last = l_col_ptr_[static_cast<std::size_t>(row + 1)];
+                for (index_t p = first; p < last; ++p) {
+                    indices.push_back(l_row_indices_[static_cast<std::size_t>(p)]);
+                    data.push_back(
+                        diagonal * l_values_[static_cast<std::size_t>(p)]);
+                }
+                indptr[static_cast<std::size_t>(row + 1)] =
+                    static_cast<index_t>(data.size());
+            }
+            return {std::move(data), std::move(indices), std::move(indptr)};
+        }
+        return csc_to_csr(n_, u_col_ptr_, u_row_indices_, u_values_);
+    }
     std::vector<double> data;
     std::vector<index_t> indices;
     std::vector<index_t> indptr(static_cast<std::size_t>(n_ + 1), 0);
@@ -1095,18 +1762,31 @@ NativeSparseLU::export_u_csr() const {
 nb::dict NativeSparseLU::stats() const {
     nb::dict output;
     output["ordering"] = ordering_;
+    output["ordering_backend"] = ordering_backend_;
+    output["numeric_engine"] = numeric_engine_;
     output["input_nnz"] = input_nnz_;
     output["factor_nnz"] = factor_nnz_;
     output["fill_ratio"] = fill_ratio_;
     output["ordering_seconds"] = ordering_seconds_;
     output["factor_seconds"] = factor_seconds_;
+    output["symbolic_seconds"] = symbolic_seconds_;
+    output["numeric_seconds"] = numeric_seconds_;
+    output["assembly_seconds"] = assembly_seconds_;
     output["num_threads"] = factor_threads_;
-    output["threading_backend"] = factor_threads_ > 1 ? "std::thread" : "serial";
+    output["threading_backend"] =
+        (!column_storage_ && factor_threads_ > 1) ? "std::thread" : "serial";
     output["parallel_steps"] = parallel_steps_;
     output["pivot_swaps"] = pivot_swaps_;
     output["row_updates"] = row_updates_;
     output["largest_front"] = largest_front_;
     output["dense_rows"] = dense_rows_;
+    output["supernodes"] = supernodes_;
+    output["max_supernode_width"] = max_supernode_width_;
+    output["parallel_panels"] = parallel_panels_;
+    output["dense_update_flops"] = dense_update_flops_;
+    output["peak_workspace_bytes"] = peak_workspace_bytes_;
+    output["ordering_estimated_l_nnz"] = ordering_estimated_l_nnz_;
+    output["ordering_estimated_max_front"] = ordering_estimated_max_front_;
     return output;
 }
 

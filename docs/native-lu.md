@@ -2,10 +2,11 @@
 
 ## Scope
 
-The native backend factors square, nonsymmetric `float64` SciPy sparse arrays
-without MKL, SuiteSparse, or another external factorization package. It is a
-clean-room implementation intended to establish a portable correctness and
-threading baseline while retaining SciPy as a mature fallback.
+The native backend factors square `float64` SciPy sparse arrays without an
+external factorization or BLAS runtime. Its numerical factorization kernels
+are implemented in this project. A small BSD-licensed subset of SuiteSparse
+AMD 3.3.4 and COLAMD 3.3.5 is compiled in for fill-reducing orderings; SciPy is
+retained as the mature compatibility fallback.
 
 The stored relationship is
 
@@ -23,27 +24,36 @@ systems.
 1. Python converts the input to a copied, canonical CSC array, sums duplicate
    entries, removes explicit zeros, sorts indices, and checks shape/dtype.
 2. C++ validates CSC bounds and optional finiteness.
-3. Rows and columns are equilibrated by infinity norms. Structural zero rows or
-   columns are reported as singular before numerical elimination.
-4. A column ordering is selected:
+3. A column ordering is selected:
    - `NATURAL` preserves input order.
-   - `COLAMD` is a clean-room approximate minimum-degree ordering of the
-     column-intersection graph. Dense rows and graph growth are bounded.
-   - `MMD_AT_PLUS_A` performs minimum-degree elimination on the structural
-     graph of `A + A.T`; it is generally preferable for PDE-like or nearly
-     symmetric patterns.
-5. Sparse Gaussian elimination stores sorted active rows. Rows whose remaining
-   front becomes at least 25% dense switch to a contiguous dense-tail
-   representation, avoiding repeated sparse merges and allocator contention.
-   At every column the factor chooses the largest available pivot unless the
-   original diagonal candidate meets `diag_pivot_thresh * column_max`.
-6. Rows below a pivot are independent. A persistent `std::thread` worker pool
-   dynamically schedules sufficiently large row-update fronts; small fronts
-   stay serial to avoid synchronization overhead.
-7. `L` and `U` are retained in row form. Their public CSC objects are built
-   lazily. Solves traverse these factors and parallelize blocks of independent
-   right-hand sides.
-8. Python optionally performs two componentwise backward-error refinement
+   - `COLAMD` uses the vendored COLAMD routine on the input pattern. For a
+     nonsymmetric result, a second AMD analysis supplies classifier estimates
+     without replacing the requested COLAMD permutation.
+   - `MMD_AT_PLUS_A` uses the vendored AMD routine on the structural graph of
+     `A + A.T`. AMD's fill and maximum-front estimates also guide numeric
+     engine selection.
+4. Rows and columns are equilibrated by infinity norms. Structural zero rows or
+   columns are reported as singular before numerical elimination.
+5. The factorizer chooses one of three numerical engines:
+   - A numerically symmetric matrix first attempts a sparse simplicial `LDL.T`
+     factorization with symmetric equilibration, using whichever column
+     permutation the caller requested as a symmetric permutation.
+     Positive pivots certify the SPD path. Its factors are exposed through the
+     common LU contract as `L` and `D @ L.T`; internally it retains only the
+     strict lower triangle and diagonal, constructing public `L` and `U`
+     lazily. A non-positive pivot falls back to pivoted LU.
+   - A nonsymmetric matrix with AMD-estimated maximum front at most 192 and
+     predicted fill at most 20 uses a Gilbert-Peierls-style left-looking CSC
+     LU. It performs threshold partial pivoting while keeping sparse work in
+     contiguous column arrays.
+   - Wider or fill-heavy patterns use the row-hybrid LU. Sorted sparse rows
+     convert to dense tails when their remaining front is at least 25% dense.
+     A persistent `std::thread` team dynamically schedules sufficiently large
+     independent row-update fronts.
+6. Factors remain in their engine-native CSC or row storage. Public CSC `L`
+   and `U` objects are materialized lazily. Solves operate directly on the
+   retained storage and parallelize blocks of independent right-hand sides.
+7. Python optionally performs two componentwise backward-error refinement
    steps using the original matrix.
 
 All arithmetic within a row follows a deterministic order. A threaded factor
@@ -52,15 +62,17 @@ factor for the same input and options.
 
 ## Threading behavior
 
-Sparse LU has a sequential pivot dependency. The native backend parallelizes
-the expensive work below each selected pivot, not the pivot selection itself.
-Statistics expose `parallel_steps`, `row_updates`, and `largest_front` so users
-can tell whether a problem supplied meaningful parallel work.
+Sparse LU has a sequential pivot dependency. The row-hybrid engine parallelizes
+the expensive work below each selected pivot, not pivot selection itself.
+Statistics expose `numeric_engine`, `parallel_steps`, `row_updates`, and
+`largest_front` so users can tell which path ran and whether a problem supplied
+meaningful parallel work.
 
-Good candidates have wide, irregular fronts and substantial fill. Banded,
-triangular, or very small problems usually remain serial and should not be
-expected to speed up. Factor solves parallelize across RHS blocks; a single RHS
-solve is serial.
+Good threading candidates have wide, irregular fronts and substantial fill.
+Banded and PDE-like problems usually select a low-overhead serial CSC engine;
+their goal is parity through efficient sparse traversal rather than parallel
+speedup. Factor solves parallelize across RHS blocks; a single RHS solve is
+serial.
 
 The factor worker pool uses only the C++ standard library. OpenMP is optional
 and currently accelerates the established multi-RHS triangular kernels. A
@@ -70,6 +82,7 @@ build without OpenMP remains functional.
 
 - row and column infinity-norm equilibration;
 - threshold partial pivoting in every active column;
+- positive-pivot validation before accepting the SPD specialization;
 - structural and exact numerical singular detection;
 - rejection of non-finite inputs by default;
 - overflow checks during scaling and row updates;
@@ -84,12 +97,12 @@ when their backward residual is small.
 - native matrix values are `float64` only;
 - no complex native factors yet (the SciPy backend handles them);
 - ordering and pivot selection are single-threaded;
-- numerical elimination is row-oriented rather than supernodal;
+- the CSC engines are simplicial rather than blocked supernodal kernels;
 - there is no out-of-core mode or symbolic-factor reuse across matrices with
   the same pattern.
 
-The key remaining performance step is a supernodal/panel representation with
-dense blocked updates and a dependency scheduler. That would improve cache
-reuse and vectorization and reduce allocator pressure on large fronts. The
-current backend is intentionally not promoted to the default until the
-reproducible gate passes.
+Fundamental supernodes are detected for diagnostics on the SPD path, but the
+current implementation does not yet execute blocked panel updates. A future
+supernodal path could improve cache reuse on larger fronts. Default promotion
+also remains contingent on repeated release-build results on both Windows and
+Linux, as described in the benchmark notes.

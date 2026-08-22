@@ -1,10 +1,11 @@
 # spsolve
 
 `spsolve` is a lightweight sparse direct solver for Python. It provides a
-clean-room, reusable, multithreaded sparse LU implementation for general real
-matrices and a fast native triangular solver. The native extension does not
-link against Intel MKL or another external solver library; SciPy remains the
-sparse-container compatibility layer and explicit fallback.
+reusable, adaptive, multithreaded sparse LU implementation for general real
+matrices and a fast native triangular solver. The extension has no external
+factorization or BLAS runtime dependency; SciPy remains the sparse-container
+compatibility layer and explicit fallback. A small BSD-licensed AMD/COLAMD
+ordering subset is compiled into the extension.
 
 The native LU backend is currently opt-in. The default `"auto"` backend uses
 SciPy SuperLU for general matrices until the documented performance promotion
@@ -75,15 +76,17 @@ Parallel work is across independent RHS blocks.
 - `backend="auto"`: SciPy for general matrices; native for the established
   triangular float64 fast path.
 - `backend="native"`: experimental native LU for float64 matrices. Ordering
-  choices are `NATURAL`, clean-room approximate `COLAMD`, and
+  choices are `NATURAL`, SuiteSparse `COLAMD`, and SuiteSparse AMD-backed
   `MMD_AT_PLUS_A`.
 - `backend="scipy"`: explicit SciPy SuperLU fallback, including complex and
   non-float64 problems supported by SciPy.
 
 Sparse LU exposes limited parallelism for narrow-front or already triangular
 matrices because pivots are dependency ordered. Irregular matrices with wide
-fronts benefit most. The native implementation remains opt-in because it does
-not yet consistently match SuperLU's mature supernodal performance.
+fronts benefit most. Structured symmetric positive-definite and narrow-front
+problems use lower-overhead serial CSC engines instead. The native backend now
+passes the checked-in Windows performance gate, but remains opt-in until that
+result is repeated consistently on both Windows and Linux release builds.
 
 See [the implementation notes](docs/native-lu.md), [API notes](docs/api.md),
 and [benchmark gate](docs/benchmarking.md) for details.
@@ -97,5 +100,6 @@ python benchmarks/factorization.py --threads 8 --gate
 ```
 
 The project is BSD-licensed. NumPy, SciPy, nanobind, CMake, the platform C++
-runtime, and optional OpenMP are the only runtime/build foundations; no solver
-source is vendored.
+runtime, and optional OpenMP are the runtime/build foundations. BSD-licensed
+AMD/COLAMD ordering source is vendored; no third-party factorization solver or
+BLAS implementation is included. See [third-party notices](THIRD_PARTY_NOTICES.md).

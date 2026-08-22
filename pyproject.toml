@@ -33,6 +33,11 @@ build-backend = "scikit_build_core.build"
 [tool.scikit-build]
 # Tells scikit-build-core where to find the Python package source
 wheel.packages = ["src/spsolve"]
+wheel.license-files = [
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "third_party/suitesparse_ordering/LICENSE-*.txt",
+]
 
 
 [tool.cibuildwheel]
