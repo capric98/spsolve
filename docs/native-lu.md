@@ -63,8 +63,10 @@ systems.
      equilibration. Both engines perform threshold partial pivoting.
    - Wider or fill-heavy patterns use the row-hybrid LU. Sorted sparse rows
      convert to dense tails when their remaining front is at least 25% dense.
-     A persistent `std::thread` team dynamically schedules sufficiently large
-     independent row-update fronts.
+     Sparse rows receive eager updates and retain their fill adjacency. When
+     at least 32 active rows are dense with at least 128 columns remaining,
+     dense rows use panels of up to 32 pivot columns. A persistent `std::thread`
+     team schedules large sparse row updates and dense output tiles.
 6. Factors remain in their engine-native CSC or row storage. Public CSC `L`
    and `U` objects are materialized lazily. Solves operate directly on the
    retained storage and parallelize blocks of independent right-hand sides.
@@ -109,13 +111,50 @@ work counters are published until every positive pivot and finite intermediate
 has passed validation. Each output entry visits contributors in the same order
 at every thread count.
 
+## Dense LU panels
+
+Pivoting remains sequential. Sparse rows receive each complete U-row update
+immediately. Dense rows keep every coefficient inside the current panel
+current, while deferring updates beyond its end. Before a dense row becomes
+a pivot, its deferred tail is materialized from its L multipliers and retained
+U rows in ascending pivot order. U is therefore complete before it supplies
+any subsequent update, even when row swaps cross panel boundaries.
+
+At a panel boundary, surviving affected dense rows receive a tiled
+`L_panel * U_panel` update. Packing uses the union of actual U tail columns;
+it does not sweep unrelated zero tails. Every output starts from its current
+value and subtracts each source term in pivot order. Independent 16-by-64
+tiles use a portable 4-by-4 microkernel with an SSE2 implementation on
+supported compiler targets. Sparse-to-dense conversions occur only after
+this flush, so conversion neither omits nor duplicates an update. After
+activation, short trailing panels retain the same recurrence.
+
+The activation thresholds are independent of the requested thread count.
+Purely sparse phases keep their existing update scheduler and do not allocate
+panel packing buffers. Selected pivot rows release their dense storage only
+after U has been retained; eliminated rows never participate in a later flush.
+
 ## Threading behavior
 
 Sparse LU has a sequential pivot dependency. The row-hybrid engine parallelizes
-the expensive work below each selected pivot, not pivot selection itself.
+the expensive work below each selected pivot and at dense panel boundaries,
+while pivot selection remains serial.
 Statistics expose `numeric_engine`, `parallel_steps`, `row_updates`, and
 `largest_front` so users can tell which path ran and whether a problem supplied
 meaningful parallel work.
+
+`lu_dense_panels` counts nonempty dense tail flushes, and
+`lu_parallel_panels` counts flushes that used the worker team; the latter is
+included in `parallel_steps`. `lu_panel_columns` is the maximum packed U-tail
+support size. `lu_dense_update_flops` counts two operations per packed
+multiply/subtract term, including zeros in packed operands; eager panel
+coefficients and pivot-tail materialization are excluded.
+`lu_panel_workspace_bytes` estimates peak panel-owned vector capacities,
+including discovery marks, row/column lists, and packed L/U operands. It
+excludes retained factors, row-engine sparse/dense storage, and worker runtime
+storage, and must not be interpreted as total row-engine peak memory.
+The SPD-specific `parallel_panels`, `dense_update_flops`, and `spd_*` fields
+retain their existing meaning.
 
 `ordering_estimated_l_nnz` and `ordering_estimated_max_front` report AMD
 estimates for `MMD_AT_PLUS_A`; zero means unavailable for other orderings.
@@ -175,8 +214,8 @@ when their backward residual is small.
 - native matrix values are `float64` only;
 - no complex native factors yet (the SciPy backend handles them);
 - ordering and pivot selection are single-threaded;
-- general LU still uses simplicial CSC or row updates; blocked panels currently
-  specialize in exactly symmetric positive-definite inputs;
+- general LU retains serial pivot selection and pivot-tail materialization;
+  dense-row panels still retain full dense tails in the row engine;
 - there is no out-of-core mode or symbolic-factor reuse across matrices with
   the same pattern.
 

@@ -23,7 +23,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 
 import numpy as np
 import scipy
-from scipy.sparse import csc_array, diags, eye, kron, random_array
+from scipy.sparse import block_diag, csc_array, diags, eye, kron, random_array
 from scipy.sparse.linalg import splu as scipy_splu
 
 from spsolve import SparseLU, splu
@@ -56,6 +56,11 @@ class Result:
     supernodes: int
     max_supernode_width: int
     peak_workspace_bytes: int
+    lu_dense_panels: int
+    lu_parallel_panels: int
+    lu_panel_columns: int
+    lu_dense_update_flops: int
+    lu_panel_workspace_bytes: int
     numeric_probe_columns: int
     numeric_probe_max_front: int
     numeric_probe_updates: int
@@ -126,6 +131,11 @@ def irregular(n: int, density: float, seed: int) -> csc_array:
 def row_permuted_banded(n: int, seed: int = 321) -> csc_array:
     matrix = banded_nonsymmetric(n)
     return csc_array(matrix[np.random.default_rng(seed).permutation(n), :])
+
+
+def dense_lu(n: int, seed: int = 721) -> csc_array:
+    rng = np.random.default_rng(seed)
+    return csc_array(rng.normal(size=(n, n)) + 1.25 * np.sqrt(n) * np.eye(n))
 
 
 def pivot_heavy(n: int, density: float, seed: int) -> csc_array:
@@ -270,6 +280,11 @@ def benchmark_case(
         supernodes=parallel.stats["supernodes"],
         max_supernode_width=parallel.stats["max_supernode_width"],
         peak_workspace_bytes=parallel.stats["peak_workspace_bytes"],
+        lu_dense_panels=parallel.stats.get("lu_dense_panels", 0),
+        lu_parallel_panels=parallel.stats.get("lu_parallel_panels", 0),
+        lu_panel_columns=parallel.stats.get("lu_panel_columns", 0),
+        lu_dense_update_flops=parallel.stats.get("lu_dense_update_flops", 0),
+        lu_panel_workspace_bytes=parallel.stats.get("lu_panel_workspace_bytes", 0),
         numeric_probe_columns=parallel.stats.get("numeric_probe_columns", 0),
         numeric_probe_max_front=parallel.stats.get("numeric_probe_max_front", 0),
         numeric_probe_updates=parallel.stats.get("numeric_probe_updates", 0),
@@ -318,6 +333,10 @@ def parse_args() -> argparse.Namespace:
         help="include 3-D Poisson and banded cases; COLAMD also tests row-permuted bands",
     )
     parser.add_argument("--gate", action="store_true", help="exit nonzero when the gate fails")
+    parser.add_argument(
+        "--dense-lu", action="store_true",
+        help="include connected, pivoted, and four-block dense general LU cases",
+    )
     parser.add_argument("--json", type=Path, help="write machine-readable results")
     return parser.parse_args()
 
@@ -358,6 +377,14 @@ def main() -> int:
             matrices.append(
                 ("permuted-band", row_permuted_banded(2500 if args.quick else 20000))
             )
+    if args.dense_lu:
+        dense = dense_lu(200 if args.quick else 600)
+        pivoted = csc_array(dense[np.random.default_rng(913).permutation(dense.shape[0]), :])
+        matrices.extend([
+            ("dense-lu", dense),
+            ("dense-pivoted", pivoted),
+            ("dense-lu-blocks", csc_array(block_diag([dense] * 4, format="csc"))),
+        ])
 
     results = [
         benchmark_case(

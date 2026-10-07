@@ -73,6 +73,11 @@ public:
     index_t parallel_steps_ = 0;
     index_t largest_front_ = 0;
     index_t dense_rows_ = 0;
+    index_t lu_dense_panels_ = 0;
+    index_t lu_parallel_panels_ = 0;
+    index_t lu_panel_columns_ = 0;
+    std::uint64_t lu_dense_update_flops_ = 0;
+    std::uint64_t lu_panel_workspace_bytes_ = 0;
     index_t supernodes_ = 0;
     index_t max_supernode_width_ = 1;
     index_t parallel_panels_ = 0;

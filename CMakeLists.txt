@@ -76,6 +76,7 @@ nanobind_add_module(
   src/sparse_lu.cpp
   src/sparse_lu.hpp
   src/sparse_ldlt.hpp
+  src/sparse_lu_panels.hpp
   src/spsolve_triangular.hpp
   src/spsolve_triangular_C.hpp
   src/spsolve_triangular_F.hpp

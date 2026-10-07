@@ -1,5 +1,6 @@
 #include "sparse_lu.hpp"
 #include "sparse_ldlt.hpp"
+#include "sparse_lu_panels.hpp"
 
 #include "amd.h"
 #include "colamd.h"
@@ -221,22 +222,6 @@ void validate_csc(
             }
         }
     }
-}
-
-template <typename Int>
-std::vector<std::vector<index_t>> build_pattern_rows(
-    const Int* indices,
-    const Int* indptr,
-    index_t n
-) {
-    std::vector<std::vector<index_t>> rows(static_cast<std::size_t>(n));
-    for (index_t col = 0; col < n; ++col) {
-        for (index_t p = static_cast<index_t>(indptr[col]);
-             p < static_cast<index_t>(indptr[col + 1]); ++p) {
-            rows[static_cast<std::size_t>(indices[p])].push_back(col);
-        }
-    }
-    return rows;
 }
 
 template <typename Int>
@@ -503,6 +488,23 @@ void update_dense_row(
         if (!std::isfinite(target)) {
             throw std::runtime_error(
                 "non-finite value generated during LU factorization");
+        }
+    }
+}
+
+void update_dense_panel_row(
+    WorkRow& row, const std::vector<Entry>& pivot,
+    index_t pivot_col, index_t panel_end, double multiplier
+) {
+    row.lower.push_back({pivot_col, multiplier});
+    row.dense[static_cast<std::size_t>(pivot_col - row.dense_offset)] = 0.0;
+    auto source = std::upper_bound(pivot.begin(), pivot.end(), pivot_col,
+        [](index_t col, const Entry& entry) { return col < entry.col; });
+    for (; source != pivot.end() && source->col < panel_end; ++source) {
+        double& target = row.dense[static_cast<std::size_t>(source->col - row.dense_offset)];
+        target -= multiplier * source->value;
+        if (!std::isfinite(target)) {
+            throw std::runtime_error("non-finite value generated during LU factorization");
         }
     }
 }
@@ -1222,7 +1224,6 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
         return result;
     }
 
-    const auto pattern_rows = build_pattern_rows(indices, indptr, n);
     std::vector<WorkRow> rows(static_cast<std::size_t>(n));
     std::vector<std::vector<index_t>> active_columns(static_cast<std::size_t>(n));
     for (index_t new_col = 0; new_col < n; ++new_col) {
@@ -1241,11 +1242,15 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
     }
 
     std::vector<index_t> dense_rows;
+    index_t converted_dense_rows = 0;
+    index_t active_dense_rows = 0;
     for (index_t row_id = 0; row_id < n; ++row_id) {
         auto& row = rows[static_cast<std::size_t>(row_id)];
         if (should_use_dense(row, n, 0)) {
             convert_to_dense(row, n, 0);
             dense_rows.push_back(row_id);
+            ++converted_dense_rows;
+            ++active_dense_rows;
         }
     }
 
@@ -1259,8 +1264,23 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
     const auto factor_start = Clock::now();
     constexpr std::uint64_t parallel_work_threshold = 8'192;
     FactorExecutor executor(result->factor_threads_);
+    sparse_lu_panels::DensePanel panel;
+    bool dense_panels_enabled = false;
+    bool panel_active = false;
 
     for (index_t pivot_col = 0; pivot_col < n; ++pivot_col) {
+        if (!panel_active) {
+            // Initial activation needs enough dense work to amortize packing.
+            // Once enabled, finish short trailing panels with the same recurrence.
+            if (!dense_panels_enabled && active_dense_rows >= 32 && n - pivot_col >= 128) {
+                dense_panels_enabled = true;
+            }
+            if (dense_panels_enabled && active_dense_rows > 0) {
+                panel.begin(pivot_col, pivot_col + std::min(n - pivot_col, sparse_lu_panels::width),
+                            n, result->factor_threads_);
+                panel_active = true;
+            }
+        }
         std::vector<index_t> candidates;
         candidates.reserve(
             active_columns[static_cast<std::size_t>(pivot_col)].size() +
@@ -1332,6 +1352,9 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
         }
         auto& pivot_output = result->u_rows_[static_cast<std::size_t>(pivot_col)];
         if (pivot_work_row.dense_mode) {
+            if (panel_active) {
+                panel.materialize_pivot(pivot_row, pivot_col, rows, result->u_rows_);
+            }
             const index_t first = std::max(pivot_col, pivot_work_row.dense_offset);
             std::size_t nonzeros = 0;
             for (index_t col = first; col < n; ++col) {
@@ -1366,8 +1389,29 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
         result->largest_front_ = std::max<index_t>(
             result->largest_front_, static_cast<index_t>(pivot.size()));
         result->row_updates_ += static_cast<index_t>(targets.size());
+        if (panel_active) {
+            // Only sparse targets perform expensive whole-tail work per pivot.
+            // Cheap dense panel coefficients run serially without a team barrier.
+            std::size_t sparse_count = 0;
+            for (index_t row_id : targets) {
+                auto& row = rows[static_cast<std::size_t>(row_id)];
+                if (!row.dense_mode) {
+                    targets[sparse_count++] = row_id;
+                    continue;
+                }
+                const double multiplier = work_row_value(row, pivot_col) / pivot_value;
+                if (!std::isfinite(multiplier)) {
+                    throw std::runtime_error("non-finite multiplier generated during LU factorization");
+                }
+                update_dense_panel_row(row, pivot, pivot_col, panel.end(), multiplier);
+                panel.note_dense_row(row_id);
+            }
+            targets.resize(sparse_count);
+        }
         const bool run_parallel = result->factor_threads_ > 1 &&
-            targets.size() > 1 && work >= parallel_work_threshold;
+            targets.size() > 1 && (panel_active
+                ? static_cast<std::uint64_t>(targets.size()) * pivot_work : work)
+                    >= parallel_work_threshold;
         const int addition_slots = run_parallel ? result->factor_threads_ : 1;
         std::vector<std::vector<Addition>> additions(
             static_cast<std::size_t>(addition_slots));
@@ -1394,10 +1438,13 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
                     row, pivot, pivot_col, multiplier,
                     local_additions, row_id);
                 if (should_use_dense(row, n, pivot_col + 1)) {
-                    convert_to_dense(row, n, pivot_col + 1);
-                    local_additions.resize(additions_before_update);
-                    dense_conversions[static_cast<std::size_t>(worker_id)].push_back(
-                        row_id);
+                    if (panel_active) {
+                        panel.note_conversion(row_id, worker_id);
+                    } else {
+                        convert_to_dense(row, n, pivot_col + 1);
+                        local_additions.resize(additions_before_update);
+                        dense_conversions[static_cast<std::size_t>(worker_id)].push_back(row_id);
+                    }
                 }
             }
         };
@@ -1417,12 +1464,33 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
         }
         for (const auto& local : dense_conversions) {
             dense_rows.insert(dense_rows.end(), local.begin(), local.end());
+            converted_dense_rows += static_cast<index_t>(local.size());
+            active_dense_rows += static_cast<index_t>(local.size());
         }
         if (pivot_work_row.dense_mode) {
             std::vector<double>().swap(pivot_work_row.dense);
             pivot_work_row.dense_mode = false;
+            --active_dense_rows;
         }
         std::vector<index_t>().swap(active_columns[static_cast<std::size_t>(pivot_col)]);
+        if (panel_active && pivot_col + 1 == panel.end()) {
+            panel.flush(rows, position_of_row, result->u_rows_, executor, result->factor_threads_);
+            for (index_t row_id : panel.conversions()) {
+                auto& row = rows[static_cast<std::size_t>(row_id)];
+                if (position_of_row[static_cast<std::size_t>(row_id)] >= panel.end() &&
+                    should_use_dense(row, n, panel.end())) {
+                    convert_to_dense(row, n, panel.end());
+                    dense_rows.push_back(row_id);
+                    ++converted_dense_rows;
+                    ++active_dense_rows;
+                }
+            }
+            dense_rows.erase(std::remove_if(dense_rows.begin(), dense_rows.end(),
+                [&](index_t row_id) { return !rows[static_cast<std::size_t>(row_id)].dense_mode; }),
+                dense_rows.end());
+            panel_active = false;
+            if (active_dense_rows == 0) dense_panels_enabled = false;
+        }
     }
 
     result->factor_seconds_ = std::chrono::duration<double>(
@@ -1443,7 +1511,13 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
     result->fill_ratio_ = data_size == 0
         ? 0.0
         : static_cast<double>(result->factor_nnz_) / static_cast<double>(data_size);
-    result->dense_rows_ = static_cast<index_t>(dense_rows.size());
+    result->dense_rows_ = converted_dense_rows;
+    result->lu_dense_panels_ = panel.flushes();
+    result->lu_parallel_panels_ = panel.parallel_flushes();
+    result->lu_panel_columns_ = panel.maximum_columns();
+    result->lu_dense_update_flops_ = panel.update_flops();
+    result->lu_panel_workspace_bytes_ = panel.workspace_bytes();
+    result->parallel_steps_ += panel.parallel_flushes();
     finish_lu();
     return result;
 }
@@ -1914,6 +1988,11 @@ nb::dict NativeSparseLU::stats() const {
     output["row_updates"] = row_updates_;
     output["largest_front"] = largest_front_;
     output["dense_rows"] = dense_rows_;
+    output["lu_dense_panels"] = lu_dense_panels_;
+    output["lu_parallel_panels"] = lu_parallel_panels_;
+    output["lu_panel_columns"] = lu_panel_columns_;
+    output["lu_dense_update_flops"] = lu_dense_update_flops_;
+    output["lu_panel_workspace_bytes"] = lu_panel_workspace_bytes_;
     output["supernodes"] = supernodes_;
     output["max_supernode_width"] = max_supernode_width_;
     output["parallel_panels"] = parallel_panels_;

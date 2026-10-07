@@ -82,7 +82,8 @@ comparable to the measured 0.0077-second SuperLU time.
 
 ## Current status
 
-The strict gate passed more than three consecutive times on checked Windows
+Before the dense LU panel change, the strict gate passed more than three
+consecutive times on checked Windows
 x64 release builds with Python 3.14. The final run produced:
 
 | case | native 1 thread | native 8 threads | SuperLU | speedup | native/SuperLU | engine |
@@ -97,9 +98,55 @@ These timings are illustrative, not cross-platform guarantees; CPU scheduling,
 compiler, allocator, and SciPy build all matter.
 
 These results use `MMD_AT_PLUS_A`. An explicitly requested `COLAMD` permutation
-also passes the three representative cases. The blocked SPD kernel improves
+also passed the three representative cases. The blocked SPD kernel improves
 larger fronts, but still trails SuperLU for some high-fill permutations and
 dense blocks, as the focused comparison below shows.
+
+### Dense LU panel comparison
+
+The optional `--dense-lu` flag adds connected dense general matrices, row-pivoted
+dense matrices, and four disconnected dense blocks. It respects the requested
+ordering and runs alongside the existing families; `--quick` uses blocks of
+size 200, while the full run uses size 600. JSON results include the LU panel
+flush, support, executed-work, and workspace counters described in
+[the design notes](native-lu.md).
+
+Sequential Windows x64 release comparisons with five batched samples,
+one-thread BLAS, and identical matrix/order requests measured these rounded
+medians for the dense-row panel change:
+
+| case | ordering | previous 1 thread | panel 1 thread | previous 8 threads | panel 8 threads | SuperLU |
+|---|---|---:|---:|---:|---:|---:|
+| four dense general blocks, size 600 | COLAMD | 0.580 s | 0.127 s | 0.189 s | 0.106 s | 0.039 s |
+| connected dense general, size 600 | COLAMD | 0.071 s | 0.025 s | 0.030 s | 0.018 s | 0.010 s |
+| row-pivoted dense general, size 600 | MMD_AT_PLUS_A | 0.071 s | 0.024 s | 0.030 s | 0.018 s | 0.011 s |
+| irregular, n=2,500 | COLAMD | 0.729 s | 0.245 s | 0.166 s | 0.124 s | 0.271 s |
+| pivot-heavy, n=2,000 | MMD_AT_PLUS_A | 0.665 s | 0.212 s | 0.147 s | 0.116 s | 0.241 s |
+
+Sparse fill followed by dense conversion improved in a 289-row bordered
+system, and a 20,000-row nonsymmetric band followed by a 193-row dense block
+improved from about 36 to 30 ms with eight threads. Narrow NATURAL band
+controls improved after removing an unused input-pattern copy; CSC and SPD
+controls retain their existing engines. Upper triangular families with only
+8, 31, 32, 40, or 64 initially dense rows also retained or improved timings,
+including cases with no nonempty tail flush.
+
+These are absolute-time improvements, with substantially larger serial gains.
+Some main-family runs now fail the unchanged 2.0x thread-scaling requirement:
+COLAMD irregular measured 1.96–1.98x across two comparisons. MMD pivot-heavy
+varied from 1.82x to roughly 2.00x, making that result sensitive to timing
+variation. Dense cases still exceed the 1.05x SuperLU requirement;
+the native backend remains opt-in. Dense panels reduce repeated row-update
+barriers, but sequential pivots, pivot-tail materialization, and retained row
+storage limit further speedup. No eligibility or promotion threshold was
+relaxed.
+
+The four-block COLAMD example packs at most 592 tail columns, with about
+0.51 MB of panel-owned buffers; the connected 600-row example uses about
+0.32 MB. These diagnostics exclude the existing row storage and factors.
+A representative four-block factor reported about 58 ms in its numeric
+loop against about 106 ms end to end, leaving substantial setup and retained
+storage costs beyond the blocked update itself.
 
 ### Blocked SPD comparison
 
