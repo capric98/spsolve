@@ -22,7 +22,11 @@ def spsolve(
     check_finite: bool = True,
     iterative_refinement: bool = True,
 ) -> NDArray[Any]:
-    """Solve ``A @ x = b`` with a sparse LU factorization."""
+    """Solve ``A @ x = b`` with a sparse LU factorization.
+
+    Auto/SciPy factorization promotes A and b to a shared floating or complex
+    dtype. Explicit native LU retains its real float64 scope.
+    """
     if not issparse(A):
         raise TypeError(f"expected a SciPy sparse matrix or array, got {type(A)!r}")
     if len(A.shape) != 2 or A.shape[0] != A.shape[1]:
@@ -47,6 +51,13 @@ def spsolve(
                 overwrite_b=overwrite_b,
                 num_threads=num_threads,
             )
+
+    if selected_backend != "native":
+        # Match SciPy's floating conversion and joint A/RHS promotion before
+        # selecting a factor backend, so a complex RHS cannot select real LU.
+        solve_dtype = np.result_type(A.dtype, rhs.dtype, np.float32)
+        A = A.astype(solve_dtype, copy=False)
+        rhs = np.asarray(rhs, dtype=solve_dtype)
 
     factor = splu(
         A,

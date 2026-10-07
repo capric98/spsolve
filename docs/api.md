@@ -52,6 +52,14 @@ dense matrix RHSs. `backend="auto"` is the stable default; use explicit
 `native` only when the current float64 scope and performance profile fit the
 problem.
 
+For general `auto` and `scipy` solves, `A` and `b` are jointly promoted to a
+shared floating or complex dtype before factorization. This supports a real
+matrix with a complex RHS and preserves the precision of a wider RHS. Matrix
+values and the original RHS remain unchanged unless `overwrite_b=True` and
+the RHS is a writable NumPy array with the solution's shape and dtype.
+Explicit general native LU still requires a real `float64` matrix and a real
+RHS; the float64 triangular fast path also accepts complex RHSs.
+
 ## `spsolve_triangular`
 
 The native triangular API is compatible with the main SciPy arguments and adds
