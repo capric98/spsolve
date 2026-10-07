@@ -56,8 +56,10 @@ systems.
 6. Factors remain in their engine-native CSC or row storage. Public CSC `L`
    and `U` objects are materialized lazily. Solves operate directly on the
    retained storage and parallelize blocks of independent right-hand sides.
-7. Python optionally performs two componentwise backward-error refinement
-   steps using the original matrix.
+7. Python optionally performs at most two componentwise backward-error
+   refinement steps using the original matrix. It checks the error after each
+   correction, retains the better iterate if a correction worsens or
+   invalidates the error, and warns when the tolerance is not reached.
 
 All arithmetic within a row follows a deterministic order. A threaded factor
 therefore produces the same permutations and factor entries as a one-thread
@@ -89,7 +91,7 @@ build without OpenMP remains functional.
 - structural and exact numerical singular detection;
 - rejection of non-finite inputs by default;
 - overflow checks during scaling and row updates;
-- componentwise iterative refinement with stall detection.
+- componentwise iterative refinement with final-error and convergence checks.
 
 This is not a rank-revealing factorization and does not estimate condition
 numbers. Very ill-conditioned matrices can still lose forward accuracy even

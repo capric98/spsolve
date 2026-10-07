@@ -33,6 +33,13 @@ The native object provides:
 `trans` accepts `N`, `T`, and `H`; `H` equals `T` for a real factor. A native
 factor accepts real numeric vector or matrix RHSs and returns `float64`.
 
+Native solves enable iterative refinement by default, with at most two
+correction solves. The componentwise backward error is checked after every
+correction against `10 * float64 epsilon`. A `RuntimeWarning` reports failure
+to reach that tolerance, stalled improvement, or a non-finite error. If a
+correction worsens or invalidates the error, the preceding better solution is
+returned. Set `iterative_refinement=False` to use only the initial solve.
+
 ## `factorized`
 
 `factorized(A, **factor_options)` retains a factor and returns its bound

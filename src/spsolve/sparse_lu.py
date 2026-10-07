@@ -197,7 +197,12 @@ class SparseLU:
         num_threads: int | None = None,
         iterative_refinement: bool = True,
     ) -> NDArray[np.float64]:
-        """Solve with the stored factors, preserving vector/matrix RHS shape."""
+        """Solve with the stored factors, preserving vector/matrix RHS shape.
+
+        Refinement applies at most two corrections and checks the final
+        componentwise backward error. Nonconvergence emits a RuntimeWarning;
+        a correction that worsens or invalidates the error is discarded.
+        """
         rhs = np.asarray(b)
         if rhs.ndim not in (1, 2):
             raise ValueError("b must be a one- or two-dimensional dense array")
@@ -226,31 +231,55 @@ class SparseLU:
             matrix = self._A if operation == "N" else self._A.T
             abs_matrix = abs(matrix)
             target = 10.0 * np.finfo(np.float64).eps
+            previous_solution = solution
             previous_error = np.inf
-            stalled = False
-            for _ in range(2):
-                residual = rhs_2d - matrix @ solution
-                denominator = abs_matrix @ np.abs(solution) + np.abs(rhs_2d)
-                ratios = np.divide(
-                    np.abs(residual),
-                    denominator,
-                    out=np.zeros_like(residual),
-                    where=denominator != 0,
-                )
-                backward_error = float(np.max(ratios, initial=0.0))
+            converged = False
+            failure_reason = "correction limit reached"
+            # Inspect the initial solve and both corrected solutions.
+            for correction_count in range(3):
+                with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+                    residual = rhs_2d - matrix @ solution
+                    denominator = abs_matrix @ np.abs(solution) + np.abs(rhs_2d)
+                    if (
+                        np.all(np.isfinite(solution))
+                        and np.all(np.isfinite(residual))
+                        and np.all(np.isfinite(denominator))
+                    ):
+                        ratios = np.divide(
+                            np.abs(residual),
+                            denominator,
+                            out=np.full_like(residual, np.inf),
+                            where=denominator > 0,
+                        )
+                        # A zero denominator certifies only an exact zero residual.
+                        ratios[(denominator == 0) & (residual == 0)] = 0.0
+                        backward_error = float(np.max(ratios, initial=0.0))
+                    else:
+                        backward_error = np.inf
+                if not np.isfinite(backward_error):
+                    solution = previous_solution
+                    failure_reason = "non-finite backward error"
+                    break
                 if backward_error <= target:
+                    converged = True
                     break
                 if backward_error >= previous_error:
-                    stalled = True
+                    solution = previous_solution
+                    failure_reason = "backward error did not decrease"
                     break
+                if correction_count == 2:
+                    break
+                previous_solution = solution
                 previous_error = backward_error
                 correction = self._solve_once(
                     np.asarray(residual), trans=operation, num_threads=num_threads
                 )
-                solution += correction
-            if stalled:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    solution = solution + correction
+            if not converged:
                 warn(
-                    "iterative refinement did not reduce the backward error",
+                    "iterative refinement did not converge to the backward-error "
+                    f"tolerance ({failure_reason})",
                     RuntimeWarning,
                     stacklevel=2,
                 )
