@@ -35,7 +35,7 @@ systems.
 4. Rows and columns are equilibrated by infinity norms. Structural zero rows or
    columns are reported as singular before numerical elimination.
 5. The factorizer chooses one of three numerical engines:
-   - An exactly symmetric matrix first attempts a sparse simplicial `LDL.T`
+   - An exactly symmetric matrix first attempts a sparse `LDL.T`
      factorization with symmetric equilibration, using whichever column
      permutation the caller requested as a symmetric permutation. Symmetry
      requires matching transpose entries with exactly equal values in the
@@ -44,7 +44,15 @@ systems.
      Positive pivots certify the SPD path. Its factors are exposed through the
      common LU contract as `L` and `D @ L.T`; internally it retains only the
      strict lower triangle and diagonal, constructing public `L` and `U`
-     lazily. A non-positive pivot falls back to pivoted LU.
+     lazily. Narrow fronts use the simplicial CSC kernel. Adjacent elimination
+     tree parents and column counts give upper bounds on fundamental-node
+     width and work. An exact pattern pass requires possible nodes at least
+     320 columns wide with sufficient combined work; exact nodes must pass the
+     same guard to enable the blocked path described below. Ten 32-column
+     panels amortize packing, while the work guard prevents a small wide node
+     from routing overwhelmingly narrow matrices through the panel driver.
+     A non-positive pivot or non-finite
+     intermediate falls back to pivoted LU with the original equilibration.
    - A nonsymmetric matrix with `MMD_AT_PLUS_A` uses a Gilbert-Peierls-style
      left-looking CSC LU when AMD estimates a maximum front at most 192 and
      fill at most 20. `COLAMD` instead starts in CSC with its actual pivots:
@@ -69,6 +77,38 @@ All arithmetic within a row follows a deterministic order. A threaded factor
 therefore produces the same permutations and factor entries as a one-thread
 factor for the same input and options.
 
+## Blocked SPD panels
+
+The `symmetric-supernodal-ldlt` engine processes one exact fundamental
+supernode at a time. Its dense workspace contains only that node's columns
+and filled rows. It scatters original matrix entries, then subtracts prior
+node contributions `L[R,Q] @ D[Q] @ L[J,Q].T`. Sparse row incidence discovers
+contributors without scanning all prior nodes. Contributors are deduplicated
+and visited in factor order; only their actual row and column intersections
+are packed, including noncontiguous and partial overlaps.
+
+The diagonal block is factored in panels of at most 32 columns. The below-panel
+solve applies `inv(L_panel.T)` and `inv(D_panel)` once, followed by a tiled
+rank-k update of the remaining lower triangle and rectangular tail. Independent
+16-by-16 output tiles share the persistent worker team. The portable scalar
+microkernel has an SSE2 implementation on targets where SSE2 is part of the
+compiler target; no external BLAS or host-specific instruction set is required.
+Tiny intersections retain sparse outer products.
+
+For node width `W` and height `R`, predicted internal update terms are
+`W*(W-1)*(3*R-2*W+1)/6`. Only nodes at least 320 columns wide contribute useful
+work; their total must be at least `3072*n`, where `n` is the whole matrix
+dimension. The cheap parent/count runs bound this work before the extra exact
+pattern pass, and actual fundamental nodes enforce the final decision.
+The measured guard accounts for per-node driver overhead without rejecting
+an expensive large node solely because it covers few matrix columns.
+
+The filled CSC pattern, including entries that cancel numerically to zero,
+remains the public storage contract. No factors, symmetric scales, or blocked
+work counters are published until every positive pivot and finite intermediate
+has passed validation. Each output entry visits contributors in the same order
+at every thread count.
+
 ## Threading behavior
 
 Sparse LU has a sequential pivot dependency. The row-hybrid engine parallelizes
@@ -87,11 +127,30 @@ included in numeric/factor time; on success it is the CSC factorization itself.
 Workspace diagnostics include the temporary restart snapshot and discarded
 CSC buffers on fallback.
 
+For blocked SPD, `parallel_panels` counts actual parallel tile phases and is
+also included in `parallel_steps`. `dense_update_flops` counts two operations
+per executed multiply/subtract term, including small panel and sparse
+intersection work; diagonal weighting, divisions, and operand packing are
+excluded.
+`largest_front` is the actual largest filled node height on either SPD path;
+`spd_panel_entries` is the largest allocated dense node rectangle. A rectangle
+uses less than twice its node's lower-triangular CSC entries, and does not
+densify unrelated matrix rows or columns. `peak_workspace_bytes` estimates
+simultaneously live numeric and symbolic vector buffers, including CSC factors,
+row incidence, packed operands, and the node rectangle; thread runtime storage
+is excluded.
+
+`spd_source_seconds` measures prior-node updates including intersection lookup
+and packing; `spd_panel_seconds` measures node factorization and trailing
+updates. `spd_pack_seconds` is the dense-buffer packing portion of those two
+times, so it must not be added to them. `failed_spd_seconds` records a discarded
+SPD attempt, and is included in the subsequent LU numeric/factor time. Peak
+workspace also includes that attempt's maximum live buffers.
+
 Good threading candidates have wide, irregular fronts and substantial fill.
-Banded and PDE-like problems usually select a low-overhead serial CSC engine;
-their goal is parity through efficient sparse traversal rather than parallel
-speedup. Factor solves parallelize across RHS blocks; a single RHS solve is
-serial.
+Banded and narrow PDE-like problems usually select a low-overhead serial CSC
+engine. Wider SPD PDE fronts can use blocked parallel updates. Factor solves
+parallelize across RHS blocks; a single RHS solve is serial.
 
 The factor worker pool uses only the C++ standard library. OpenMP is optional
 and currently accelerates the established multi-RHS triangular kernels. A
@@ -116,12 +175,11 @@ when their backward residual is small.
 - native matrix values are `float64` only;
 - no complex native factors yet (the SciPy backend handles them);
 - ordering and pivot selection are single-threaded;
-- the CSC engines are simplicial rather than blocked supernodal kernels;
+- general LU still uses simplicial CSC or row updates; blocked panels currently
+  specialize in exactly symmetric positive-definite inputs;
 - there is no out-of-core mode or symbolic-factor reuse across matrices with
   the same pattern.
 
-Fundamental supernodes are detected for diagnostics on the SPD path, but the
-current implementation does not yet execute blocked panel updates. A future
-supernodal path could improve cache reuse on larger fronts. Default promotion
-also remains contingent on repeated release-build results on both Windows and
-Linux, as described in the benchmark notes.
+Default promotion remains contingent on repeated release-build results on both
+Windows and Linux, as described in the benchmark notes. The native backend
+remains opt-in.

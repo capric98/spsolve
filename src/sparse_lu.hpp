@@ -78,6 +78,11 @@ public:
     index_t parallel_panels_ = 0;
     std::uint64_t dense_update_flops_ = 0;
     std::uint64_t peak_workspace_bytes_ = 0;
+    std::uint64_t spd_panel_entries_ = 0;
+    double failed_spd_seconds_ = 0.0;
+    double spd_source_seconds_ = 0.0;
+    double spd_panel_seconds_ = 0.0;
+    double spd_pack_seconds_ = 0.0;
     double ordering_estimated_l_nnz_ = 0.0;
     double ordering_estimated_max_front_ = 0.0;
     index_t numeric_probe_columns_ = 0;

@@ -97,10 +97,58 @@ These timings are illustrative, not cross-platform guarantees; CPU scheduling,
 compiler, allocator, and SciPy build all matter.
 
 These results use `MMD_AT_PLUS_A`. An explicitly requested `COLAMD` permutation
-also passes the three representative cases, but the current simplicial SPD
-kernel remains slower than SuperLU on the extended 3-D Poisson case with that
-ordering. A blocked supernodal kernel is still the likely next improvement for
-such high-fill permutations.
+also passes the three representative cases. The blocked SPD kernel improves
+larger fronts, but still trails SuperLU for some high-fill permutations and
+dense blocks, as the focused comparison below shows.
+
+### Blocked SPD comparison
+
+Two sequential Windows x64 release comparisons used five batched samples per
+case, one-thread BLAS, and identical matrix/order requests before and after the
+blocked SPD change. The rounded eight-thread medians were:
+
+| case | ordering | previous native | blocked native | SuperLU |
+|---|---|---:|---:|---:|
+| Poisson 3-D, side 20 | COLAMD | 0.226 s | 0.147 s | 0.134 s |
+| Poisson 3-D, side 20 | MMD_AT_PLUS_A | 0.075 s | 0.045 s | 0.188 s |
+| four dense SPD blocks, size 600 | MMD_AT_PLUS_A | 0.085 s | 0.052 s | 0.039 s |
+| Poisson 2-D, side 90 | COLAMD | 0.0082 s | 0.0084 s | 0.0105 s |
+| Poisson 2-D, side 90 | MMD_AT_PLUS_A | 0.0044 s | 0.0044 s | 0.0073 s |
+
+One-thread Poisson 3-D COLAMD improved from about 0.224 to 0.175 seconds, and
+dense SPD blocks from 0.085 to 0.064 seconds. The largest node must be at least
+320 columns wide to select blocked work: measured nodes of width 193–256 did
+not amortize the extra symbolic and packing costs, while width 320 and larger
+improved serial and threaded timings. A cheap tree/count width bound keeps
+narrow cases on the original symbolic/numeric path. A second structural guard
+requires at least 3,072 useful internal update terms per whole-matrix column,
+using the node formula in [the design notes](native-lu.md). The cheap tree/count
+runs bound this work before exact pattern construction; exact nodes decide
+final selection.
+
+Mixed-component comparisons exposed why maximum width alone was insufficient.
+A 320-column dense block beside a 100,000-row tridiagonal component previously
+routed every narrow node through the panel driver, roughly doubling native
+factor time despite unchanged 502,718 factor entries. The work guard retains
+simplicial processing for this family. A 600-column block with 10,000 narrow
+rows supplies enough useful work to retain measured serial/threaded gains;
+a 2,000-column block beside 100,000 narrow rows remains eligible because its
+cubic work dominates. A fixed wide-column fraction would reject useful cases
+of this kind.
+
+The COLAMD 3-D case adds roughly 15 ms of pre-numeric symbolic work and spends
+about 24 ms packing operands within its numeric phase. Its executed update
+terms are within 0.5% of the simplicial count; actual intersections avoid
+padding sparse contributors with structural zeros. Estimated simultaneous
+vector buffers increase from 30.3 to 48.3 MB, including a largest node rectangle
+of 335,146 doubles (2.68 MB). Dense-block buffers increase from 11.7 to 20.6 MB,
+with a 360,000-double node rectangle (2.88 MB). These are local node workspaces,
+with sparse CSC factors retained throughout.
+
+Unrefined normal/transpose solves and identical one/eight-thread factors were
+checked alongside timing. The COLAMD 3-D and dense-block cases still exceed
+the unchanged 1.05x SuperLU criterion, so these gains do not establish universal
+parity or authorize default promotion. Linux results remain required.
 
 The row-permuted 20,000-row COLAMD band exposes a separate classifier problem.
 Using an unrelated AMD analysis previously reported a front of 11,309 despite
