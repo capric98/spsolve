@@ -181,17 +181,91 @@ class SparseLUTests(unittest.TestCase):
                 assert_array_equal(serial.perm_c, threaded.perm_c)
                 self.assert_factor_identity(matrix, threaded)
 
-    def test_symmetric_indefinite_falls_back_to_pivoted_lu(self):
-        matrix = csc_array([[0.0, 1.0], [1.0, 0.0]])
-        factor = splu(
-            matrix,
-            backend="native",
-            permc_spec="MMD_AT_PLUS_A",
-            num_threads=4,
+    def test_unequal_transpose_entries_do_not_use_symmetric_factorization(self):
+        for scale in (1e-16, 1e-8, 1.0, 1e8, 1e16):
+            nonsymmetric = scale * np.array([[1.0, 0.5], [3.0, 2.0]])
+            near_symmetric = scale * np.array(
+                [[4.0, 1.0, 0.0], [1.0, 3.0, -0.5], [0.0, -0.5, 2.0]]
+            )
+            near_symmetric[1, 0] = np.nextafter(near_symmetric[0, 1], np.inf)
+            for kind, values in (
+                ("nonsymmetric", nonsymmetric),
+                ("near_symmetric", near_symmetric),
+            ):
+                matrix = csc_array(values)
+                expected = np.column_stack(
+                    (np.ones(matrix.shape[0]), np.arange(matrix.shape[0]) + 1.0)
+                )
+                for ordering in ("NATURAL", "COLAMD", "MMD_AT_PLUS_A"):
+                    with self.subTest(kind=kind, scale=scale, ordering=ordering):
+                        factor = splu(matrix, backend="native", permc_spec=ordering)
+                        self.assertNotEqual(
+                            factor.stats["numeric_engine"], "symmetric-ldlt-csc"
+                        )
+                        self.assert_factor_identity(matrix, factor, atol=2e-14)
+                        for trans, operator in (("N", matrix), ("T", matrix.T)):
+                            assert_allclose(
+                                factor.solve(
+                                    operator @ expected,
+                                    trans=trans,
+                                    iterative_refinement=False,
+                                ),
+                                expected,
+                                rtol=2e-14,
+                                atol=2e-14,
+                            )
+
+    def test_exactly_symmetric_spd_retains_ldlt_at_all_scales(self):
+        values = np.array(
+            [[4.0, 1.0, 0.0], [1.0, 3.0, -0.5], [0.0, -0.5, 2.0]]
         )
-        self.assertNotEqual(factor.stats["numeric_engine"], "symmetric-ldlt-csc")
+        expected = np.array([2.0, -3.0, 1.0])
+        for scale in (1e-16, 1e-8, 1.0, 1e8, 1e16):
+            matrix = csc_array(scale * values)
+            for ordering in ("NATURAL", "COLAMD", "MMD_AT_PLUS_A"):
+                with self.subTest(scale=scale, ordering=ordering):
+                    factor = splu(matrix, backend="native", permc_spec=ordering)
+                    self.assertEqual(
+                        factor.stats["numeric_engine"], "symmetric-ldlt-csc"
+                    )
+                    self.assert_factor_identity(matrix, factor, atol=2e-14)
+                    for trans, operator in (("N", matrix), ("T", matrix.T)):
+                        assert_allclose(
+                            factor.solve(
+                                operator @ expected,
+                                trans=trans,
+                                iterative_refinement=False,
+                            ),
+                            expected,
+                            rtol=2e-14,
+                            atol=2e-14,
+                        )
+
+    def test_symmetric_indefinite_falls_back_to_pivoted_lu(self):
         expected = np.array([2.0, -3.0])
-        assert_allclose(factor.solve(matrix @ expected), expected)
+        for scale in (1e-16, 1.0, 1e16):
+            matrix = csc_array(scale * np.array([[0.0, 1.0], [1.0, 0.0]]))
+            for ordering in ("NATURAL", "COLAMD", "MMD_AT_PLUS_A"):
+                with self.subTest(scale=scale, ordering=ordering):
+                    factor = splu(
+                        matrix,
+                        backend="native",
+                        permc_spec=ordering,
+                        num_threads=4,
+                    )
+                    self.assertNotEqual(
+                        factor.stats["numeric_engine"], "symmetric-ldlt-csc"
+                    )
+                    self.assert_factor_identity(matrix, factor)
+                    for trans, operator in (("N", matrix), ("T", matrix.T)):
+                        assert_allclose(
+                            factor.solve(
+                                operator @ expected,
+                                trans=trans,
+                                iterative_refinement=False,
+                            ),
+                            expected,
+                        )
 
     def test_vendored_orderings_accept_both_index_widths(self):
         matrix = general_matrix(45, 0.08, 99)

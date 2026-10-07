@@ -35,9 +35,12 @@ systems.
 4. Rows and columns are equilibrated by infinity norms. Structural zero rows or
    columns are reported as singular before numerical elimination.
 5. The factorizer chooses one of three numerical engines:
-   - A numerically symmetric matrix first attempts a sparse simplicial `LDL.T`
+   - An exactly symmetric matrix first attempts a sparse simplicial `LDL.T`
      factorization with symmetric equilibration, using whichever column
-     permutation the caller requested as a symmetric permutation.
+     permutation the caller requested as a symmetric permutation. Symmetry
+     requires matching transpose entries with exactly equal values in the
+     canonical input. Unequal entries, even one floating-point step apart,
+     use general LU so that neither triangle of the input is discarded.
      Positive pivots certify the SPD path. Its factors are exposed through the
      common LU contract as `L` and `D @ L.T`; internally it retains only the
      strict lower triangle and diagonal, constructing public `L` and `U`

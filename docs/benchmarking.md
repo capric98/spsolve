@@ -63,7 +63,7 @@ old aggregate timer obscured:
 
 Adding more worker threads could not remove those serial setup and dependency
 costs. The accepted fix was therefore adaptive: use sparse simplicial LDL.T
-for numerically symmetric positive-definite matrices, left-looking CSC LU for
+for exactly symmetric positive-definite matrices, left-looking CSC LU for
 narrow nonsymmetric fronts, and reserve threaded row updates for genuinely
 wide fronts. The current 2-D Poisson factor has about 7% more stored entries
 than SuperLU, but its approximately 0.0051-second factorization time is now

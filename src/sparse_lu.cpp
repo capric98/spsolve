@@ -507,13 +507,12 @@ void update_dense_row(
 }
 
 template <typename Int>
-[[nodiscard]] bool is_numerically_symmetric(
+[[nodiscard]] bool is_exactly_symmetric(
     const double* data,
     const Int* indices,
     const Int* indptr,
     index_t n
 ) {
-    constexpr double tolerance = 16.0 * std::numeric_limits<double>::epsilon();
     for (index_t col = 0; col < n; ++col) {
         for (index_t p = static_cast<index_t>(indptr[col]);
              p < static_cast<index_t>(indptr[col + 1]); ++p) {
@@ -524,10 +523,9 @@ template <typename Int>
             const Int* transpose = std::lower_bound(first, last, needle);
             if (transpose == last || *transpose != needle) return false;
             const index_t transpose_position = static_cast<index_t>(transpose - indices);
-            const double left = data[p];
-            const double right = data[transpose_position];
-            const double scale = std::max({1.0, std::abs(left), std::abs(right)});
-            if (std::abs(left - right) > tolerance * scale) return false;
+            // LDL.T uses only one triangle. Without a caller symmetry assumption,
+            // accepting unequal entries would factor a different matrix.
+            if (data[p] != data[transpose_position]) return false;
         }
     }
     return true;
@@ -542,7 +540,7 @@ template <typename Int>
     index_t n
 ) {
     const auto symbolic_start = Clock::now();
-    if (!is_numerically_symmetric(data, indices, indptr, n)) return false;
+    if (!is_exactly_symmetric(data, indices, indptr, n)) return false;
 
     std::vector<index_t> inverse_permutation(static_cast<std::size_t>(n));
     for (index_t k = 0; k < n; ++k) {
