@@ -56,6 +56,11 @@ class Result:
     supernodes: int
     max_supernode_width: int
     peak_workspace_bytes: int
+    numeric_probe_columns: int
+    numeric_probe_max_front: int
+    numeric_probe_updates: int
+    numeric_probe_seconds: float
+    numeric_probe_fallback: bool
     residual: float
     eligible: bool
     passed: bool
@@ -116,6 +121,11 @@ def irregular(n: int, density: float, seed: int) -> csc_array:
     )
     row_norm = np.asarray(abs(matrix).sum(axis=1)).ravel()
     return csc_array(matrix + diags(row_norm + 1.0, format="csc"))
+
+
+def row_permuted_banded(n: int, seed: int = 321) -> csc_array:
+    matrix = banded_nonsymmetric(n)
+    return csc_array(matrix[np.random.default_rng(seed).permutation(n), :])
 
 
 def pivot_heavy(n: int, density: float, seed: int) -> csc_array:
@@ -260,6 +270,11 @@ def benchmark_case(
         supernodes=parallel.stats["supernodes"],
         max_supernode_width=parallel.stats["max_supernode_width"],
         peak_workspace_bytes=parallel.stats["peak_workspace_bytes"],
+        numeric_probe_columns=parallel.stats.get("numeric_probe_columns", 0),
+        numeric_probe_max_front=parallel.stats.get("numeric_probe_max_front", 0),
+        numeric_probe_updates=parallel.stats.get("numeric_probe_updates", 0),
+        numeric_probe_seconds=parallel.stats.get("numeric_probe_seconds", 0.0),
+        numeric_probe_fallback=parallel.stats.get("numeric_probe_fallback", False),
         residual=residual,
         eligible=eligible,
         passed=passed,
@@ -300,7 +315,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--extended",
         action="store_true",
-        help="include 3-D Poisson and narrow nonsymmetric validation cases",
+        help="include 3-D Poisson and banded cases; COLAMD also tests row-permuted bands",
     )
     parser.add_argument("--gate", action="store_true", help="exit nonzero when the gate fails")
     parser.add_argument("--json", type=Path, help="write machine-readable results")
@@ -339,6 +354,10 @@ def main() -> int:
                 ("banded-nonsym", banded_nonsymmetric(2500 if args.quick else 8000)),
             ]
         )
+        if args.permc_spec == "COLAMD":
+            matrices.append(
+                ("permuted-band", row_permuted_banded(2500 if args.quick else 20000))
+            )
 
     results = [
         benchmark_case(

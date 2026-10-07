@@ -80,6 +80,11 @@ public:
     std::uint64_t peak_workspace_bytes_ = 0;
     double ordering_estimated_l_nnz_ = 0.0;
     double ordering_estimated_max_front_ = 0.0;
+    index_t numeric_probe_columns_ = 0;
+    index_t numeric_probe_max_front_ = 0;
+    std::uint64_t numeric_probe_updates_ = 0;
+    double numeric_probe_seconds_ = 0.0;
+    bool numeric_probe_fallback_ = false;
 
     // perm_r_[new row] and perm_c_[new column] contain original indices.
     std::vector<index_t> perm_r_;

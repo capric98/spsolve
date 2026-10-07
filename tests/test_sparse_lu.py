@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 from numpy.testing import assert_allclose, assert_array_equal
-from scipy.sparse import csc_array, diags, random_array, tril
+from scipy.sparse import block_diag, csc_array, diags, random_array, tril
 
 from spsolve import SparseLU, factorized, splu
 
@@ -118,8 +118,100 @@ class SparseLUTests(unittest.TestCase):
             num_threads=8,
         )
         self.assertEqual(narrow_colamd.stats["numeric_engine"], "left-looking-csc")
-        self.assertIn("AMD 3.3.4 classifier", narrow_colamd.stats["ordering_backend"])
+        self.assertEqual(
+            narrow_colamd.stats["ordering_backend"], "SuiteSparse COLAMD 3.3.5"
+        )
         self.assert_factor_identity(nonsymmetric, narrow_colamd)
+
+    def test_colamd_probe_keeps_row_permuted_bands_in_csc(self):
+        n = 1000
+        base = csc_array(
+            diags(
+                [-0.2 * np.ones(n - 7), -np.ones(n - 1), 4.0 * np.ones(n),
+                 0.5 * np.ones(n - 2), 0.1 * np.ones(n - 9)],
+                [-7, -1, 0, 2, 9], format="csc",
+            )
+        )
+        reference = splu(base, backend="native", permc_spec="COLAMD")
+        expected = np.random.default_rng(322).normal(size=(n, 3))
+        for seed in (321, 654):
+            matrix = csc_array(base[np.random.default_rng(seed).permutation(n), :])
+            factors = []
+            for threads in (1, 4):
+                with self.subTest(seed=seed, threads=threads):
+                    factor = splu(
+                        matrix, backend="native", permc_spec="COLAMD", num_threads=threads
+                    )
+                    factors.append(factor)
+                    self.assertEqual(factor.stats["numeric_engine"], "left-looking-csc")
+                    self.assertEqual(
+                        factor.stats["ordering_backend"], "SuiteSparse COLAMD 3.3.5"
+                    )
+                    self.assertEqual(factor.stats["ordering_estimated_max_front"], 0.0)
+                    self.assertEqual(factor.stats["ordering_estimated_l_nnz"], 0.0)
+                    self.assertFalse(factor.stats["numeric_probe_fallback"])
+                    self.assertEqual(factor.stats["numeric_probe_columns"], n)
+                    self.assertLess(factor.stats["numeric_probe_max_front"], 40)
+                    self.assertLessEqual(factor.nnz, reference.nnz + 2)
+                    self.assert_factor_identity(matrix, factor)
+                    for trans, operator in (("N", matrix), ("T", matrix.T)):
+                        assert_allclose(
+                            factor.solve(operator @ expected, trans=trans,
+                                         iterative_refinement=False),
+                            expected, rtol=2e-13, atol=2e-13,
+                        )
+            assert_array_equal(factors[0].perm_r, factors[1].perm_r)
+            assert_array_equal(factors[0].perm_c, factors[1].perm_c)
+            assert_array_equal(factors[0].L.toarray(), factors[1].L.toarray())
+            assert_array_equal(factors[0].U.toarray(), factors[1].U.toarray())
+
+    def test_colamd_probe_restarts_wide_fronts_deterministically(self):
+        for dense_size in (140, 260):
+            with self.subTest(dense_size=dense_size):
+                rng = np.random.default_rng(555)
+                dense = rng.uniform(-0.5, 0.5, size=(dense_size, dense_size))
+                dense += 300.0 * np.eye(dense_size)
+                matrix = csc_array(block_diag((np.eye(40), dense), format="csc"))
+                matrix = csc_array(matrix[rng.permutation(matrix.shape[0]), :])
+                expected = rng.normal(size=(matrix.shape[0], 3))
+                factors = []
+                for threads in (1, 4):
+                    factor = splu(
+                        matrix, backend="native", permc_spec="COLAMD", num_threads=threads
+                    )
+                    factors.append(factor)
+                    self.assertEqual(factor.stats["numeric_engine"], "row-hybrid")
+                    self.assertTrue(factor.stats["numeric_probe_fallback"])
+                    self.assertGreater(factor.stats["numeric_probe_columns"], 0)
+                    self.assertLess(factor.stats["numeric_probe_columns"], matrix.shape[0])
+                    self.assertEqual(factor.stats["numeric_probe_max_front"], dense_size)
+                    self.assertLessEqual(factor.stats["numeric_probe_updates"], 64 * matrix.nnz)
+                    self.assertGreater(factor.stats["numeric_probe_seconds"], 0.0)
+                    self.assertGreaterEqual(
+                        factor.stats["numeric_seconds"], factor.stats["numeric_probe_seconds"]
+                    )
+                    self.assertGreater(factor.stats["peak_workspace_bytes"], 0)
+                    self.assert_factor_identity(matrix, factor)
+                    for trans, operator in (("N", matrix), ("T", matrix.T)):
+                        assert_allclose(
+                            factor.solve(operator @ expected, trans=trans,
+                                         iterative_refinement=False),
+                            expected, rtol=2e-13, atol=2e-13,
+                        )
+                self.assertGreater(factors[1].stats["parallel_steps"], 0)
+                assert_array_equal(factors[0].perm_r, factors[1].perm_r)
+                assert_array_equal(factors[0].perm_c, factors[1].perm_c)
+                assert_array_equal(factors[0].L.toarray(), factors[1].L.toarray())
+                assert_array_equal(factors[0].U.toarray(), factors[1].U.toarray())
+
+    def test_colamd_probe_propagates_factorization_errors(self):
+        singular = np.ones((260, 260))
+        singular[:, 1] = 2.0
+        with self.assertRaises(np.linalg.LinAlgError):
+            splu(csc_array(singular), backend="native", permc_spec="COLAMD")
+        with self.assertRaisesRegex(RuntimeError, "non-finite"):
+            splu(csc_array([[1e-310, 1.0], [1.0, 1.0]]), backend="native",
+                 permc_spec="COLAMD", diag_pivot_thresh=0.0)
 
     def test_adaptive_csc_engines_on_random_patterns(self):
         for seed in range(5):

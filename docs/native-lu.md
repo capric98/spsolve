@@ -26,9 +26,9 @@ systems.
 2. C++ validates CSC bounds and optional finiteness.
 3. A column ordering is selected:
    - `NATURAL` preserves input order.
-   - `COLAMD` uses the vendored COLAMD routine on the input pattern. For a
-     nonsymmetric result, a second AMD analysis supplies classifier estimates
-     without replacing the requested COLAMD permutation.
+   - `COLAMD` uses the vendored COLAMD routine on the input pattern. Engine
+     selection uses actual numeric work in this permutation; there is no
+     second ordering pass.
    - `MMD_AT_PLUS_A` uses the vendored AMD routine on the structural graph of
      `A + A.T`. AMD's fill and maximum-front estimates also guide numeric
      engine selection.
@@ -45,10 +45,14 @@ systems.
      common LU contract as `L` and `D @ L.T`; internally it retains only the
      strict lower triangle and diagonal, constructing public `L` and `U`
      lazily. A non-positive pivot falls back to pivoted LU.
-   - A nonsymmetric matrix with AMD-estimated maximum front at most 192 and
-     predicted fill at most 20 uses a Gilbert-Peierls-style left-looking CSC
-     LU. It performs threshold partial pivoting while keeping sparse work in
-     contiguous column arrays.
+   - A nonsymmetric matrix with `MMD_AT_PLUS_A` uses a Gilbert-Peierls-style
+     left-looking CSC LU when AMD estimates a maximum front at most 192 and
+     fill at most 20. `COLAMD` instead starts in CSC with its actual pivots:
+     a column reach above 192, more than 8,192 scalar updates in a column,
+     more than `64 * nnz(A)` total updates, or factor storage above
+     `20 * nnz(A)` triggers a restart in the row engine. The discarded probe
+     is bounded, and restart preserves the requested column permutation and
+     equilibration. Both engines perform threshold partial pivoting.
    - Wider or fill-heavy patterns use the row-hybrid LU. Sorted sparse rows
      convert to dense tails when their remaining front is at least 25% dense.
      A persistent `std::thread` team dynamically schedules sufficiently large
@@ -72,6 +76,16 @@ the expensive work below each selected pivot, not pivot selection itself.
 Statistics expose `numeric_engine`, `parallel_steps`, `row_updates`, and
 `largest_front` so users can tell which path ran and whether a problem supplied
 meaningful parallel work.
+
+`ordering_estimated_l_nnz` and `ordering_estimated_max_front` report AMD
+estimates for `MMD_AT_PLUS_A`; zero means unavailable for other orderings.
+COLAMD exposes `numeric_probe_columns`, `numeric_probe_max_front`,
+`numeric_probe_updates`, `numeric_probe_seconds`, and `numeric_probe_fallback`.
+The probe counts completed columns and scalar updates, and records the largest
+observed reach, including the column that triggers a restart. Probe time is
+included in numeric/factor time; on success it is the CSC factorization itself.
+Workspace diagnostics include the temporary restart snapshot and discarded
+CSC buffers on fallback.
 
 Good threading candidates have wide, irregular fronts and substantial fill.
 Banded and PDE-like problems usually select a low-overhead serial CSC engine;

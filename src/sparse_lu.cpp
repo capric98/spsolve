@@ -728,13 +728,14 @@ template <typename Int>
 }
 
 template <typename Int>
-void factorize_left_looking(
+bool factorize_left_looking(
     const std::shared_ptr<NativeSparseLU>& result,
     const double* data,
     const Int* indices,
     const Int* indptr,
     index_t n,
-    double diag_pivot_thresh
+    double diag_pivot_thresh,
+    bool bounded_probe = false
 ) {
     const auto numeric_start = Clock::now();
     result->numeric_engine_ = "left-looking-csc";
@@ -764,7 +765,20 @@ void factorize_left_looking(
     std::iota(position_of_row.begin(), position_of_row.end(), index_t{0});
 
     result->peak_workspace_bytes_ = static_cast<std::uint64_t>(n) *
-        (sizeof(double) + 6 * sizeof(index_t));
+        (sizeof(double) + 7 * sizeof(index_t));
+
+    // Bound discarded COLAMD work by the input size, and leave genuinely wide
+    // or expensive columns to the row engine. These limits use this ordering
+    // and its actual pivots, rather than an unrelated symmetric graph.
+    constexpr index_t probe_front_limit = 192;
+    constexpr std::uint64_t probe_column_update_limit = 8'192;
+    const auto scaled_budget = [&](std::uint64_t multiplier) {
+        const auto nnz = static_cast<std::uint64_t>(result->input_nnz_);
+        const auto maximum = std::numeric_limits<std::uint64_t>::max();
+        return nnz > maximum / multiplier ? maximum : nnz * multiplier;
+    };
+    const std::uint64_t probe_update_limit = scaled_budget(64);
+    const std::uint64_t probe_factor_limit = scaled_budget(20);
 
     auto depth_first_reach = [&](index_t root, index_t top, index_t generation) {
         index_t head = 0;
@@ -816,7 +830,13 @@ void factorize_left_looking(
                 top = depth_first_reach(row, top, factor_col);
             }
         }
+        if (bounded_probe) {
+            result->numeric_probe_max_front_ = std::max(
+                result->numeric_probe_max_front_, n - top);
+            if (n - top > probe_front_limit) return false;
+        }
 
+        std::uint64_t column_updates = 0;
         for (index_t p = top; p < n; ++p) {
             values[static_cast<std::size_t>(reach[static_cast<std::size_t>(p)])] = 0.0;
         }
@@ -838,6 +858,15 @@ void factorize_left_looking(
                 result->l_col_ptr_[static_cast<std::size_t>(source_col)] + 1;
             const index_t last =
                 result->l_col_ptr_[static_cast<std::size_t>(source_col + 1)];
+            if (bounded_probe) {
+                const auto updates = static_cast<std::uint64_t>(last - first);
+                if (updates > probe_column_update_limit - column_updates ||
+                    updates > probe_update_limit - result->numeric_probe_updates_) {
+                    return false;
+                }
+                column_updates += updates;
+                result->numeric_probe_updates_ += updates;
+            }
             result->row_updates_ += last - first;
             for (index_t q = first; q < last; ++q) {
                 const index_t target =
@@ -933,6 +962,12 @@ void factorize_left_looking(
         values[static_cast<std::size_t>(pivot_row)] = 0.0;
         result->largest_front_ = std::max(
             result->largest_front_, n - top);
+        if (bounded_probe) {
+            ++result->numeric_probe_columns_;
+            const auto entries = static_cast<std::uint64_t>(result->l_values_.size()) +
+                static_cast<std::uint64_t>(result->u_values_.size());
+            if (entries > probe_factor_limit) return false;
+        }
     }
 
     result->l_col_ptr_[static_cast<std::size_t>(n)] =
@@ -954,6 +989,7 @@ void factorize_left_looking(
     result->numeric_seconds_ = std::chrono::duration<double>(
         Clock::now() - numeric_start).count();
     result->factor_seconds_ = result->numeric_seconds_;
+    return true;
 }
 
 template <typename Int>
@@ -1060,17 +1096,41 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
     }
 
     if (ordering == "COLAMD") {
-        // COLAMD does not expose frontal-size estimates. Run AMD's symbolic
-        // analysis as a cheap classifier while retaining the requested COLAMD
-        // permutation. Symmetric positive-definite inputs return above and do
-        // not pay for this second ordering pass.
-        const auto estimate_start = Clock::now();
-        (void)suitesparse_amd_order(
-            indices, indptr, n, result->ordering_estimated_l_nnz_,
-            result->ordering_estimated_max_front_);
-        result->ordering_backend_ += " + AMD 3.3.4 classifier";
-        result->ordering_seconds_ += std::chrono::duration<double>(
-            Clock::now() - estimate_start).count();
+        // Restart from pristine state if actual CSC work is unsuitable. Copy
+        // only the construction state; no partial factors exist at this point.
+        const auto probe_start = Clock::now();
+        NativeSparseLU restart_state = *result;
+        const bool completed = factorize_left_looking(
+            result, data, indices, indptr, n, diag_pivot_thresh, true);
+        const double probe_seconds = std::chrono::duration<double>(
+            Clock::now() - probe_start).count();
+        const auto probe_columns = result->numeric_probe_columns_;
+        const auto probe_front = result->numeric_probe_max_front_;
+        const auto probe_updates = result->numeric_probe_updates_;
+        // The pristine snapshot is temporary workspace. On fallback, count
+        // the discarded CSC factor buffers as workspace as well.
+        std::uint64_t probe_workspace = result->peak_workspace_bytes_ +
+            static_cast<std::uint64_t>(n) * (sizeof(index_t) + 2 * sizeof(double));
+        if (!completed) {
+            probe_workspace += sizeof(index_t) * (
+                result->l_col_ptr_.capacity() + result->u_col_ptr_.capacity() +
+                result->l_row_indices_.capacity() + result->u_row_indices_.capacity());
+            probe_workspace += sizeof(double) * (
+                result->l_values_.capacity() + result->u_values_.capacity());
+            *result = std::move(restart_state);
+        }
+        result->numeric_probe_columns_ = probe_columns;
+        result->numeric_probe_max_front_ = probe_front;
+        result->numeric_probe_updates_ = probe_updates;
+        result->numeric_probe_seconds_ = probe_seconds;
+        result->numeric_probe_fallback_ = !completed;
+        result->peak_workspace_bytes_ = std::max(
+            result->peak_workspace_bytes_, probe_workspace);
+        if (completed) {
+            result->numeric_seconds_ = probe_seconds;
+            result->factor_seconds_ = probe_seconds;
+            return result;
+        }
     }
 
     const double predicted_factor_nnz =
@@ -1292,7 +1352,7 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
     }
 
     result->factor_seconds_ = std::chrono::duration<double>(
-        Clock::now() - factor_start).count();
+        Clock::now() - factor_start).count() + result->numeric_probe_seconds_;
     result->numeric_seconds_ = result->factor_seconds_;
     result->perm_r_ = row_at_position;
     result->l_rows_.resize(static_cast<std::size_t>(n));
@@ -1785,6 +1845,11 @@ nb::dict NativeSparseLU::stats() const {
     output["peak_workspace_bytes"] = peak_workspace_bytes_;
     output["ordering_estimated_l_nnz"] = ordering_estimated_l_nnz_;
     output["ordering_estimated_max_front"] = ordering_estimated_max_front_;
+    output["numeric_probe_columns"] = numeric_probe_columns_;
+    output["numeric_probe_max_front"] = numeric_probe_max_front_;
+    output["numeric_probe_updates"] = numeric_probe_updates_;
+    output["numeric_probe_seconds"] = numeric_probe_seconds_;
+    output["numeric_probe_fallback"] = numeric_probe_fallback_;
     return output;
 }
 

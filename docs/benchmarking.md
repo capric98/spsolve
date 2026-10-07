@@ -12,11 +12,17 @@ Run the default eight-thread promotion gate with:
 python benchmarks/factorization.py --threads 8 --repeats 5 --gate
 ```
 
-Exercise two additional structural families with:
+Exercise additional structural families with:
 
 ```bash
 python benchmarks/factorization.py --threads 8 --extended
 ```
+
+With `--extended --permc-spec COLAMD`, the suite also includes a 20,000-row
+banded matrix whose rows are randomly permuted (`--quick` uses 2,500 rows).
+This checks that row labels do not turn narrow COLAMD factors into a wide-front
+classification. The case is specific to COLAMD: MMD's `A + A.T` graph changes
+under independent row permutations and can produce a very different ordering.
 
 The promotion ordering is `MMD_AT_PLUS_A`. Use `--permc-spec COLAMD` or
 `--permc-spec NATURAL` to compare another public ordering without editing the
@@ -29,6 +35,11 @@ timer noise and garbage-collection jitter do not dominate; override this with
 `--min-sample-seconds` when needed. Previous factors are released outside each
 timed interval, so object-destruction cost is not attributed to the next
 factorization.
+
+JSON results also include COLAMD probe work and restart diagnostics. Numeric
+time includes any discarded probe, while ordering time contains only the
+requested ordering. The promotion criteria also apply to the permuted-band
+case when it is included.
 
 ## Criteria
 
@@ -90,6 +101,17 @@ also passes the three representative cases, but the current simplicial SPD
 kernel remains slower than SuperLU on the extended 3-D Poisson case with that
 ordering. A blocked supernodal kernel is still the likely next improvement for
 such high-fill permutations.
+
+The row-permuted 20,000-row COLAMD band exposes a separate classifier problem.
+Using an unrelated AMD analysis previously reported a front of 11,309 despite
+only 359,878 factor entries and narrow actual fronts. Replacing that analysis
+with bounded numeric probing reduced native eight-thread factorization from
+0.0846 seconds to 0.0218 seconds in a three-repeat Windows release comparison.
+The probe observed a maximum column reach of 31 and retained the CSC engine;
+factor fill and residual were unchanged. SuperLU took 0.0167 seconds, so the
+new extended case still fails the unchanged 1.05x gate at about 1.30x. The
+misclassification and extra ordering pass are fixed; the remaining CSC cost
+still needs optimization. Native remains opt-in.
 
 Do not switch `NATIVE_DEFAULT` in `src/spsolve/sparse_lu.py` until the full gate
 passes in at least three consecutive release-build runs on both Windows and
