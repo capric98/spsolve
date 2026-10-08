@@ -223,6 +223,15 @@ A representative four-block factor reported about 58 ms in its numeric
 loop against about 106 ms end to end, leaving substantial setup and retained
 storage costs beyond the blocked update itself.
 
+The later contiguous panel path (retained dense pivot rows, `axpy_sub`
+materialization, segment packing, and lazy U rows; see
+[the design notes](native-lu.md#dense-lu-panels)) lowered row-hybrid times
+on the same machine with the `avx2-fma` kernel, with bitwise identical
+factors: connected dense LU of size 600 from about 17.7 to 14.4 ms at eight
+threads (numeric phase 10.0 to 6.3 ms), irregular and pivot-heavy by about
+20% at one thread, and the four-, five-, and eight-block dense cases by about
+20%. The tables above remain historical.
+
 ### Blocked SPD comparison
 
 Two sequential Windows x64 release comparisons used five batched samples per

@@ -175,9 +175,14 @@ tail must be complete first, so it is materialized explicitly:
 
 $$u_{kj} = \tilde a_{pj} - \sum_{k' \in P,\ k' < k} l_{p k'}\, u_{k' j}, \qquad j \in T,$$
 
-summing in ascending $k'$. The flush is tiled over disjoint $16 \times 64$
-output blocks; tiles may run on different threads because they write disjoint
-entries and each entry subtracts its $w$ terms in ascending pivot order.
+summing in ascending $k'$. The flush packs the columns of $T$ in which some
+$u_{kj} \ne 0$ as contiguous column segments, which may also contain columns
+where every $u_{kj}$ is zero (bridged gaps of fewer than 16 columns, and
+zeros inside a dense pivot row's packed range); such a column changes at
+most the sign of a zero entry. The flush is tiled over disjoint blocks of 16
+rows by at most 64 columns of one segment; tiles may run on different
+threads because they write disjoint entries and each entry subtracts its $w$
+terms in ascending pivot order.
 
 ## 6. Symmetric $LDL^T$
 
@@ -379,8 +384,9 @@ one while both are tiny. No condition estimate is computed.
   $c \leftarrow (\cdots((c - a_0 b_0) - a_1 b_1) \cdots) - a_{k-1} b_{k-1}$,
   each term a rounded product and a rounded subtraction in every kernel: this
   is the recurrence of its eager rank-1 updates and of pivot-tail
-  materialization, which apply the same terms outside the kernels, so a
-  duplicated row still cancels exactly. The supernodal $LDL^T$ rank-$k$
+  materialization, which apply the same terms through `axpy_sub` or, for
+  sparse pivot rows, in scalar code, so a duplicated row still cancels
+  exactly. The supernodal $LDL^T$ rank-$k$
   update forms $s = (\cdots((0 + a_0 b_0) + a_1 b_1) \cdots) + a_{k-1}
   b_{k-1}$ and then $c \leftarrow c - s$: when $|c|$ is much larger than the
   terms, as on a dominant diagonal, the running form would round at the scale
@@ -395,11 +401,13 @@ one while both are tiny. No condition estimate is computed.
   `SPSOLVE_FORCE_KERNEL`) and cross-machine reproducibility remains possible.
 - Non-finite values cannot be produced by finite input without overflow or a
   zero pivot. The engines check the pivot column maximum and pivot, the
-  multipliers, and every updated entry (or, where documented, every retained
-  row once), and abort with a non-finite error before any factor is
-  published. Pivot growth is bounded only by the usual $2^{n-1}$ worst case of
-  partial pivoting; refinement, not pivoting, is the second line of defence
-  against moderate growth.
+  multipliers, and every updated entry (or, where documented, every pivot
+  candidate and every retained row once; the row-hybrid panel path gives the
+  completeness argument in `docs/native-lu.md`), and abort with a non-finite
+  error, or a singular error if an exactly singular column is reached before
+  a deferred check, before any factor is published. Pivot growth is bounded
+  only by the usual $2^{n-1}$ worst case of partial pivoting; refinement, not
+  pivoting, is the second line of defence against moderate growth.
 
 ## 12. Complexity summary
 

@@ -73,9 +73,11 @@ python benchmarks/factorization.py --threads 8 --repeats 5 --gate   # promotion 
   and the preferred row `perm_c[k]`; ties break by current row position.
   Exact singularity raises an error containing "singular" (Python maps it to
   `numpy.linalg.LinAlgError`). Any non-finite intermediate raises a
-  `RuntimeError` containing "non-finite" before factors are published. Hoisting
-  a per-element finiteness check needs a written completeness argument in the
-  code and in `docs/native-lu.md`.
+  `RuntimeError` containing "non-finite" before factors are published, unless
+  an exactly singular column is reached before a hoisted (deferred) check
+  sees it, in which case "singular" is reported first; no factors are
+  published either way. Hoisting a per-element finiteness check needs a
+  written completeness argument in the code and in `docs/native-lu.md`.
 - **SPD path.** Factors are published only after every pivot is positive and
   finite; otherwise fall back to pivoted LU with `failed_spd_seconds > 0`,
   `parallel_panels == 0`, `spd_panel_entries == 0`. Engine names and selection

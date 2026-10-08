@@ -32,10 +32,6 @@
 #include <omp.h>
 #endif
 
-#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
-#include <emmintrin.h>
-#endif
-
 namespace {
 
 using index_t = NativeSparseLU::index_t;
@@ -478,51 +474,20 @@ void update_sparse_row(
     row.scratch.clear();
 }
 
-// target[i] -= multiplier * source[i] for every i, then reject non-finite
-// results. Each element uses the scalar multiply-then-subtract rounding.
-// There is no zero-source skip: for a finite target it can change at most
-// the sign of a zero, which is unobservable because zeros are never emitted
-// as factor entries, and the branch-free loop vectorizes.
-void subtract_scaled_dense(
-    double* target, const double* source, std::size_t count, double multiplier
-) {
-    std::size_t i = 0;
-    bool finite = true;
-#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
-    const __m128d scale = _mm_set1_pd(multiplier);
-    const __m128d sign = _mm_set1_pd(-0.0);
-    const __m128d largest = _mm_set1_pd(std::numeric_limits<double>::max());
-    __m128d bounded = _mm_castsi128_pd(_mm_set1_epi32(-1));
-    for (; i + 4 <= count; i += 4) {
-        const __m128d low = _mm_sub_pd(_mm_loadu_pd(target + i),
-            _mm_mul_pd(scale, _mm_loadu_pd(source + i)));
-        const __m128d high = _mm_sub_pd(_mm_loadu_pd(target + i + 2),
-            _mm_mul_pd(scale, _mm_loadu_pd(source + i + 2)));
-        _mm_storeu_pd(target + i, low);
-        _mm_storeu_pd(target + i + 2, high);
-        // |x| <= DBL_MAX is false exactly for infinities and NaNs.
-        bounded = _mm_and_pd(bounded, _mm_and_pd(
-            _mm_cmple_pd(_mm_andnot_pd(sign, low), largest),
-            _mm_cmple_pd(_mm_andnot_pd(sign, high), largest)));
-    }
-    finite = _mm_movemask_pd(bounded) == 0x3;
-#endif
-    for (; i < count; ++i) {
-        target[i] -= multiplier * source[i];
-        finite &= std::isfinite(target[i]);
-    }
-    if (!finite) {
-        throw std::runtime_error("non-finite value generated during LU factorization");
-    }
-}
-
+// Dense-pivot updates subtract multiplier * source over the pivot row's whole
+// stored range with kernels.axpy_sub (multiply, then subtract, per element)
+// and reject a non-finite result through the kernel flag. There is no
+// zero-source skip: for a finite target it can change at most the sign of a
+// zero, which is unobservable because zeros are never emitted as factor
+// entries or candidates, and the branch-free loop vectorizes.
 void update_dense_row(
     WorkRow& row,
     const WorkRow& pivot_row,
     const std::vector<Entry>& pivot,
     index_t pivot_col,
     index_t n,
-    double multiplier
+    double multiplier,
+    const dense_kernels::Kernels& kernels
 ) {
     // The target is a candidate at pivot_col, which therefore lies inside
     // [dense_offset, dense_end()). Every later write is above pivot_col, so
@@ -535,10 +500,12 @@ void update_dense_row(
         const index_t end = pivot_row.dense_end();
         if (first >= end) return;
         row.grow_dense(end, n);
-        subtract_scaled_dense(
-            row.dense.data() + (first - row.dense_offset),
-            pivot_row.dense.data() + (first - pivot_row.dense_offset),
-            static_cast<std::size_t>(end - first), multiplier);
+        if (!kernels.axpy_sub(
+                row.dense.data() + (first - row.dense_offset),
+                pivot_row.dense.data() + (first - pivot_row.dense_offset),
+                multiplier, static_cast<std::size_t>(end - first))) {
+            sparse_lu_panels::throw_non_finite();
+        }
         return;
     }
 
@@ -555,22 +522,39 @@ void update_dense_row(
     }
 }
 
+// Eager in-panel update of a dense target: only columns before panel_end.
+// A dense pivot row is retained by the panel, so its in-panel coefficients
+// are read in place with one AXPY; a sparse pivot supplies its U entries.
+// Neither path tests each element (see the completeness argument in
+// sparse_lu_panels::DensePanel); the AXPY reports through its kernel flag.
 void update_dense_panel_row(
-    WorkRow& row, const std::vector<Entry>& pivot,
-    index_t pivot_col, index_t panel_end, index_t n, double multiplier
+    WorkRow& row, const WorkRow& pivot_row, const std::vector<Entry>& pivot,
+    index_t pivot_col, index_t panel_end, index_t n, double multiplier,
+    const dense_kernels::Kernels& kernels
 ) {
     // As in update_dense_row, pivot_col is inside the candidate's storage.
     row.lower.push_back({pivot_col, multiplier});
     row.dense[static_cast<std::size_t>(pivot_col - row.dense_offset)] = 0.0;
+    if (pivot_row.dense_mode) {
+        // pivot_col is inside the pivot row's storage as well.
+        const index_t first = pivot_col + 1;
+        const index_t end = std::min(panel_end, pivot_row.dense_end());
+        if (first >= end) return;
+        row.grow_dense(end, n);
+        if (!kernels.axpy_sub(
+                row.dense.data() + (first - row.dense_offset),
+                pivot_row.dense.data() + (first - pivot_row.dense_offset),
+                multiplier, static_cast<std::size_t>(end - first))) {
+            sparse_lu_panels::throw_non_finite();
+        }
+        return;
+    }
     if (!pivot.empty()) row.grow_dense(std::min(panel_end, pivot.back().col + 1), n);
     auto source = std::upper_bound(pivot.begin(), pivot.end(), pivot_col,
         [](index_t col, const Entry& entry) { return col < entry.col; });
     for (; source != pivot.end() && source->col < panel_end; ++source) {
-        double& target = row.dense[static_cast<std::size_t>(source->col - row.dense_offset)];
-        target -= multiplier * source->value;
-        if (!std::isfinite(target)) {
-            throw std::runtime_error("non-finite value generated during LU factorization");
-        }
+        row.dense[static_cast<std::size_t>(source->col - row.dense_offset)] -=
+            multiplier * source->value;
     }
 }
 
@@ -1458,24 +1442,15 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
                 "factor is exactly singular at column " + std::to_string(pivot_col));
         }
         auto& pivot_output = result->u_rows_[static_cast<std::size_t>(pivot_col)];
-        if (pivot_work_row.dense_mode) {
-            if (panel_active) {
-                panel.materialize_pivot(pivot_row, pivot_col, rows, result->u_rows_);
-            }
+        // Inside a panel a dense pivot row is retained, unchanged, until the
+        // panel's flush; its U row is built on demand or at that flush.
+        const bool retained_pivot = pivot_work_row.dense_mode && panel_active;
+        if (retained_pivot) {
+            panel.materialize_pivot(pivot_row, pivot_col, rows, result->u_rows_, kernels);
+            panel.record_dense_pivot(pivot_row, pivot_col, rows);
+        } else if (pivot_work_row.dense_mode) {
             // Columns at or beyond dense_end() are exact zeros.
-            const index_t first = std::max(pivot_col, pivot_work_row.dense_offset);
-            const index_t end = pivot_work_row.dense_end();
-            std::size_t nonzeros = 0;
-            for (index_t col = first; col < end; ++col) {
-                nonzeros += pivot_work_row.dense[
-                    static_cast<std::size_t>(col - pivot_work_row.dense_offset)] != 0.0;
-            }
-            pivot_output.reserve(nonzeros);
-            for (index_t col = first; col < end; ++col) {
-                const double value = pivot_work_row.dense[
-                    static_cast<std::size_t>(col - pivot_work_row.dense_offset)];
-                if (value != 0.0) pivot_output.push_back({col, value});
-            }
+            sparse_lu_panels::append_dense_u_row(pivot_work_row, pivot_col, pivot_output);
         } else {
             pivot_output = std::move(pivot_work_row.active);
         }
@@ -1491,12 +1466,14 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
         }
 
         const std::uint64_t pivot_work = pivot_work_row.dense_mode
-            ? static_cast<std::uint64_t>(pivot_work_row.dense.size())
+            ? static_cast<std::uint64_t>(pivot_work_row.dense_end() - pivot_col)
             : static_cast<std::uint64_t>(pivot.size());
         const std::uint64_t work = static_cast<std::uint64_t>(targets.size()) *
             pivot_work;
-        result->largest_front_ = std::max<index_t>(
-            result->largest_front_, static_cast<index_t>(pivot.size()));
+        if (!retained_pivot) {
+            result->largest_front_ = std::max<index_t>(
+                result->largest_front_, static_cast<index_t>(pivot.size()));
+        }
         result->row_updates_ += static_cast<index_t>(targets.size());
         if (panel_active) {
             // Only sparse targets perform expensive whole-tail work per pivot.
@@ -1512,10 +1489,16 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
                 if (!std::isfinite(multiplier)) {
                     throw std::runtime_error("non-finite multiplier generated during LU factorization");
                 }
-                update_dense_panel_row(row, pivot, pivot_col, panel.end(), n, multiplier);
+                update_dense_panel_row(row, pivot_work_row, pivot, pivot_col, panel.end(), n,
+                                       multiplier, kernels);
                 panel.note_dense_row(row_id);
             }
             targets.resize(sparse_count);
+            // Sparse targets merge the complete U row; build it serially
+            // before any worker reads it.
+            if (retained_pivot && !targets.empty()) {
+                panel.ensure_u_entries(pivot_col, rows, result->u_rows_, result->largest_front_);
+            }
         }
         const bool run_parallel = result->factor_threads_ > 1 &&
             targets.size() > 1 && (panel_active
@@ -1539,7 +1522,7 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
             }
             if (row.dense_mode) {
                 update_dense_row(
-                    row, pivot_work_row, pivot, pivot_col, n, multiplier);
+                    row, pivot_work_row, pivot, pivot_col, n, multiplier, kernels);
             } else {
                 auto& local_additions = additions[static_cast<std::size_t>(worker_id)];
                 const std::size_t additions_before_update = local_additions.size();
@@ -1580,14 +1563,17 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
         }
         std::sort(dense_rows.begin() + conversions_begin, dense_rows.end());
         if (pivot_work_row.dense_mode) {
-            std::vector<double>().swap(pivot_work_row.dense);
-            pivot_work_row.dense_mode = false;
+            // A retained pivot row is released by the panel's flush.
+            if (!retained_pivot) {
+                std::vector<double>().swap(pivot_work_row.dense);
+                pivot_work_row.dense_mode = false;
+            }
             --active_dense_rows;
         }
         std::vector<index_t>().swap(active_columns[static_cast<std::size_t>(pivot_col)]);
         if (panel_active && pivot_col + 1 == panel.end()) {
-            panel.flush(rows, position_of_row, result->u_rows_, kernels, executor,
-                        result->factor_threads_);
+            panel.flush(rows, position_of_row, result->u_rows_, result->largest_front_,
+                        kernels, executor, result->factor_threads_);
             for (index_t row_id : panel.conversions()) {
                 auto& row = rows[static_cast<std::size_t>(row_id)];
                 if (position_of_row[static_cast<std::size_t>(row_id)] >= panel.end() &&
