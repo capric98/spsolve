@@ -1,0 +1,132 @@
+# Working in this repository
+
+`spsolve` is a BSD-3 Python package with a C++20 nanobind extension: a native
+sparse LU / LDL^T factorization and a native sparse triangular solver, with no
+BLAS or external factorization library. SciPy is the container layer and the
+`backend="scipy"` fallback. This file is for coding agents and humans who want
+to make a change without re-deriving the project's constraints.
+
+Read first, in this order: `README.md`, `docs/native-lu.md` (engine design and
+`stats` semantics), `docs/algorithms.md` (the mathematics each engine
+implements), `docs/benchmarking.md` (the promotion gate), `docs/api.md`.
+
+## Layout
+
+| Path | What lives there |
+|---|---|
+| `src/spsolve/*.py` | Public API: `splu`, `spsolve`, `factorized`, `spsolve_triangular`, `spparms` (thread/order settings). Canonicalizes input, maps native errors to `LinAlgError`, runs iterative refinement. |
+| `src/spsolve.cpp` | nanobind module `_spsolve`: binds the triangular kernels and calls `bind_sparse_lu`. |
+| `src/sparse_lu.cpp`, `src/sparse_lu.hpp` | `NativeSparseLU` and `factorize_typed`: validation, equilibration, ordering calls, engine selection, the SPD attempt, the left-looking CSC LU, the row-hybrid LU, `solve_inplace`, CSC export, `stats`. Also `FactorExecutor`, the persistent `std::thread` team. |
+| `src/sparse_ldlt.hpp` | Supernodal LDL^T kernels: fundamental supernodes, row incidence, rank-k tile update, per-node panel factorization. |
+| `src/sparse_lu_panels.hpp` | `DensePanel`: deferred dense-row updates and the tiled `L_panel * U_panel` flush of the row-hybrid LU. |
+| `src/spsolve_triangular*.hpp` | CSR triangular solve for C- and Fortran-ordered right-hand sides. |
+| `third_party/suitesparse_ordering/` | Vendored SuiteSparse AMD 3.3.4 and COLAMD 3.3.5 (BSD-3) plus a minimal config shim. Do not edit; upgrade wholesale and update `THIRD_PARTY_NOTICES.md`. |
+| `tests/` | `unittest` suites. `tests/__init__.py` is empty; tests import the installed package. |
+| `benchmarks/factorization.py` | Reproducible benchmark and promotion gate against SciPy SuperLU. |
+| `docs/` | Design, algorithms, API, benchmark notes. Update them in the same commit as a behavior change. |
+| `build/` | Gitignored scratch for local CMake trees and benchmark JSON/log output (`build/review/` by convention). |
+
+## Build, test, benchmark
+
+```bash
+python -m pip install . -v                       # scikit-build-core + CMake + C++20 compiler
+python -m unittest discover -v -s tests -t .     # must pass before any commit
+python benchmarks/factorization.py --quick       # smoke run, also used by CI
+python benchmarks/factorization.py --threads 8 --repeats 5 --extended --dense-lu --json build/review/run.json
+python benchmarks/factorization.py --threads 8 --repeats 5 --gate   # promotion gate, exits nonzero on failure
+```
+
+- Tests and benchmarks import `spsolve` from site-packages, so rebuild with
+  `pip install .` after every C++ change. A stale install silently tests old
+  code.
+- CMake options: `SP_USE_OPENMP` (default ON, only the triangular kernels and
+  multi-RHS solves use OpenMP), `SP_ARCH_NATIVE` (default OFF; wheels target
+  baseline x64, so never make correctness depend on it). Pass options through
+  pip as `-Ccmake.define.SP_ARCH_NATIVE=ON`.
+- On Windows the build uses MSVC; a manual `cmake` run needs `vcvars64.bat`.
+- Benchmarks pin BLAS libraries to one thread before importing NumPy so the
+  SuperLU comparison is factorization versus factorization. Run them on an
+  otherwise idle machine; medians of batched samples are still noisy at a few
+  percent, so re-run before calling a change a regression.
+- Keep a JSON of the state before your change and compare `native_1_seconds`,
+  `native_n_seconds`, `numeric_seconds`, `dense_rows`, `lu_*`, `parallel_*`,
+  `spd_*`, `residual`, and `stable_permutations` per case afterwards. The
+  gate criteria are in `docs/benchmarking.md`.
+
+## Invariants (do not break; tests pin them)
+
+- **Thread-count determinism.** The same input and options give bitwise
+  identical `perm_r`, `perm_c`, scales, `L` and `U` at every thread count.
+  Tiling, segmentation, path selection and remainder handling may depend on
+  sizes and positions only, never on the thread count or on which worker ran.
+  Every output entry accumulates its terms in one fixed order. Checked by
+  `assert_same_factors` in `tests/test_blocked_lu.py` and
+  `tests/test_supernodal_ldlt.py` and by exact comparisons in
+  `tests/test_sparse_lu.py`.
+- **Pivoting semantics.** Threshold partial pivoting with `diag_pivot_thresh`
+  and the preferred row `perm_c[k]`; ties break by current row position.
+  Exact singularity raises an error containing "singular" (Python maps it to
+  `numpy.linalg.LinAlgError`). Any non-finite intermediate raises a
+  `RuntimeError` containing "non-finite" before factors are published. Hoisting
+  a per-element finiteness check needs a written completeness argument in the
+  code and in `docs/native-lu.md`.
+- **SPD path.** Factors are published only after every pivot is positive and
+  finite; otherwise fall back to pivoted LU with `failed_spd_seconds > 0`,
+  `parallel_panels == 0`, `spd_panel_entries == 0`. Engine names and selection
+  boundaries (`symmetric-ldlt-csc` vs `symmetric-supernodal-ldlt` at width 320,
+  the `3072 * n` work guard, `left-looking-csc` vs `row-hybrid` limits) are
+  pinned by tests; change them only together with the tests and docs.
+- **Public contracts.** `Pr @ Dr @ A @ Dc @ Pc == L @ U`; lazy CSC `L`/`U`
+  via `export_l_csr`/`export_u_csr`; `solve_inplace`; every existing `stats`
+  key keeps its meaning (new keys may be added); the filled pattern including
+  numerically cancelled entries stays stored.
+- **No input mutation.** The native code only reads `const` pointers; tests
+  assert the caller's arrays are unchanged.
+- **Licensing.** BSD-3 only. Do not copy code from SuperLU, CHOLMOD, UMFPACK,
+  MUMPS, PaStiX, Eigen's sparse modules, or MKL, and do not add a BLAS
+  dependency. Kernels are written in-house; ideas from papers are fine and
+  belong in `docs/algorithms.md` with a citation.
+
+## Conventions
+
+- C++20, `index_t = std::int64_t`, exceptions for errors (workers capture and
+  rethrow through `FactorExecutor`), no global mutable state except the
+  executor's own. SIMD is SSE2 intrinsics guarded by the existing
+  `__SSE2__ || _M_X64` test with a scalar fallback; anything wider must be
+  runtime-dispatched from a separately compiled translation unit so baseline
+  wheels keep running.
+- `.clang-format` has `DisableFormat: true`: match the surrounding style by
+  hand (4-space indent, `static_cast`, `[[nodiscard]]`, braces on the same
+  line).
+- Python: NumPy/SciPy only, `from __future__ import annotations`, type hints,
+  warnings for format conversions (`SparseEfficiencyWarning`).
+- Every behavior or threshold change updates `docs/native-lu.md` (and
+  `docs/benchmarking.md` if a benchmark number or criterion moves). Timing
+  fields in `stats` document exactly what they include.
+- Commit messages: `feat:` / `perf:` / `fix:` / `bench:` / `docs:` prefix, an
+  imperative subject under 72 characters, and a wrapped body that states what
+  changed and the measured effect with numbers (see `git log`). One logical
+  change per commit. Never push unless asked.
+
+## How to make a change safely
+
+1. Measure first. Reproduce the case with `benchmarks/factorization.py` or a
+   small script, read `stats` (engine, `numeric_seconds`, `parallel_steps`,
+   `dense_rows`, `spd_*`) and locate the phase, before touching the code.
+2. Keep the engine selection and the public contract unchanged unless the
+   change is about them; most speedups live inside one engine or kernel.
+3. Rebuild, run the whole test suite, then the benchmark with `--json`, and
+   compare against your pre-change JSON for every case, not only the target.
+4. Run a thread sweep (1, 2, 3, 4, 8) on the affected matrices and confirm
+   bitwise identical factors, not just small residuals.
+5. Update the docs in the same change, including the "Current limitations"
+   section of `docs/native-lu.md` when a limitation appears or disappears.
+6. Prefer an independent review of the diff (different person or agent) that
+   re-runs tests and benchmarks before committing.
+
+## Known gaps
+
+The native backend stays opt-in (`backend="native"`) until the gate passes on
+Windows and Linux release builds. Current performance gaps and the planned
+fixes are summarized at the end of `docs/native-lu.md` and in the status tables
+of `docs/benchmarking.md`.
