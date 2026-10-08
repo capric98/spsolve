@@ -213,6 +213,46 @@ class SparseLUTests(unittest.TestCase):
             splu(csc_array([[1e-310, 1.0], [1.0, 1.0]]), backend="native",
                  permc_spec="COLAMD", diag_pivot_thresh=0.0)
 
+    def test_left_looking_reports_nonfinite_candidates_and_singular_rows(self):
+        n = 40
+        band = diags(
+            [4.0 * np.ones(n), -np.ones(n - 1), 0.25 * np.ones(n - 9)],
+            [0, 1, 9], shape=(n, n), format="csc",
+        ).toarray()
+        orderings = ("COLAMD", "MMD_AT_PLUS_A")
+        for ordering in orderings:
+            factor = splu(csc_array(band), backend="native", permc_spec=ordering)
+            self.assertEqual(factor.stats["numeric_engine"], "left-looking-csc")
+        # Each planted value is, in some ordering here, the only candidate of
+        # its column: a NaN magnitude never wins the maximum comparison, so it
+        # must be reported as non-finite rather than as an empty column.
+        for value in (np.nan, np.inf):
+            for position in (1, 2, 5, 12):
+                planted = band.copy()
+                planted[position, position] = value
+                for ordering in orderings:
+                    for threads in (1, 4):
+                        with self.subTest(value=value, position=position,
+                                          ordering=ordering, threads=threads):
+                            with self.assertRaisesRegex(RuntimeError, "non-finite"):
+                                splu(csc_array(planted), backend="native",
+                                     permc_spec=ordering, num_threads=threads,
+                                     check_finite=False)
+        # A duplicated row stays exactly singular; a perturbed copy with the
+        # same pattern shows that this pattern runs in the CSC engine.
+        duplicated = band.copy()
+        duplicated[21, :] = duplicated[20, :]
+        perturbed = duplicated.copy()
+        perturbed[21, 21] = 3.0
+        for ordering in orderings:
+            factor = splu(csc_array(perturbed), backend="native", permc_spec=ordering)
+            self.assertEqual(factor.stats["numeric_engine"], "left-looking-csc")
+            for threads in (1, 4):
+                with self.subTest(ordering=ordering, threads=threads, case="duplicated"):
+                    with self.assertRaisesRegex(np.linalg.LinAlgError, "singular"):
+                        splu(csc_array(duplicated), backend="native",
+                             permc_spec=ordering, num_threads=threads)
+
     def test_adaptive_csc_engines_on_random_patterns(self):
         for seed in range(5):
             with self.subTest(kind="spd", seed=seed):

@@ -956,12 +956,19 @@ bool factorize_left_looking(
             }
         }
 
+        // Every candidate is tested for finiteness: a NaN magnitude compares
+        // false with the running maximum and would otherwise be skipped, so a
+        // column whose only candidate is non-finite would look singular.
         index_t pivot_row = -1;
         double maximum_value = 0.0;
         for (index_t p = top; p < n; ++p) {
             const index_t row = reach[static_cast<std::size_t>(p)];
             if (inverse_row_permutation[static_cast<std::size_t>(row)] >= 0) continue;
             const double magnitude = std::abs(values[static_cast<std::size_t>(row)]);
+            if (!std::isfinite(magnitude)) {
+                throw std::runtime_error(
+                    "non-finite value generated during LU factorization");
+            }
             if (magnitude > maximum_value ||
                 (magnitude == maximum_value && magnitude != 0.0 &&
                  (pivot_row < 0 ||
@@ -971,7 +978,7 @@ bool factorize_left_looking(
                 pivot_row = row;
             }
         }
-        if (pivot_row < 0 || maximum_value == 0.0 || !std::isfinite(maximum_value)) {
+        if (pivot_row < 0 || maximum_value == 0.0) {
             throw std::runtime_error(
                 "factor is exactly singular at column " + std::to_string(factor_col));
         }
@@ -984,8 +991,12 @@ bool factorize_left_looking(
                 pivot_row = preferred_row;
             }
         }
+        // The scan above checked every candidate, so these are defensive.
         const double pivot_value = values[static_cast<std::size_t>(pivot_row)];
-        if (pivot_value == 0.0 || !std::isfinite(pivot_value)) {
+        if (!std::isfinite(pivot_value)) {
+            throw std::runtime_error("non-finite value generated during LU factorization");
+        }
+        if (pivot_value == 0.0) {
             throw std::runtime_error(
                 "factor is exactly singular at column " + std::to_string(factor_col));
         }

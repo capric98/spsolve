@@ -456,6 +456,10 @@ build without OpenMP remains functional.
 - overflow checks during scaling and row updates (the dense panel path checks
   candidates, multipliers, kernel results, and retained U rows; see "Dense
   LU panels");
+- both LU engines test every pivot candidate for finiteness, so a non-finite
+  candidate raises the non-finite error even when it is the only candidate
+  of its column (a NaN never wins the maximum comparison, and skipping it
+  would report the column as singular);
 - componentwise iterative refinement with final-error and convergence checks.
 
 This is not a rank-revealing factorization and does not estimate condition
