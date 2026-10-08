@@ -522,42 +522,6 @@ void update_dense_row(
     }
 }
 
-// Eager in-panel update of a dense target: only columns before panel_end.
-// A dense pivot row is retained by the panel, so its in-panel coefficients
-// are read in place with one AXPY; a sparse pivot supplies its U entries.
-// Neither path tests each element (see the completeness argument in
-// sparse_lu_panels::DensePanel); the AXPY reports through its kernel flag.
-void update_dense_panel_row(
-    WorkRow& row, const WorkRow& pivot_row, const std::vector<Entry>& pivot,
-    index_t pivot_col, index_t panel_end, index_t n, double multiplier,
-    const dense_kernels::Kernels& kernels
-) {
-    // As in update_dense_row, pivot_col is inside the candidate's storage.
-    row.lower.push_back({pivot_col, multiplier});
-    row.dense[static_cast<std::size_t>(pivot_col - row.dense_offset)] = 0.0;
-    if (pivot_row.dense_mode) {
-        // pivot_col is inside the pivot row's storage as well.
-        const index_t first = pivot_col + 1;
-        const index_t end = std::min(panel_end, pivot_row.dense_end());
-        if (first >= end) return;
-        row.grow_dense(end, n);
-        if (!kernels.axpy_sub(
-                row.dense.data() + (first - row.dense_offset),
-                pivot_row.dense.data() + (first - pivot_row.dense_offset),
-                multiplier, static_cast<std::size_t>(end - first))) {
-            sparse_lu_panels::throw_non_finite();
-        }
-        return;
-    }
-    if (!pivot.empty()) row.grow_dense(std::min(panel_end, pivot.back().col + 1), n);
-    auto source = std::upper_bound(pivot.begin(), pivot.end(), pivot_col,
-        [](index_t col, const Entry& entry) { return col < entry.col; });
-    for (; source != pivot.end() && source->col < panel_end; ++source) {
-        row.dense[static_cast<std::size_t>(source->col - row.dense_offset)] -=
-            multiplier * source->value;
-    }
-}
-
 template <typename Int>
 [[nodiscard]] bool is_exactly_symmetric(
     const double* data,
@@ -1332,8 +1296,18 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
     sparse_lu_panels::DensePanel panel;
     bool dense_panels_enabled = false;
     bool panel_active = false;
+    // Per-pivot scratch, cleared at each step instead of reallocated. The
+    // addition and conversion slots are indexed by worker.
+    std::vector<index_t> candidates;
+    std::vector<double> candidate_values;
+    std::vector<index_t> targets;
+    std::vector<std::vector<Addition>> additions(
+        static_cast<std::size_t>(result->factor_threads_));
+    std::vector<std::vector<index_t>> dense_conversions(
+        static_cast<std::size_t>(result->factor_threads_));
 
     for (index_t pivot_col = 0; pivot_col < n; ++pivot_col) {
+        bool panel_started = false;
         if (!panel_active) {
             // Initial activation needs enough dense work to amortize packing.
             // Once enabled, finish short trailing panels with the same recurrence.
@@ -1344,6 +1318,7 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
                 panel.begin(pivot_col, pivot_col + std::min(n - pivot_col, sparse_lu_panels::width),
                             n, result->factor_threads_);
                 panel_active = true;
+                panel_started = true;
             }
         }
         // Admit pending rows that start in this column, or anywhere in the
@@ -1355,57 +1330,83 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
                    admit_end) {
             dense_rows.push_back(pending_dense[pending_dense_cursor++]);
         }
-        std::vector<index_t> candidates;
-        candidates.reserve(
-            active_columns[static_cast<std::size_t>(pivot_col)].size() +
-            dense_rows.size());
+        // A new panel copies its columns of every dense row that can be a
+        // candidate inside it into its block (see DensePanel).
+        if (panel_started) panel.gather(dense_rows, rows, position_of_row);
+
+        candidates.clear();
+        candidate_values.clear();
         const auto add_candidate = [&](index_t row_id, double value) {
             if (value == 0.0) return;
             if (!std::isfinite(value)) {
                 throw std::runtime_error("non-finite value generated during LU factorization");
             }
             candidates.push_back(row_id);
+            candidate_values.push_back(value);
         };
         // A dense row listed here by an earlier sparse entry is examined once,
         // through the bounded read; the dense loop skips rows already seen.
+        // Inside a panel, members are examined in the block instead, and no
+        // other dense row can have a nonzero in a panel column.
         for (const index_t row_id : active_columns[static_cast<std::size_t>(pivot_col)]) {
-            if (seen[static_cast<std::size_t>(row_id)] == pivot_col) continue;
-            seen[static_cast<std::size_t>(row_id)] = pivot_col;
-            if (position_of_row[static_cast<std::size_t>(row_id)] < pivot_col) continue;
-            add_candidate(row_id,
-                work_row_value(rows[static_cast<std::size_t>(row_id)], pivot_col));
-        }
-        for (const index_t row_id : dense_rows) {
+            if (panel_active && panel.is_member(row_id)) continue;
             if (seen[static_cast<std::size_t>(row_id)] == pivot_col) continue;
             seen[static_cast<std::size_t>(row_id)] = pivot_col;
             if (position_of_row[static_cast<std::size_t>(row_id)] < pivot_col) continue;
             const auto& row = rows[static_cast<std::size_t>(row_id)];
-            // Columns outside a dense row's storage are exact zeros, and a
-            // released pivot row has empty storage.
-            if (!row.dense_mode || pivot_col < row.dense_offset ||
-                pivot_col >= row.dense_end()) {
-                continue;
+            const double value = work_row_value(row, pivot_col);
+            if (panel_active && row.dense_mode && value != 0.0) {
+                throw std::logic_error("dense LU panel: a dense candidate is not a panel member");
             }
-            add_candidate(row_id,
-                row.dense[static_cast<std::size_t>(pivot_col - row.dense_offset)]);
+            add_candidate(row_id, value);
         }
-        if (candidates.empty()) {
+        sparse_lu_panels::DensePanel::Candidate block_candidate;
+        if (panel_active) {
+            block_candidate = panel.scan_column(pivot_col);
+        } else {
+            for (const index_t row_id : dense_rows) {
+                if (seen[static_cast<std::size_t>(row_id)] == pivot_col) continue;
+                seen[static_cast<std::size_t>(row_id)] = pivot_col;
+                if (position_of_row[static_cast<std::size_t>(row_id)] < pivot_col) continue;
+                const auto& row = rows[static_cast<std::size_t>(row_id)];
+                // Columns outside a dense row's storage are exact zeros, and a
+                // released pivot row has empty storage.
+                if (!row.dense_mode || pivot_col < row.dense_offset ||
+                    pivot_col >= row.dense_end()) {
+                    continue;
+                }
+                add_candidate(row_id,
+                    row.dense[static_cast<std::size_t>(pivot_col - row.dense_offset)]);
+            }
+        }
+        if (candidates.empty() && block_candidate.count == 0) {
             throw std::runtime_error(
                 "factor is exactly singular at column " + std::to_string(pivot_col));
         }
 
-        index_t maximum_row = candidates.front();
+        // Largest magnitude, ties to the smaller current position. The block
+        // maximum merges by the same rule, so the choice does not depend on
+        // which list holds a candidate.
+        index_t maximum_row = -1;
+        index_t maximum_position = 0;
         double maximum_value = 0.0;
-        for (const index_t row_id : candidates) {
-            const double magnitude = std::abs(
-                work_row_value(rows[static_cast<std::size_t>(row_id)], pivot_col));
+        for (std::size_t index = 0; index < candidates.size(); ++index) {
+            const double magnitude = std::abs(candidate_values[index]);
+            const index_t position = position_of_row[static_cast<std::size_t>(candidates[index])];
             if (magnitude > maximum_value ||
-                (magnitude == maximum_value &&
-                 position_of_row[static_cast<std::size_t>(row_id)] <
-                 position_of_row[static_cast<std::size_t>(maximum_row)])) {
+                (magnitude == maximum_value && position < maximum_position)) {
                 maximum_value = magnitude;
-                maximum_row = row_id;
+                maximum_position = position;
+                maximum_row = candidates[index];
             }
+        }
+        if (block_candidate.count > 0 &&
+            (block_candidate.magnitude > maximum_value ||
+             (block_candidate.magnitude == maximum_value &&
+              block_candidate.position < maximum_position))) {
+            maximum_value = block_candidate.magnitude;
+            maximum_position = block_candidate.position;
+            maximum_row = block_candidate.row;
         }
         if (!std::isfinite(maximum_value)) {
             throw std::runtime_error("non-finite value generated during LU factorization");
@@ -1419,8 +1420,9 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
         const index_t preferred_row = result->perm_c_[static_cast<std::size_t>(pivot_col)];
         if (preferred_row >= 0 && preferred_row < n &&
             position_of_row[static_cast<std::size_t>(preferred_row)] >= pivot_col) {
-            const double preferred = work_row_value(
-                rows[static_cast<std::size_t>(preferred_row)], pivot_col);
+            const double preferred = panel_active && panel.is_member(preferred_row)
+                ? panel.value_of(preferred_row, pivot_col)
+                : work_row_value(rows[static_cast<std::size_t>(preferred_row)], pivot_col);
             if (preferred != 0.0 &&
                 std::abs(preferred) >= diag_pivot_thresh * maximum_value) {
                 pivot_row = preferred_row;
@@ -1434,9 +1436,16 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
         position_of_row[static_cast<std::size_t>(pivot_row)] = pivot_col;
         position_of_row[static_cast<std::size_t>(displaced_row)] = old_position;
         if (old_position != pivot_col) ++result->pivot_swaps_;
+        if (panel_active) {
+            panel.set_position(pivot_row, pivot_col);
+            panel.set_position(displaced_row, old_position);
+        }
 
         auto& pivot_work_row = rows[static_cast<std::size_t>(pivot_row)];
-        const double pivot_value = work_row_value(pivot_work_row, pivot_col);
+        const bool member_pivot = panel_active && panel.is_member(pivot_row);
+        const double pivot_value = member_pivot
+            ? panel.value_of(pivot_row, pivot_col)
+            : work_row_value(pivot_work_row, pivot_col);
         if (pivot_value == 0.0 || !std::isfinite(pivot_value)) {
             throw std::runtime_error(
                 "factor is exactly singular at column " + std::to_string(pivot_col));
@@ -1446,8 +1455,10 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
         // panel's flush; its U row is built on demand or at that flush.
         const bool retained_pivot = pivot_work_row.dense_mode && panel_active;
         if (retained_pivot) {
-            panel.materialize_pivot(pivot_row, pivot_col, rows, result->u_rows_, kernels);
-            panel.record_dense_pivot(pivot_row, pivot_col, rows);
+            if (!member_pivot) {
+                throw std::logic_error("dense LU panel: a dense pivot is not a panel member");
+            }
+            panel.pivot_dense(pivot_row, pivot_col, rows, result->u_rows_, kernels);
         } else if (pivot_work_row.dense_mode) {
             // Columns at or beyond dense_end() are exact zeros.
             sparse_lu_panels::append_dense_u_row(pivot_work_row, pivot_col, pivot_output);
@@ -1455,15 +1466,18 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
             pivot_output = std::move(pivot_work_row.active);
         }
         const auto& pivot = result->u_rows_[static_cast<std::size_t>(pivot_col)];
+        if (panel_active && !retained_pivot) panel.pivot_sparse(pivot_col, pivot);
 
-        std::vector<index_t> targets;
-        targets.reserve(candidates.size());
+        // Inside a panel the candidate list holds sparse rows only; the dense
+        // targets are the block's candidates other than the pivot.
+        targets.clear();
         for (const index_t row_id : candidates) {
             if (row_id != pivot_row &&
                 position_of_row[static_cast<std::size_t>(row_id)] > pivot_col) {
                 targets.push_back(row_id);
             }
         }
+        const index_t block_targets = block_candidate.count - (member_pivot ? 1 : 0);
 
         const std::uint64_t pivot_work = pivot_work_row.dense_mode
             ? static_cast<std::uint64_t>(pivot_work_row.dense_end() - pivot_col)
@@ -1474,26 +1488,10 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
             result->largest_front_ = std::max<index_t>(
                 result->largest_front_, static_cast<index_t>(pivot.size()));
         }
-        result->row_updates_ += static_cast<index_t>(targets.size());
+        result->row_updates_ += static_cast<index_t>(targets.size()) + block_targets;
         if (panel_active) {
-            // Only sparse targets perform expensive whole-tail work per pivot.
-            // Cheap dense panel coefficients run serially without a team barrier.
-            std::size_t sparse_count = 0;
-            for (index_t row_id : targets) {
-                auto& row = rows[static_cast<std::size_t>(row_id)];
-                if (!row.dense_mode) {
-                    targets[sparse_count++] = row_id;
-                    continue;
-                }
-                const double multiplier = work_row_value(row, pivot_col) / pivot_value;
-                if (!std::isfinite(multiplier)) {
-                    throw std::runtime_error("non-finite multiplier generated during LU factorization");
-                }
-                update_dense_panel_row(row, pivot_work_row, pivot, pivot_col, panel.end(), n,
-                                       multiplier, kernels);
-                panel.note_dense_row(row_id);
-            }
-            targets.resize(sparse_count);
+            // Dense targets: one serial block elimination, no team barrier.
+            panel.eliminate(pivot_col, pivot_value, block_targets, kernels);
             // Sparse targets merge the complete U row; build it serially
             // before any worker reads it.
             if (retained_pivot && !targets.empty()) {
@@ -1501,14 +1499,12 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
             }
         }
         const bool run_parallel = result->factor_threads_ > 1 &&
-            targets.size() > 1 && (panel_active
-                ? static_cast<std::uint64_t>(targets.size()) * pivot_work : work)
-                    >= parallel_work_threshold;
+            targets.size() > 1 && work >= parallel_work_threshold;
         const int addition_slots = run_parallel ? result->factor_threads_ : 1;
-        std::vector<std::vector<Addition>> additions(
-            static_cast<std::size_t>(addition_slots));
-        std::vector<std::vector<index_t>> dense_conversions(
-            static_cast<std::size_t>(addition_slots));
+        for (int slot = 0; slot < addition_slots; ++slot) {
+            additions[static_cast<std::size_t>(slot)].clear();
+            dense_conversions[static_cast<std::size_t>(slot)].clear();
+        }
 
         auto update_target = [&](std::size_t target_index, int worker_id) {
             const index_t row_id = targets[target_index];
@@ -1549,14 +1545,15 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
             }
         }
 
-        for (const auto& local : additions) {
-            for (const Addition& addition : local) {
+        for (int slot = 0; slot < addition_slots; ++slot) {
+            for (const Addition& addition : additions[static_cast<std::size_t>(slot)]) {
                 active_columns[static_cast<std::size_t>(addition.col)].push_back(addition.row);
             }
         }
         // Worker slots depend on scheduling; sort so dense_rows does not.
         const auto conversions_begin = static_cast<std::ptrdiff_t>(dense_rows.size());
-        for (const auto& local : dense_conversions) {
+        for (int slot = 0; slot < addition_slots; ++slot) {
+            const auto& local = dense_conversions[static_cast<std::size_t>(slot)];
             dense_rows.insert(dense_rows.end(), local.begin(), local.end());
             converted_dense_rows += static_cast<index_t>(local.size());
             active_dense_rows += static_cast<index_t>(local.size());
@@ -1572,7 +1569,7 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
         }
         std::vector<index_t>().swap(active_columns[static_cast<std::size_t>(pivot_col)]);
         if (panel_active && pivot_col + 1 == panel.end()) {
-            panel.flush(rows, position_of_row, result->u_rows_, result->largest_front_,
+            panel.flush(rows, result->u_rows_, result->largest_front_,
                         kernels, executor, result->factor_threads_);
             for (index_t row_id : panel.conversions()) {
                 auto& row = rows[static_cast<std::size_t>(row_id)];

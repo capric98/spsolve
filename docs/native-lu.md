@@ -131,12 +131,33 @@ immediately. Dense rows keep every coefficient inside the current panel
 panel path (`DensePanel` in `src/sparse_lu_panels.hpp`) maintains these
 invariants:
 
+- **Panel block.** When a panel starts, after the pending dense rows that
+  begin before `last` are admitted, its members are the dense rows not yet
+  pivoted whose storage meets `[first, last)`. Their panel columns are
+  copied into one column-major `members x 32` block. Inside a panel every
+  dense candidate is a member: pending rows start at or after `last`,
+  conversions wait for the flush, and every other dense row is an exact zero
+  in the panel's columns, which only a candidate's update could change. The
+  block is then factored in place, dgetf2-style: per pivot column one
+  contiguous scan of the block column finds the members' candidates (each
+  nonzero of an unpivoted member, checked for finiteness), their largest
+  magnitude (ties to the smaller position), and their count for
+  `row_updates`; a member's position follows every row swap. Sparse rows
+  stay candidates through the column lists, and the two maxima merge by the
+  same rule (larger magnitude, then smaller position), so the pivot choice
+  and the preferred-row test are those of a single candidate list. After the
+  pivot step, the block column is divided by the pivot and tested for
+  finiteness as a whole, then every later block column with a nonzero pivot
+  row value `u` takes one `axpy_sub` with `u`. Members that are not
+  candidates have multiplier `+-0`, and a pivot's block row is cleared at
+  its pivot step, so no target list is needed. Each member records, as a
+  32-bit mask, the panel columns at which it was a candidate: those are its
+  L entries for the panel.
 - **Retained pivot rows.** While a panel is active, a dense row selected as
-  pivot keeps its dense storage until the panel's flush and is not modified
-  after its pivot step. Later eager in-panel updates read its coefficients in
-  place with one `axpy_sub` per dense target, over
-  `[pivot + 1, min(last, end of its storage))`; a sparse pivot supplies its U
-  entries as before.
+  pivot appends its panel L entries, writes its block row back to its
+  storage as its in-panel U values, and keeps that storage, unmodified, until
+  the panel's flush. A sparse pivot supplies its in-panel U entries from its
+  U row.
 - **Contiguous materialization.** Before a dense row becomes a pivot, its
   deferred tail is completed from its L multipliers in ascending pivot
   order: one `axpy_sub` over `[last, tail_end)` for each retained dense
@@ -144,60 +165,82 @@ invariants:
   over the U entries of a sparse source. U is therefore complete before it
   supplies any subsequent update, even when row swaps cross panel
   boundaries.
+- **Storage extents.** A member's storage grows exactly as in-place updates
+  would have grown it (to `min(last, end of that pivot's row)` for each
+  panel step at which it was a candidate), so storage ends, and the work
+  estimates derived from them, do not depend on the block. While a panel is
+  active, a member's storage inside the panel is stale; like every storage
+  column before a row's current pivot column, it is never read.
 - **Lazy U rows.** The U row (`Entry` vector) of a retained dense pivot is
-  built at the flush, or earlier, serially and before the workers start,
-  when a sparse row needs it as an update source. Sparse pivots publish
+  built once: serially, before the workers start, when a sparse row needs it
+  as an update source, otherwise during the flush. Sparse pivots publish
   their U rows at once, and dense pivots outside a panel build theirs at the
   pivot step. The flush finalizes the panel even when nothing is left to
   update (the last panel never has targets): it builds the remaining U rows
   and releases the retained storage.
-- **Segment packing.** The packed U support is the union of the panel
-  pivots' tails at or after `last`, as sorted disjoint column segments. A
-  dense pivot contributes `[last, tail_end)`, found by a backward scan of its
-  retained row, so the dense pivots together form one segment starting at
-  `last`; a sparse pivot contributes its tail columns. Gaps narrower than 16
-  columns are bridged with zero U columns. Dense pivots are copied into the
-  packed U rows segment by segment, sparse pivots scattered. Before packing,
-  every target is extended serially to the end of the union, so each segment
-  is contiguous in every target.
-- **Tiling.** Independent tiles of 16 target rows by at most 64 columns of
-  one segment call `gemm_sub_rows` in place on the targets' dense tails.
-  Every output starts from its current value and subtracts its `rank` terms
-  in ascending pivot order (`running`). Segments and tiles depend only on
-  column positions, never on the thread count. The flush uses the worker
-  team when more than one thread is requested, there are at least four
-  tiles, and the counted work is at least 262,144 flops.
-- **One rounding rule.** Every path that updates a dense entry (eager
-  in-panel updates, materialization, the flush, and dense-pivot updates
-  outside panels) computes `c = c - round(l*u)` with separate rounding, in
-  ascending pivot order, so two identical rows stay bitwise identical
-  whichever path their updates take; exact singular detection of a
-  duplicated row depends on it. Columns whose packed U values are all zero
-  (bridged gaps, zeros inside a dense tail) can change at most the sign of a
-  zero entry, which is never stored as a factor entry or accepted as a
-  candidate.
+- **Segment packing.** The packed U support covers the panel pivots'
+  nonzeros at or after `last`, as sorted disjoint column segments. The
+  retained dense pivots' tails `[last, tail_end)` are OR-ed into a column
+  mask (`tail_end` comes from a backward scan of the retained row), and the
+  mask's columns are merged with the sparse pivots' tail columns. Gaps
+  narrower than 16 columns are bridged with zero U columns, wider gaps start
+  a new segment, so a dense block plus a distant column packs two segments
+  rather than the whole range between them. Dense pivots are copied into the
+  packed U rows segment by segment, sparse pivots scattered; the targets'
+  packed L rows are the block's multiplier columns, transposed, with exact
+  zeros outside each target's candidate mask. Before packing, every target
+  is extended serially to the end of the union, so each segment is
+  contiguous in every target.
+- **Flush pass.** The flush targets are the members still unpivoted that were
+  candidates in the panel. One pass runs three kinds of independent items:
+  the U rows still to be built (each also releases its retained storage),
+  the targets' panel L entries (groups of 16 targets), and tiles of 16
+  target rows by at most 64 columns of one segment that call
+  `gemm_sub_rows` in place on the targets' dense tails. Every output starts
+  from its current value and subtracts its `rank` terms in ascending pivot
+  order (`running`). Each item writes only its own rows, so segments, items
+  and results depend only on column positions, never on the thread count.
+  The pass uses the worker team when more than one thread is requested,
+  there are at least four tiles, and the counted tile work is at least
+  262,144 flops.
+- **One rounding rule.** Every path that updates a dense entry (block
+  updates, materialization, the flush, and dense-row updates outside
+  panels) computes `c = c - round(l*u)` with separate rounding, in ascending
+  pivot order, so two identical rows stay bitwise identical whichever path
+  their updates take; exact singular detection of a duplicated row depends
+  on it. A block entry receives exactly the operations that in-place updates
+  of its row would apply: multiplier `value / pivot` (division), then one
+  term per later pivot with the pivot row's current value. Terms with a zero
+  multiplier or a zero U value, and packed columns whose U values are all
+  zero (bridged gaps), can change at most the sign of a zero entry, which is
+  never stored as a factor entry or accepted as a candidate.
 
-Finiteness is checked for every candidate value and pivot, every L
-multiplier, every value a sparse row update writes, every kernel call
-(`axpy_sub` and the flush GEMM report whether any element they wrote is
-non-finite, and a false flag raises the usual error), and every U row built
-from dense storage. The scalar U-entry walks of sparse sources during
-materialization and of sparse pivots during eager panel updates are not
+Finiteness is checked for every candidate value (in the block scan for
+members) and pivot, every L multiplier (one test per block column), every
+value a sparse row update writes, every kernel call (`axpy_sub` and the flush
+GEMM report whether any element they wrote is non-finite, and a false flag
+raises the usual error), and every U row built from dense storage. Only the
+scalar U-entry walks of sparse sources during materialization are not
 checked per element. The checks are complete: suppose elimination stores a
-non-finite value in column `c` of row `r`, which is later pivoted at position
-`pos(r)`. If `c >= pos(r)`, the value belongs to `r`'s U row, which is
-checked when it is built, before any factor is published. If `c < pos(r)`,
-the value is still present at step `c`: non-finite operands never produce
-finite results, columns at or before the current pivot are only written to
-clear an already checked coefficient, and deferred updates to column `c` are
-applied before step `c` (a flush precedes the next panel, and a panel keeps
-its own columns current). A non-finite value is nonzero, so `r` is a
-candidate at step `c` and the candidate check rejects it. Every row is
-pivoted, so no value escapes both checks. Detection can come later than the
-arithmetic step that produced the value; if an exactly singular column is
-reached in between, the singular error is reported instead. In either case
-no factor is published. Input values are validated separately when
-`check_finite` is set.
+non-finite value in column `c` of row `r` (in its storage, or in its block
+row while `c` is inside the active panel), and `r` is later pivoted at
+position `pos(r)`. If `c >= pos(r)`, the value belongs to `r`'s U row (a
+pivot's block row is written back to its storage), which is checked when it
+is built, before any factor is published. If `c < pos(r)`, the value is
+still present at step `c`: non-finite operands never produce finite results,
+columns at or before the current pivot are only written to clear an already
+checked coefficient or replace it by its checked multiplier, and deferred updates
+to column `c` are applied before step `c` (a flush precedes the next panel,
+and the block keeps the panel's columns current and is scanned directly). A
+non-finite value is nonzero, so `r` is a candidate at step `c` and the
+candidate check rejects it. Every row is pivoted, so no value escapes both
+checks. Detection can come later than the arithmetic step that produced the
+value; if an exactly singular column is reached in between, the singular
+error is reported instead. Because a block elimination tests all multipliers
+of a step before any update, a step may raise "non-finite multiplier" where
+updating row by row raised "non-finite value" for an earlier target. In
+either case no factor is published. Input values are validated separately
+when `check_finite` is set.
 
 Sparse-to-dense conversions occur only after the flush, so conversion
 neither omits nor duplicates an update. After activation, short trailing
@@ -212,9 +255,9 @@ Both blocked paths call one kernel table, `dense_kernels::Kernels`
 (`src/dense_kernels.hpp`): `gemm_sub` (`C -= A @ B`), `gemm_sub_rows` (the
 same with per-row output pointers), `gemm_sub_lower` (writes only entries with
 `i + shift >= j`), and `axpy_sub` (`y -= alpha * x`, one `running` term per
-element; the row-hybrid LU uses it for every update whose source is a dense
-pivot row: eager in-panel updates, pivot-tail materialization, and
-dense-row updates outside panels). The GEMM entry points take an
+element; the row-hybrid LU uses it for the panel block's column updates,
+for pivot-tail materialization from retained dense pivots, and for dense-row
+updates from dense pivots outside panels). The GEMM entry points take an
 accumulation order:
 
 - `running`: the output starts from its current value and subtracts each
@@ -222,7 +265,7 @@ accumulation order:
 - `sum_then_subtract`: the terms are summed from zero in ascending `k`, and
   the sum is subtracted from the output once, `c = c - (a0*b0 + a1*b1 + ...)`.
 
-The LU flush uses `running`. It is the recurrence of the eager in-panel
+The LU flush uses `running`. It is the recurrence of the panel block's
 updates and of pivot-tail materialization, so a dense row's entries receive
 the same arithmetic whichever of those paths applies a term, and the flush
 stays bitwise identical to its previous implementation. The supernodal LDL^T
@@ -270,10 +313,11 @@ term either from the flush or, when the row becomes a pivot first, from
 pivot-tail materialization (`DensePanel::materialize_pivot`), and both must
 round identically. With a fused flush, a dense row duplicated from a pivot
 row kept a residue near 1e-18 instead of cancelling to zero, and the exactly
-singular matrix factored instead of raising. Materialization and eager
-updates from dense pivot rows call `axpy_sub`, but terms from sparse pivot
-rows are applied by scalar U-entry walks, so fusing `running` would require
-those walks to round the same way as every kernel.
+singular matrix factored instead of raising. The panel block and
+materialization from dense pivot rows call `axpy_sub`, but some terms from
+sparse pivot rows (pivot-tail materialization and dense-row updates outside
+panels) are applied by scalar U-entry walks, so fusing `running` would
+require those walks to round the same way as every kernel.
 
 Every kernel reports whether any element it wrote is non-finite. The SIMD
 kernels fold `x - x` of every stored register into one witness per microtile
@@ -322,9 +366,10 @@ translation unit, also stated in its header comment:
 The whole module is built without floating-point contraction
 (`-ffp-contract=off` target-wide on GCC/Clang; MSVC does not contract under
 its default `/fp:precise`), so every scalar and vector path, including the
-eager row updates and pivot-tail materialization in `sparse_lu.cpp` and
-`sparse_lu_panels.hpp`, rounds `a*b` and the following subtraction
-separately, even with `SP_ARCH_NATIVE` on an FMA host. The exact cancellation
+scalar walks (sparse-row updates and dense-row updates from sparse pivots
+outside panels in `sparse_lu.cpp`, and pivot-tail materialization from
+sparse sources in `sparse_lu_panels.hpp`), rounds `a*b` and the following
+subtraction separately, even with `SP_ARCH_NATIVE` on an FMA host. The exact cancellation
 of duplicated rows described above depends on it.
 
 Disassembling a Windows release module (`dumpbin /disasm` with a linker map)
@@ -346,16 +391,17 @@ meaningful parallel work.
 `lu_parallel_panels` counts flushes that used the worker team; the latter is
 included in `parallel_steps`. `lu_panel_columns` is the maximum packed U-tail
 support size: the total width of a flush's column segments, including
-bridged gap columns and zero columns inside dense pivots' tails (see "Dense
-LU panels"). `lu_dense_update_flops` counts two operations per packed
-multiply/subtract term, including zeros in packed operands (bridged and zero
-columns as well); eager panel coefficients and pivot-tail materialization
-are excluded. `lu_panel_workspace_bytes` estimates peak panel-owned vector
-capacities, including discovery marks, row lists, per-pivot panel state,
-segment and tile lists, and packed L/U operands. It excludes retained
-factors, row-engine sparse/dense storage (including pivot rows retained
-until a flush), and worker runtime storage, and must not be interpreted as
-total row-engine peak memory.
+bridged gap columns (see "Dense LU panels"). `lu_dense_update_flops` counts
+two operations per packed multiply/subtract term, including zeros in packed
+operands (bridged columns and zeros inside segments as well); the panel
+block's own updates and pivot-tail materialization are excluded.
+`lu_panel_workspace_bytes` estimates peak panel-owned vector capacities,
+including membership and discovery marks, member and row lists, the panel
+block, per-pivot panel state, the segment column mask, segment and tile
+lists, and packed L/U operands. It excludes retained factors, row-engine
+sparse/dense storage (including pivot rows retained until a flush), and
+worker runtime storage, and must not be interpreted as total row-engine peak
+memory.
 The SPD-specific `parallel_panels`, `dense_update_flops`, and `spd_*` fields
 retain their existing meaning. `dense_kernel` names the dense tile kernel the
 factorization snapshotted (`avx2-fma`, `sse2`, or `scalar`; see "Dense
@@ -421,20 +467,24 @@ when their backward residual is small.
 - native matrix values are `float64` only;
 - no complex native factors yet (the SciPy backend handles them);
 - ordering and pivot selection are single-threaded;
-- general LU retains serial pivot selection, eager in-panel updates, and
-  pivot-tail materialization, each touching separately allocated dense rows;
-  dense-row panels still retain each dense row's span-wide tail in the row
-  engine, and a dense pivot's packed U range runs from the panel end to its
-  last nonzero, interior zero runs included;
+- general LU retains serial per-pivot panel work: the block column scan, the
+  right-looking block update (one `axpy_sub` per later panel column; a
+  recursively blocked panel would touch the block less often), and
+  pivot-tail materialization (one `axpy_sub` per earlier panel pivot);
+  dense rows still keep span-wide tails in separately allocated storage,
+  and on the dense benchmark cases the flush pass runs only about 2x faster
+  with eight threads than with one;
+- a dense row converted at setup stays listed in the sparse column lists,
+  which the candidate scan of a panel still walks and skips;
 - dense-row classification measures density over a row's whole remaining
   span, so a row that is dense in a prefix but has one far column (for
   example, a bordered system ordered border-last) has a wide span: it stays
   sparse, or its dense tail covers that whole span;
 - the `avx2-fma` kernel does not fuse the LU flush (`running` order): the
-  scalar U-entry walks of sparse pivot rows (eager panel updates and
-  pivot-tail materialization) apply the same terms outside the kernel table
-  and must round identically, so dense LU gains only from the wider vectors
-  (see "Dense kernels");
+  scalar U-entry walks of sparse pivot rows (pivot-tail materialization and
+  dense-row updates outside panels) apply the same terms outside the kernel
+  table and must round identically, so dense LU gains only from the wider
+  vectors (see "Dense kernels");
 - there is no out-of-core mode or symbolic-factor reuse across matrices with
   the same pattern.
 

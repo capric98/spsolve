@@ -232,6 +232,23 @@ threads (numeric phase 10.0 to 6.3 ms), irregular and pivot-heavy by about
 20% at one thread, and the four-, five-, and eight-block dense cases by about
 20%. The tables above remain historical.
 
+The panel block that followed (column-major `members x 32` block factored
+in place, gappy dense tails split into column segments, and the flush's L
+and U row assembly run as work items of its parallel pass; see
+[the design notes](native-lu.md#dense-lu-panels)) again kept the factors
+bitwise identical. Interleaved runs against the previous build on the same
+machine (`avx2-fma`, medians of five rounds) measured connected dense LU of
+size 600 (`MMD_AT_PLUS_A`) at 15.4 ms instead of 16.6 ms with one thread
+(numeric phase 7.8 to 6.5 ms) and 14.0 ms instead of 15.5 ms with eight
+(numeric 6.7 to 4.6 ms); five 600-wide blocks at 67.6 instead of 78.6 ms
+with eight threads; irregular (n=2,500) and pivot-heavy (n=2,000) with
+`MMD_AT_PLUS_A` 27% and 23% faster with eight threads, and 11-14% with
+one. A dense 400-wide block whose rows also share a column 800 columns to
+its right (NATURAL) packs 369 instead of 1,169 columns per flush and runs
+29% faster with one thread. In the full benchmark, `sparse-dense-border`
+packs at most 611 (`MMD_AT_PLUS_A`) and 1,913 (`COLAMD`) columns per flush,
+down from 643 and 2,327.
+
 ### Blocked SPD comparison
 
 Two sequential Windows x64 release comparisons used five batched samples per

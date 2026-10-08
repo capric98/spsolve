@@ -160,12 +160,14 @@ else()
     target_compile_options(_spsolve PRIVATE -march=native)
   endif()
   # The whole module is built without floating-point contraction, so every
-  # scalar and vector path (the dense kernels, the eager row updates and
-  # pivot-tail materialization in sparse_lu.cpp and sparse_lu_panels.hpp)
-  # rounds a*b and the following subtraction separately. Exact singular
-  # detection relies on those paths rounding identically; GCC's C++ default
-  # -ffp-contract=fast would fuse them under -march=native or -mfma. MSVC
-  # does not contract under its default /fp:precise.
+  # scalar and vector path (the dense kernels and the scalar walks: sparse-row
+  # updates and dense-row updates from sparse pivots outside panels in
+  # sparse_lu.cpp, sparse-source pivot-tail materialization in
+  # sparse_lu_panels.hpp) rounds a*b and the following subtraction
+  # separately. Exact singular detection relies on those paths rounding
+  # identically; GCC's C++ default -ffp-contract=fast would fuse them under
+  # -march=native or -mfma. MSVC does not contract under its default
+  # /fp:precise.
   target_compile_options(_spsolve PRIVATE -ffp-contract=off)
 endif()
 

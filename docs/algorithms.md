@@ -163,8 +163,15 @@ blocks in one system) on the dense path.
 Dense rows are updated in panels of $w = 32$ pivot columns. Let $P$ be the
 panel's column range, $T$ the columns after the panel and $R$ the dense rows
 still active at the panel's end. Within the panel every coefficient in
-columns of $P$ is kept current (eager rank-1 updates, needed for pivot
-search), while the updates to columns in $T$ are deferred and applied once as
+columns of $P$ is kept current, because pivot search needs it: the dense
+rows' entries in $P$ are copied into a column-major block $B_{R,P}$, which
+is factored like an unblocked dense LU (LAPACK's `dgetf2`). At step $k$ the
+block column is scanned for the candidates, divided by the pivot to give
+$l_{rk}$, and each later block column $j$ with $u_{kj} \ne 0$ receives the
+rank-1 update $b_{rj} \leftarrow b_{rj} - l_{rk} u_{kj}$ over all rows at
+once. Rows that are not candidates have $l_{rk} = 0$, and the pivot row's
+block row is cleared at its step, so no target list is needed. The updates
+to columns in $T$ are deferred and applied once as
 
 $$\tilde A_{R,T} \leftarrow \tilde A_{R,T} - L_{R,P}\, U_{P,T},$$
 
@@ -176,10 +183,11 @@ tail must be complete first, so it is materialized explicitly:
 $$u_{kj} = \tilde a_{pj} - \sum_{k' \in P,\ k' < k} l_{p k'}\, u_{k' j}, \qquad j \in T,$$
 
 summing in ascending $k'$. The flush packs the columns of $T$ in which some
-$u_{kj} \ne 0$ as contiguous column segments, which may also contain columns
-where every $u_{kj}$ is zero (bridged gaps of fewer than 16 columns, and
-zeros inside a dense pivot row's packed range); such a column changes at
-most the sign of a zero entry. The flush is tiled over disjoint blocks of 16
+$u_{kj} \ne 0$ as contiguous column segments: the nonzero columns of the
+dense pivot rows (a column mask) merged with the sparse pivot rows' columns,
+with gaps of fewer than 16 columns bridged and wider gaps splitting
+segments. A bridged column, where every $u_{kj}$ is zero, changes at most
+the sign of a zero entry. The flush is tiled over disjoint blocks of 16
 rows by at most 64 columns of one segment; tiles may run on different
 threads because they write disjoint entries and each entry subtracts its $w$
 terms in ascending pivot order.
@@ -383,10 +391,10 @@ one while both are tiny. No condition estimate is computed.
   The blocked LU flush updates every output from its current value,
   $c \leftarrow (\cdots((c - a_0 b_0) - a_1 b_1) \cdots) - a_{k-1} b_{k-1}$,
   each term a rounded product and a rounded subtraction in every kernel: this
-  is the recurrence of its eager rank-1 updates and of pivot-tail
+  is the recurrence of the panel block's rank-1 updates and of pivot-tail
   materialization, which apply the same terms through `axpy_sub` or, for
-  sparse pivot rows, in scalar code, so a duplicated row still cancels
-  exactly. The supernodal $LDL^T$ rank-$k$
+  sparse pivot rows during materialization, in scalar code, so a duplicated
+  row still cancels exactly. The supernodal $LDL^T$ rank-$k$
   update forms $s = (\cdots((0 + a_0 b_0) + a_1 b_1) \cdots) + a_{k-1}
   b_{k-1}$ and then $c \leftarrow c - s$: when $|c|$ is much larger than the
   terms, as on a dominant diagonal, the running form would round at the scale
@@ -402,8 +410,9 @@ one while both are tiny. No condition estimate is computed.
 - Non-finite values cannot be produced by finite input without overflow or a
   zero pivot. The engines check the pivot column maximum and pivot, the
   multipliers, and every updated entry (or, where documented, every pivot
-  candidate and every retained row once; the row-hybrid panel path gives the
-  completeness argument in `docs/native-lu.md`), and abort with a non-finite
+  candidate, every multiplier column and every retained row once; the
+  row-hybrid panel path gives the completeness argument in
+  `docs/native-lu.md`), and abort with a non-finite
   error, or a singular error if an exactly singular column is reached before
   a deferred check, before any factor is published. Pivot growth is bounded
   only by the usual $2^{n-1}$ worst case of partial pivoting; refinement, not
@@ -444,5 +453,8 @@ one while both are tiny. No condition estimate is computed.
   elimination," Math. Comp. 35 (1980).
 - N. J. Higham, *Accuracy and Stability of Numerical Algorithms*, 2nd ed.,
   SIAM (2002), chapters 9 and 12.
+- G. H. Golub and C. F. Van Loan, *Matrix Computations*, 4th ed., Johns
+  Hopkins (2013), section 3.2 (unblocked and blocked LU; the panel block
+  follows the unblocked right-looking form, as in LAPACK's `dgetf2`).
 - T. A. Davis, *Direct Methods for Sparse Linear Systems*, SIAM (2006),
   chapters 4 to 7.

@@ -33,12 +33,13 @@ namespace dense_kernels {
 //   sum_then_subtract:  s = (...((0 + a0*b0) + a1*b1) ...) + a(k-1)*b(k-1);
 //                       c = c - s
 //
-// The row-hybrid LU flush uses running: it is the recurrence of its eager
-// rank-1 updates and of pivot-tail materialization, so a dense row receives
-// the same arithmetic whichever way its tail is updated. The supernodal LDL.T
-// update uses sum_then_subtract: its targets are often much larger than the
-// individual terms (a dominant diagonal), and summing the terms first rounds
-// at their scale, with a single rounding at the target's scale.
+// The row-hybrid LU flush uses running: it is the recurrence of the panel
+// block's rank-1 updates and of pivot-tail materialization, so a dense row
+// receives the same arithmetic whichever way its tail is updated. The
+// supernodal LDL.T update uses sum_then_subtract: its targets are often much
+// larger than the individual terms (a dominant diagonal), and summing the
+// terms first rounds at their scale, with a single rounding at the target's
+// scale.
 //
 // In either order an element's result depends only on its own operands,
 // never on its position in a tile, the tile shape, the call path, or the
