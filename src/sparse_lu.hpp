@@ -62,6 +62,7 @@ public:
     std::string ordering_ = "NATURAL";
     std::string ordering_backend_ = "builtin";
     std::string numeric_engine_ = "row-hybrid";
+    std::string dense_kernel_;
     double ordering_seconds_ = 0.0;
     double factor_seconds_ = 0.0;
     double symbolic_seconds_ = 0.0;

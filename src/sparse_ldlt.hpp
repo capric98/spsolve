@@ -8,9 +8,7 @@
 #include <stdexcept>
 #include <vector>
 
-#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
-#include <emmintrin.h>
-#endif
+#include "dense_kernels.hpp"
 
 // Internal, portable supernodal LDL.T kernels. The caller supplies an exact
 // filled pattern and publishes the CSC factors only after all pivots succeed.
@@ -117,14 +115,21 @@ struct NumericInfo {
 struct NonPositiveDefinite {};
 
 // Pack only the exact intersection with a prior fundamental supernode.
-// Output tiles are disjoint, and every entry visits packed sources in order.
+// Output tiles are disjoint, and every entry visits packed sources in order:
+// the kernel sums the left * right terms from zero in ascending source order
+// and subtracts that sum from the entry once (Accumulate::sum_then_subtract).
+// Terms are often far smaller than the dominant diagonal they update, so
+// summing first avoids rounding at the entry's scale once per term. The
+// kernel's finiteness flag is authoritative on every tile path, and no path
+// scatters an entry the kernel was not asked to compute.
 template <typename Executor>
 void rank_update(
     std::vector<double>& front, index_t columns,
     const std::vector<index_t>& output_rows,
     const std::vector<index_t>& output_columns,
     const std::vector<double>& left, const std::vector<double>& right,
-    index_t rank, Executor& executor, int threads, NumericInfo& info
+    index_t rank, const dense_kernels::Kernels& kernels,
+    Executor& executor, int threads, NumericInfo& info
 ) {
     constexpr index_t tile_size = 16;
     const index_t rows = static_cast<index_t>(output_rows.size());
@@ -139,6 +144,8 @@ void rank_update(
     }
     const auto flops = entries * static_cast<std::uint64_t>(2 * rank);
     info.update_flops += flops;
+    // Only entries with row >= col are updated. Output rows and columns are
+    // ascending front positions; the path depends only on those positions.
     auto update_tile = [&](std::size_t tile, int) {
         const index_t row_first = static_cast<index_t>(tile /
             static_cast<std::size_t>(col_tiles)) * tile_size;
@@ -146,88 +153,68 @@ void rank_update(
             static_cast<std::size_t>(col_tiles)) * tile_size;
         const index_t row_last = std::min(rows, row_first + tile_size);
         const index_t col_last = std::min(cols, col_first + tile_size);
-        if (output_rows[static_cast<std::size_t>(row_last - 1)] <
-            output_columns[static_cast<std::size_t>(col_first)]) return;
-        index_t i = row_first;
-        if (output_rows[static_cast<std::size_t>(row_first)] >=
-            output_columns[static_cast<std::size_t>(col_last - 1)]) {
-            for (; i + 4 <= row_last; i += 4) {
-                index_t j = col_first;
-                for (; j + 4 <= col_last; j += 4) {
-                    double sums[4][4]{};
-#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
-                    __m128d s00 = _mm_setzero_pd(), s02 = s00;
-                    __m128d s10 = s00, s12 = s00, s20 = s00, s22 = s00, s30 = s00, s32 = s00;
-                    for (index_t k = 0; k < rank; ++k) {
-                        const double* packed = right.data() + k * cols + j;
-                        const __m128d r0 = _mm_loadu_pd(packed);
-                        const __m128d r2 = _mm_loadu_pd(packed + 2);
-                        const __m128d l0 = _mm_set1_pd(left[static_cast<std::size_t>(i * panel_width + k)]);
-                        const __m128d l1 = _mm_set1_pd(left[static_cast<std::size_t>((i + 1) * panel_width + k)]);
-                        const __m128d l2 = _mm_set1_pd(left[static_cast<std::size_t>((i + 2) * panel_width + k)]);
-                        const __m128d l3 = _mm_set1_pd(left[static_cast<std::size_t>((i + 3) * panel_width + k)]);
-                        s00 = _mm_add_pd(s00, _mm_mul_pd(l0, r0));
-                        s02 = _mm_add_pd(s02, _mm_mul_pd(l0, r2));
-                        s10 = _mm_add_pd(s10, _mm_mul_pd(l1, r0));
-                        s12 = _mm_add_pd(s12, _mm_mul_pd(l1, r2));
-                        s20 = _mm_add_pd(s20, _mm_mul_pd(l2, r0));
-                        s22 = _mm_add_pd(s22, _mm_mul_pd(l2, r2));
-                        s30 = _mm_add_pd(s30, _mm_mul_pd(l3, r0));
-                        s32 = _mm_add_pd(s32, _mm_mul_pd(l3, r2));
-                    }
-                    _mm_storeu_pd(sums[0], s00); _mm_storeu_pd(sums[0] + 2, s02);
-                    _mm_storeu_pd(sums[1], s10); _mm_storeu_pd(sums[1] + 2, s12);
-                    _mm_storeu_pd(sums[2], s20); _mm_storeu_pd(sums[2] + 2, s22);
-                    _mm_storeu_pd(sums[3], s30); _mm_storeu_pd(sums[3] + 2, s32);
-#else
-                    for (index_t k = 0; k < rank; ++k) {
-                        for (index_t a = 0; a < 4; ++a) {
-                            const double value = left[static_cast<std::size_t>((i + a) * panel_width + k)];
-                            for (index_t b = 0; b < 4; ++b) {
-                                sums[a][b] += value * right[static_cast<std::size_t>(k * cols + j + b)];
-                            }
-                        }
-                    }
-#endif
-                    for (index_t a = 0; a < 4; ++a) {
-                        for (index_t b = 0; b < 4; ++b) {
-                            double& value = front[static_cast<std::size_t>(
-                                output_rows[static_cast<std::size_t>(i + a)] * columns +
-                                output_columns[static_cast<std::size_t>(j + b)])];
-                            value -= sums[a][b];
-                            if (!std::isfinite(value)) throw NonPositiveDefinite{};
-                        }
-                    }
-                }
-                for (; j < col_last; ++j) {
-                    for (index_t a = 0; a < 4; ++a) {
-                        double sum = 0.0;
-                        for (index_t k = 0; k < rank; ++k) {
-                            sum += left[static_cast<std::size_t>((i + a) * panel_width + k)] *
-                                right[static_cast<std::size_t>(k * cols + j)];
-                        }
-                        double& value = front[static_cast<std::size_t>(
-                            output_rows[static_cast<std::size_t>(i + a)] * columns +
-                            output_columns[static_cast<std::size_t>(j)])];
-                        value -= sum;
-                        if (!std::isfinite(value)) throw NonPositiveDefinite{};
-                    }
-                }
+        const index_t top = output_rows[static_cast<std::size_t>(row_first)];
+        const index_t bottom = output_rows[static_cast<std::size_t>(row_last - 1)];
+        const index_t leftmost = output_columns[static_cast<std::size_t>(col_first)];
+        const index_t rightmost = output_columns[static_cast<std::size_t>(col_last - 1)];
+        if (bottom < leftmost) return;  // Entirely above the diagonal.
+        const auto tile_rows = static_cast<std::size_t>(row_last - row_first);
+        const auto tile_cols = static_cast<std::size_t>(col_last - col_first);
+        const bool below = top >= rightmost;  // Every entry has row >= col.
+        const double* a = left.data() + static_cast<std::size_t>(row_first * panel_width);
+        const double* b = right.data() + static_cast<std::size_t>(col_first);
+        const auto lda = static_cast<std::size_t>(panel_width);
+        const auto ldb = static_cast<std::size_t>(cols);
+        constexpr auto order = dense_kernels::Accumulate::sum_then_subtract;
+        // The kernel flag is authoritative on every path. A kernel may stop
+        // at its first non-finite block, leaving later entries uncomputed, so
+        // a false flag rejects the SPD attempt before anything is scattered.
+        if (bottom - top == row_last - 1 - row_first &&
+            rightmost - leftmost == col_last - 1 - col_first) {
+            // A contiguous block of the front: update it in place.
+            double* c = front.data() + static_cast<std::size_t>(top * columns + leftmost);
+            const auto ldc = static_cast<std::size_t>(columns);
+            const bool finite = below
+                ? kernels.gemm_sub(c, ldc, a, lda, b, ldb, tile_rows, tile_cols,
+                      static_cast<std::size_t>(rank), order)
+                : kernels.gemm_sub_lower(c, ldc, a, lda, b, ldb, tile_rows, tile_cols,
+                      static_cast<std::size_t>(rank), static_cast<std::ptrdiff_t>(top - leftmost),
+                      order);
+            if (!finite) throw NonPositiveDefinite{};
+            return;
+        }
+        // Irregular intersection: gather into a scratch block, update it, and
+        // scatter back exactly the entries the kernel computed. Output columns
+        // are the node's own positions among the ascending output rows, which
+        // come first, so output_columns is a prefix of output_rows and
+        // output_columns[q] == output_rows[q]. Tiles start at multiples of 16,
+        // so a tile that is neither skipped above nor entirely below the
+        // diagonal has row_first == col_first: its local entry (i, j) is on
+        // or below the diagonal exactly when j <= i, which is what
+        // gemm_sub_lower with shift 0 computes.
+        constexpr auto stride = static_cast<std::size_t>(tile_size);
+        double values[stride * stride];
+        const auto row_columns = [&](std::size_t i) {
+            return below ? tile_cols : std::min(i + 1, tile_cols);
+        };
+        for (std::size_t i = 0; i < tile_rows; ++i) {
+            const index_t row = output_rows[static_cast<std::size_t>(row_first) + i];
+            for (std::size_t j = 0; j < row_columns(i); ++j) {
+                values[i * stride + j] = front[static_cast<std::size_t>(row * columns +
+                    output_columns[static_cast<std::size_t>(col_first) + j])];
             }
         }
-        for (; i < row_last; ++i) {
-            for (index_t j = col_first; j < col_last; ++j) {
-                const index_t row = output_rows[static_cast<std::size_t>(i)];
-                const index_t col = output_columns[static_cast<std::size_t>(j)];
-                if (row < col) break;
-                double sum = 0.0;
-                for (index_t k = 0; k < rank; ++k) {
-                    sum += left[static_cast<std::size_t>(i * panel_width + k)] *
-                        right[static_cast<std::size_t>(k * cols + j)];
-                }
-                double& value = front[static_cast<std::size_t>(row * columns + col)];
-                value -= sum;
-                if (!std::isfinite(value)) throw NonPositiveDefinite{};
+        const bool finite = below
+            ? kernels.gemm_sub(values, stride, a, lda, b, ldb, tile_rows, tile_cols,
+                  static_cast<std::size_t>(rank), order)
+            : kernels.gemm_sub_lower(values, stride, a, lda, b, ldb, tile_rows, tile_cols,
+                  static_cast<std::size_t>(rank), 0, order);
+        if (!finite) throw NonPositiveDefinite{};
+        for (std::size_t i = 0; i < tile_rows; ++i) {
+            const index_t row = output_rows[static_cast<std::size_t>(row_first) + i];
+            for (std::size_t j = 0; j < row_columns(i); ++j) {
+                front[static_cast<std::size_t>(row * columns +
+                    output_columns[static_cast<std::size_t>(col_first) + j])] = values[i * stride + j];
             }
         }
     };
@@ -247,8 +234,8 @@ bool factorize(
     const std::vector<double>& scale,
     const std::vector<index_t>& col_ptr, const std::vector<index_t>& rows,
     const Pattern& pattern, std::vector<double>& values,
-    std::vector<double>& diagonal, Executor& executor, int threads,
-    NumericInfo& info, std::uint64_t base_workspace
+    std::vector<double>& diagonal, const dense_kernels::Kernels& kernels,
+    Executor& executor, int threads, NumericInfo& info, std::uint64_t base_workspace
 ) {
     const index_t n = static_cast<index_t>(permutation.size());
     std::vector<index_t> row_position(static_cast<std::size_t>(n), -1);
@@ -380,7 +367,7 @@ bool factorize(
                     info.pack_seconds += std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - pack_start).count();
                     rank_update(front, width, output_rows, output_columns, left, right, rank,
-                        executor, threads, info);
+                        kernels, executor, threads, info);
                 }
             }
             info.source_seconds += std::chrono::duration<double>(
@@ -443,7 +430,7 @@ bool factorize(
                     info.pack_seconds += std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - pack_start).count();
                     rank_update(front, width, output_rows, output_columns, left, right, end - begin,
-                        executor, threads, info);
+                        kernels, executor, threads, info);
                 }
             }
             info.panel_seconds += std::chrono::duration<double>(

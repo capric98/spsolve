@@ -74,6 +74,8 @@ nanobind_add_module(
   NB_STATIC
   src/spsolve.cpp
   src/sparse_lu.cpp
+  src/dense_kernels.cpp
+  src/dense_kernels.hpp
   src/sparse_lu.hpp
   src/sparse_ldlt.hpp
   src/sparse_lu_panels.hpp
@@ -85,6 +87,8 @@ nanobind_add_module(
 target_include_directories(_spsolve PRIVATE src)
 target_include_directories(_spsolve PRIVATE "${ORDERING_DIR}")
 target_link_libraries(_spsolve PRIVATE Threads::Threads spsolve_ordering)
+# No AVX2 kernel translation unit is compiled yet; dispatch lists sse2/scalar.
+target_compile_definitions(_spsolve PRIVATE SPSOLVE_HAVE_AVX2_KERNELS=0)
 
 if(MSVC)
   target_compile_options(_spsolve PRIVATE /O2 /EHsc)
@@ -96,6 +100,9 @@ else()
   if(SP_ARCH_NATIVE)
     target_compile_options(_spsolve PRIVATE -march=native)
   endif()
+  # The baseline kernels promise a separate multiply and add/subtract per
+  # term; keep -march=native from fusing them into FMA.
+  set_source_files_properties(src/dense_kernels.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 endif()
 
 if(OpenMP_CXX_FOUND)

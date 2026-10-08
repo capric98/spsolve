@@ -7,9 +7,7 @@
 #include <stdexcept>
 #include <vector>
 
-#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
-#include <emmintrin.h>
-#endif
+#include "dense_kernels.hpp"
 
 namespace sparse_lu_panels {
 
@@ -97,7 +95,8 @@ public:
 
     template <typename Row, typename Sources, typename Executor>
     void flush(std::vector<Row>& rows, const std::vector<index_t>& positions,
-               const Sources& sources, Executor& executor, int threads) {
+               const Sources& sources, const dense_kernels::Kernels& kernels,
+               Executor& executor, int threads) {
         targets_.clear();
         for (index_t row : pending_) {
             if (positions[static_cast<std::size_t>(row)] >= last_ &&
@@ -168,68 +167,59 @@ public:
         const auto row_tiles = (targets_.size() + tile_rows - 1) / tile_rows;
         const auto col_tiles = (cols + tile_columns - 1) / tile_columns;
         const auto tiles = checked_product(row_tiles, col_tiles);
+        // Each output starts from its current value and subtracts its rank
+        // terms in pivot order inside the kernel (Accumulate::running, the
+        // recurrence of the eager and materialized updates). The in-place and
+        // gathered paths therefore produce identical bits, and the path
+        // depends only on this tile's column positions, never on the thread
+        // count.
         auto update_tile = [&](std::size_t tile, int) {
             const auto first_row = (tile / col_tiles) * tile_rows;
             const auto first_col = (tile % col_tiles) * tile_columns;
-            const auto end_row = std::min(targets_.size(), first_row + tile_rows);
-            const auto end_col = std::min(cols, first_col + tile_columns);
-            std::size_t i = first_row;
-            for (; i + 4 <= end_row; i += 4) {
-                std::size_t j = first_col;
-                for (; j + 4 <= end_col; j += 4) {
-                    double values[4][4];
-                    for (std::size_t a = 0; a < 4; ++a) {
-                        const auto& row = rows[static_cast<std::size_t>(targets_[i + a])];
-                        for (std::size_t b = 0; b < 4; ++b) {
-                            values[a][b] = row.dense[static_cast<std::size_t>(columns_[j + b] - row.dense_offset)];
-                        }
-                    }
-#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
-                    __m128d s00 = _mm_loadu_pd(values[0]), s02 = _mm_loadu_pd(values[0] + 2);
-                    __m128d s10 = _mm_loadu_pd(values[1]), s12 = _mm_loadu_pd(values[1] + 2);
-                    __m128d s20 = _mm_loadu_pd(values[2]), s22 = _mm_loadu_pd(values[2] + 2);
-                    __m128d s30 = _mm_loadu_pd(values[3]), s32 = _mm_loadu_pd(values[3] + 2);
-                    for (std::size_t k = 0; k < rank; ++k) {
-                        const __m128d u0 = _mm_loadu_pd(packed_u_.data() + k * cols + j);
-                        const __m128d u2 = _mm_loadu_pd(packed_u_.data() + k * cols + j + 2);
-                        const __m128d l0 = _mm_set1_pd(packed_l_[i * rank + k]);
-                        const __m128d l1 = _mm_set1_pd(packed_l_[(i + 1) * rank + k]);
-                        const __m128d l2 = _mm_set1_pd(packed_l_[(i + 2) * rank + k]);
-                        const __m128d l3 = _mm_set1_pd(packed_l_[(i + 3) * rank + k]);
-                        s00 = _mm_sub_pd(s00, _mm_mul_pd(l0, u0)); s02 = _mm_sub_pd(s02, _mm_mul_pd(l0, u2));
-                        s10 = _mm_sub_pd(s10, _mm_mul_pd(l1, u0)); s12 = _mm_sub_pd(s12, _mm_mul_pd(l1, u2));
-                        s20 = _mm_sub_pd(s20, _mm_mul_pd(l2, u0)); s22 = _mm_sub_pd(s22, _mm_mul_pd(l2, u2));
-                        s30 = _mm_sub_pd(s30, _mm_mul_pd(l3, u0)); s32 = _mm_sub_pd(s32, _mm_mul_pd(l3, u2));
-                    }
-                    _mm_storeu_pd(values[0], s00); _mm_storeu_pd(values[0] + 2, s02);
-                    _mm_storeu_pd(values[1], s10); _mm_storeu_pd(values[1] + 2, s12);
-                    _mm_storeu_pd(values[2], s20); _mm_storeu_pd(values[2] + 2, s22);
-                    _mm_storeu_pd(values[3], s30); _mm_storeu_pd(values[3] + 2, s32);
-#else
-                    for (std::size_t k = 0; k < rank; ++k) {
-                        for (std::size_t a = 0; a < 4; ++a) {
-                            for (std::size_t b = 0; b < 4; ++b) {
-                                values[a][b] -= packed_l_[(i + a) * rank + k] * packed_u_[k * cols + j + b];
-                            }
-                        }
-                    }
-#endif
-                    for (std::size_t a = 0; a < 4; ++a) {
-                        auto& row = rows[static_cast<std::size_t>(targets_[i + a])];
-                        for (std::size_t b = 0; b < 4; ++b) {
-                            if (!std::isfinite(values[a][b])) {
-                                throw std::runtime_error("non-finite value generated during LU factorization");
-                            }
-                            row.dense[static_cast<std::size_t>(columns_[j + b] - row.dense_offset)] = values[a][b];
-                        }
+            const auto row_count = std::min(targets_.size(), first_row + tile_rows) - first_row;
+            const auto col_count = std::min(cols, first_col + tile_columns) - first_col;
+            const double* l = packed_l_.data() + first_row * rank;
+            const double* u = packed_u_.data() + first_col;
+            const index_t first_column = columns_[first_col];
+            bool finite = true;
+            if (columns_[first_col + col_count - 1] - first_column ==
+                static_cast<index_t>(col_count - 1)) {
+                // Contiguous support: every target's dense storage covers
+                // these columns (grown above), so update the rows in place.
+                double* outputs[tile_rows];
+                for (std::size_t i = 0; i < row_count; ++i) {
+                    auto& row = rows[static_cast<std::size_t>(targets_[first_row + i])];
+                    outputs[i] = row.dense.data() + static_cast<std::size_t>(first_column - row.dense_offset);
+                }
+                finite = kernels.gemm_sub_rows(outputs, l, rank, u, cols, row_count, col_count, rank,
+                    dense_kernels::Accumulate::running);
+            } else {
+                // Gather, update, and write every scratch entry back only when
+                // the kernel flag is true. A kernel may stop at its first
+                // non-finite block, so a false flag throws before any
+                // possibly uncomputed value can reach a row.
+                double values[tile_rows * tile_columns];
+                for (std::size_t i = 0; i < row_count; ++i) {
+                    const auto& row = rows[static_cast<std::size_t>(targets_[first_row + i])];
+                    for (std::size_t j = 0; j < col_count; ++j) {
+                        values[i * tile_columns + j] = row.dense[static_cast<std::size_t>(
+                            columns_[first_col + j] - row.dense_offset)];
                     }
                 }
-                for (; j < end_col; ++j) {
-                    for (std::size_t a = 0; a < 4; ++a) update_entry(rows, i + a, j, rank, cols);
+                finite = kernels.gemm_sub(values, tile_columns, l, rank, u, cols,
+                    row_count, col_count, rank, dense_kernels::Accumulate::running);
+                if (finite) {
+                    for (std::size_t i = 0; i < row_count; ++i) {
+                        auto& row = rows[static_cast<std::size_t>(targets_[first_row + i])];
+                        for (std::size_t j = 0; j < col_count; ++j) {
+                            row.dense[static_cast<std::size_t>(columns_[first_col + j] - row.dense_offset)] =
+                                values[i * tile_columns + j];
+                        }
+                    }
                 }
             }
-            for (; i < end_row; ++i) {
-                for (std::size_t j = first_col; j < end_col; ++j) update_entry(rows, i, j, rank, cols);
+            if (!finite) {
+                throw std::runtime_error("non-finite value generated during LU factorization");
             }
         };
         if (threads > 1 && tiles >= 4 && flops >= 262'144) {
@@ -247,19 +237,6 @@ public:
     [[nodiscard]] std::uint64_t workspace_bytes() const noexcept { return workspace_bytes_; }
 
 private:
-    template <typename Row>
-    void update_entry(std::vector<Row>& rows, std::size_t target, std::size_t col,
-                      std::size_t rank, std::size_t cols) {
-        auto& row = rows[static_cast<std::size_t>(targets_[target])];
-        double& value = row.dense[static_cast<std::size_t>(columns_[col] - row.dense_offset)];
-        for (std::size_t k = 0; k < rank; ++k) {
-            value -= packed_l_[target * rank + k] * packed_u_[k * cols + col];
-        }
-        if (!std::isfinite(value)) {
-            throw std::runtime_error("non-finite value generated during LU factorization");
-        }
-    }
-
     void record_workspace() {
         std::uint64_t bytes = sizeof(index_t) * (pending_mark_.capacity() +
             conversion_mark_.capacity() + column_position_.capacity() + pending_.capacity() +

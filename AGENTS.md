@@ -14,11 +14,13 @@ implements), `docs/benchmarking.md` (the promotion gate), `docs/api.md`.
 
 | Path | What lives there |
 |---|---|
-| `src/spsolve/*.py` | Public API: `splu`, `spsolve`, `factorized`, `spsolve_triangular`, `spparms` (thread/order settings). Canonicalizes input, maps native errors to `LinAlgError`, runs iterative refinement. |
-| `src/spsolve.cpp` | nanobind module `_spsolve`: binds the triangular kernels and calls `bind_sparse_lu`. |
+| `src/spsolve/*.py` | Public API: `splu`, `spsolve`, `factorized`, `spsolve_triangular`, `spparms` (thread/order/dense-kernel settings). Canonicalizes input, maps native errors to `LinAlgError`, runs iterative refinement. |
+| `src/spsolve.cpp` | nanobind module `_spsolve`: binds the triangular kernels and the dense-kernel selection, and calls `bind_sparse_lu`. |
 | `src/sparse_lu.cpp`, `src/sparse_lu.hpp` | `NativeSparseLU` and `factorize_typed`: validation, equilibration, ordering calls, engine selection, the SPD attempt, the left-looking CSC LU, the row-hybrid LU, `solve_inplace`, CSC export, `stats`. Also `FactorExecutor`, the persistent `std::thread` team. |
 | `src/sparse_ldlt.hpp` | Supernodal LDL^T kernels: fundamental supernodes, row incidence, rank-k tile update, per-node panel factorization. |
 | `src/sparse_lu_panels.hpp` | `DensePanel`: deferred dense-row updates and the tiled `L_panel * U_panel` flush of the row-hybrid LU. |
+| `src/dense_kernels.hpp` | Dense tile kernel interface (`dense_kernels::Kernels`: `gemm_sub`, `gemm_sub_rows`, `gemm_sub_lower`, `axpy_sub`) and selection API. Declarations only: it is included by wider-ISA translation units. |
+| `src/dense_kernels.cpp` | Scalar and SSE2 kernels, CPUID/XCR0 detection, `SPSOLVE_FORCE_KERNEL` and runtime selection behind an atomic pointer. |
 | `src/spsolve_triangular*.hpp` | CSR triangular solve for C- and Fortran-ordered right-hand sides. |
 | `third_party/suitesparse_ordering/` | Vendored SuiteSparse AMD 3.3.4 and COLAMD 3.3.5 (BSD-3) plus a minimal config shim. Do not edit; upgrade wholesale and update `THIRD_PARTY_NOTICES.md`. |
 | `tests/` | `unittest` suites. `tests/__init__.py` is empty; tests import the installed package. |
@@ -91,10 +93,11 @@ python benchmarks/factorization.py --threads 8 --repeats 5 --gate   # promotion 
 
 - C++20, `index_t = std::int64_t`, exceptions for errors (workers capture and
   rethrow through `FactorExecutor`), no global mutable state except the
-  executor's own. SIMD is SSE2 intrinsics guarded by the existing
-  `__SSE2__ || _M_X64` test with a scalar fallback; anything wider must be
-  runtime-dispatched from a separately compiled translation unit so baseline
-  wheels keep running.
+  executor's own and the dense-kernel selection. SIMD is SSE2 intrinsics
+  guarded by the existing `__SSE2__ || _M_X64` test with a scalar fallback;
+  dense tile arithmetic goes through the `dense_kernels::Kernels` snapshot a
+  factorization takes once. Anything wider must be runtime-dispatched from a
+  separately compiled translation unit so baseline wheels keep running.
 - `.clang-format` has `DisableFormat: true`: match the surrounding style by
   hand (4-space indent, `static_cast`, `[[nodiscard]]`, braces on the same
   line).

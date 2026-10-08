@@ -1,5 +1,13 @@
+from __future__ import annotations
+
 import os
 from typing import Literal
+
+from ._spsolve import (  # type: ignore
+    _available_dense_kernels,
+    _dense_kernel,
+    _set_dense_kernel,
+)
 
 
 def _initial_thread_count() -> int:
@@ -26,6 +34,30 @@ def set_num_threads(n: int) -> None:
 
 def get_max_threads() -> int:
     return _OMP_NUM_THREADS
+
+
+def get_dense_kernel() -> str:
+    """Return the dense tile kernel that new native factorizations use."""
+    return str(_dense_kernel())
+
+
+def available_dense_kernels() -> list[str]:
+    """Return the dense kernels this build and CPU support, best first."""
+    return [str(name) for name in _available_dense_kernels()]
+
+
+def set_dense_kernel(name: str | None) -> None:
+    """Select the dense tile kernel for subsequent native factorizations.
+
+    ``name`` is ``"auto"`` (the best available kernel), ``"avx2"`` or
+    ``"avx2-fma"``, ``"sse2"``, or ``"scalar"``, case-insensitively. ``None``
+    restores the startup selection: ``SPSOLVE_FORCE_KERNEL`` when it names a
+    usable kernel, otherwise ``"auto"``. Unknown or unsupported names raise
+    ``ValueError``.
+    """
+    if name is not None and not isinstance(name, str):
+        raise TypeError("dense kernel name must be a string or None")
+    _set_dense_kernel(name)
 
 
 def get_prefer_order() -> Literal["C", "F", "A", "K"]:

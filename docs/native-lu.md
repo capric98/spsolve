@@ -98,10 +98,16 @@ are packed, including noncontiguous and partial overlaps.
 The diagonal block is factored in panels of at most 32 columns. The below-panel
 solve applies `inv(L_panel.T)` and `inv(D_panel)` once, followed by a tiled
 rank-k update of the remaining lower triangle and rectangular tail. Independent
-16-by-16 output tiles share the persistent worker team. The portable scalar
-microkernel has an SSE2 implementation on targets where SSE2 is part of the
-compiler target; no external BLAS or host-specific instruction set is required.
-Tiny intersections retain sparse outer products.
+16-by-16 output tiles share the persistent worker team and call the shared
+dense kernels described below. A tile whose output rows and columns are both
+contiguous node positions (always true for trailing updates) is updated in
+place in the node rectangle; a tile that straddles the diagonal writes only its
+lower entries, and tiles entirely above it are skipped. An irregular
+intersection tile is gathered into a 16-by-16 scratch block, updated, and
+scattered back. Because the output columns are a prefix of the ascending
+output rows, a tile that straddles the diagonal is a diagonal tile, and only
+its lower triangle is gathered, computed, and scattered. Tiny intersections
+retain sparse outer products.
 
 For node width `W` and height `R`, predicted internal update terms are
 `W*(W-1)*(3*R-2*W+1)/6`. Only nodes at least 320 columns wide contribute useful
@@ -130,15 +136,70 @@ At a panel boundary, surviving affected dense rows receive a tiled
 `L_panel * U_panel` update. Packing uses the union of actual U tail columns;
 it does not sweep unrelated zero tails. Every output starts from its current
 value and subtracts each source term in pivot order. Independent 16-by-64
-tiles use a portable 4-by-4 microkernel with an SSE2 implementation on
-supported compiler targets. Sparse-to-dense conversions occur only after
-this flush, so conversion neither omits nor duplicates an update. After
-activation, short trailing panels retain the same recurrence.
+tiles call the shared dense kernels: when a tile's packed columns are
+contiguous, the kernel updates the rows' dense tails in place; otherwise the
+tile is gathered into a 16-by-64 scratch block and scattered back. Both paths
+compute identical bits, and the choice depends only on column positions.
+Sparse-to-dense conversions occur only after this flush, so conversion
+neither omits nor duplicates an update. After activation, short trailing
+panels retain the same recurrence.
 
 The activation thresholds are independent of the requested thread count.
 Purely sparse phases keep their existing update scheduler and do not allocate
 panel packing buffers. Selected pivot rows release their dense storage only
 after U has been retained; eliminated rows never participate in a later flush.
+
+## Dense kernels
+
+Both blocked paths call one kernel table, `dense_kernels::Kernels`
+(`src/dense_kernels.hpp`): `gemm_sub` (`C -= A @ B`), `gemm_sub_rows` (the
+same with per-row output pointers), `gemm_sub_lower` (writes only entries with
+`i + shift >= j`), and `axpy_sub` (`y -= alpha * x`, not yet used by the
+engines). The GEMM entry points take an accumulation order, each with a
+separate multiply per term (no fused multiply-add):
+
+- `running`: the output starts from its current value and subtracts each
+  term in ascending `k`, `c = (c - a0*b0) - a1*b1 - ...`;
+- `sum_then_subtract`: the terms are summed from zero in ascending `k`, and
+  the sum is subtracted from the output once, `c = c - (a0*b0 + a1*b1 + ...)`.
+
+The LU flush uses `running`. It is the recurrence of the eager in-panel
+updates and of pivot-tail materialization, so a dense row's entries receive
+the same arithmetic whichever of those paths applies a term, and the flush
+stays bitwise identical to its previous implementation. The supernodal LDL^T
+update uses `sum_then_subtract`, its previous association: after symmetric
+scaling the diagonal and nearby entries it updates are often much larger than
+the individual terms, and summing first rounds at the scale of the terms with
+one rounding at the scale of the entry. With `running` the LDL^T backward
+error `max|P^T S A S P - L D L^T|` grew about fourfold (for example from
+6.7e-16 to 2.6e-15 on four dense 600-wide SPD blocks).
+
+In either order an element's result depends only on its own operands, never
+on its tile, path, or thread. The `sse2` kernel generalizes the earlier 4-by-4
+microkernel to 1-4 rows by 4, 2, or 1 columns, so edges use the same
+arithmetic, and reproduces the previous LU and LDL^T results bit for bit. The
+portable `scalar` kernel performs the same operations and, on x86-64,
+produces the same bits.
+
+Every kernel reports whether any element it wrote is non-finite. The SIMD
+kernels fold `x - x` of every stored register into one witness per microtile
+(zero for finite values, NaN otherwise) and test it once, so every written
+element is covered. A kernel may stop at its first non-finite block, leaving
+later elements uncomputed, so its flag is authoritative on every path: a
+false flag raises the usual LU non-finite error or rejects the SPD attempt
+before any gathered tile is scattered back, and no path scatters an element
+the kernel was not asked to compute.
+
+A factorization snapshots the active kernel once, before ordering, and passes
+it to both engines; `stats["dense_kernel"]` names it (`avx2-fma`, `sse2`, or
+`scalar`) even when the selected engine performs no tile updates. The default
+is the best kernel the build and CPU support; `SPSOLVE_FORCE_KERNEL` and
+`spsolve.spparms.set_dense_kernel` override it (see `docs/api.md`). Wider
+kernels belong in separately compiled translation units behind a CPUID and
+XCR0 check (`cpu_supports_avx2_fma`); the shared header holds declarations
+only, so no inline code compiled for a wider target can be linked into the
+baseline paths. This build has no AVX2 translation unit yet
+(`SPSOLVE_HAVE_AVX2_KERNELS=0`).
 
 ## Threading behavior
 
@@ -160,7 +221,9 @@ including discovery marks, row/column lists, and packed L/U operands. It
 excludes retained factors, row-engine sparse/dense storage, and worker runtime
 storage, and must not be interpreted as total row-engine peak memory.
 The SPD-specific `parallel_panels`, `dense_update_flops`, and `spd_*` fields
-retain their existing meaning.
+retain their existing meaning. `dense_kernel` names the dense tile kernel the
+factorization snapshotted (`avx2-fma`, `sse2`, or `scalar`; see "Dense
+kernels"), whether or not the selected engine used it.
 
 `ordering_estimated_l_nnz` and `ordering_estimated_max_front` report AMD
 estimates for `MMD_AT_PLUS_A`; zero means unavailable for other orderings.

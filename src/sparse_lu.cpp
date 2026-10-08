@@ -1,4 +1,5 @@
 #include "sparse_lu.hpp"
+#include "dense_kernels.hpp"
 #include "sparse_ldlt.hpp"
 #include "sparse_lu_panels.hpp"
 
@@ -604,7 +605,8 @@ template <typename Int>
     const double* data,
     const Int* indices,
     const Int* indptr,
-    index_t n
+    index_t n,
+    const dense_kernels::Kernels& kernels
 ) {
     const auto symbolic_start = Clock::now();
     if (!is_exactly_symmetric(data, indices, indptr, n)) return false;
@@ -745,7 +747,7 @@ template <typename Int>
         const bool succeeded = sparse_ldlt::factorize(
             data, indices, indptr, result->perm_c_, inverse_permutation,
             symmetric_scale, strict_col_ptr, strict_rows, nodes, strict_values,
-            diagonal, executor, result->factor_threads_, blocked_info, base_workspace);
+            diagonal, kernels, executor, result->factor_threads_, blocked_info, base_workspace);
         result->peak_workspace_bytes_ = blocked_info.workspace_bytes;
         if (!succeeded) return false;
         numeric_updates = blocked_info.update_flops / 2;
@@ -1148,6 +1150,10 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
     result->n_ = n;
     result->input_nnz_ = data_size;
     result->factor_threads_ = resolve_threads(num_threads);
+    // One snapshot per factorization: a concurrent selection change from
+    // another thread cannot mix kernels within this factor.
+    const dense_kernels::Kernels& kernels = dense_kernels::active();
+    result->dense_kernel_ = kernels.name;
     result->ordering_ = ordering;
     result->row_scale_.assign(static_cast<std::size_t>(n), 1.0);
     result->col_scale_.assign(static_cast<std::size_t>(n), 1.0);
@@ -1217,7 +1223,7 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
 
     const auto spd_start = Clock::now();
     if (try_factorize_symmetric_positive_definite(
-            result, data, indices, indptr, n)) {
+            result, data, indices, indptr, n, kernels)) {
         return result;
     }
     const auto spd_workspace = result->peak_workspace_bytes_;
@@ -1580,7 +1586,8 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
         }
         std::vector<index_t>().swap(active_columns[static_cast<std::size_t>(pivot_col)]);
         if (panel_active && pivot_col + 1 == panel.end()) {
-            panel.flush(rows, position_of_row, result->u_rows_, executor, result->factor_threads_);
+            panel.flush(rows, position_of_row, result->u_rows_, kernels, executor,
+                        result->factor_threads_);
             for (index_t row_id : panel.conversions()) {
                 auto& row = rows[static_cast<std::size_t>(row_id)];
                 if (position_of_row[static_cast<std::size_t>(row_id)] >= panel.end() &&
@@ -2077,6 +2084,7 @@ nb::dict NativeSparseLU::stats() const {
     output["ordering"] = ordering_;
     output["ordering_backend"] = ordering_backend_;
     output["numeric_engine"] = numeric_engine_;
+    output["dense_kernel"] = dense_kernel_;
     output["input_nnz"] = input_nnz_;
     output["factor_nnz"] = factor_nnz_;
     output["fill_ratio"] = fill_ratio_;
