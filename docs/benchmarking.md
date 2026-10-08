@@ -100,6 +100,33 @@ than hidden nested BLAS teams. Inputs are canonicalized once before timing
 (duplicates summed, indices sorted), so neither backend pays sorting inside
 the timed region.
 
+### Dense kernel selection
+
+Blocked LU flushes and supernodal LDL.T updates run on the dense kernel the
+extension selects at startup: `avx2-fma` on CPUs with AVX2 and FMA, otherwise
+`sse2` on x86-64 (see [the design notes](native-lu.md#dense-kernels)). Timings
+therefore depend on the CPU's kernel, and the `kernel` column shows which one
+ran. Set `SPSOLVE_FORCE_KERNEL` before starting the script to pin one, for
+example to compare a CI runner with a workstation or to measure the kernel's
+own contribution:
+
+```bash
+SPSOLVE_FORCE_KERNEL=sse2 python benchmarks/factorization.py --threads 8 --repeats 5 --extended --dense-lu
+```
+
+Forcing a kernel also makes factors reproducible across machines: general LU
+factors are bitwise identical under every kernel on x86-64, while LDL.T
+factors from `avx2-fma` differ from `sse2` and `scalar` in the last bits.
+
+On a Windows x64 release build (i5-13600K, five batched samples,
+`--extended --dense-lu`, `MMD_AT_PLUS_A`), the default `avx2-fma` kernel
+reduced one-thread medians against forced `sse2` in the same build by 14-24%
+for irregular, pivot-heavy, 3-D Poisson, dense LU (connected, pivoted, and
+blocked) and dense SPD cases; eight-thread medians moved within about ±4%,
+because their remaining time is serial pivoting, pivot-tail materialization,
+and setup rather than tile updates. Cases without blocked dense work were
+unchanged.
+
 ## Poisson bottleneck and resolution
 
 Profiling the original 8,100-row 2-D Poisson case separated two costs that the
@@ -121,6 +148,11 @@ than SuperLU, but its approximately 0.0051-second factorization time is now
 comparable to the measured 0.0077-second SuperLU time.
 
 ## Current status
+
+The tables below were measured before the `avx2-fma` kernel existed, on the
+`sse2` kernel or its predecessor; runs on an AVX2 machine now default to
+`avx2-fma` and are faster on dense-update-heavy cases (see "Dense kernel
+selection" above). Force `SPSOLVE_FORCE_KERNEL=sse2` to compare with them.
 
 Before the dense LU panel change, the strict gate passed more than three
 consecutive times on checked Windows

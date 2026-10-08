@@ -4,6 +4,7 @@ project(_spsolve LANGUAGES C CXX)
 
 option(SP_USE_OPENMP "Enable OpenMP parallelism" ON)
 option(SP_ARCH_NATIVE "Enable host-specific compiler optimizations" OFF)
+option(SP_ENABLE_AVX2 "Build runtime-dispatched AVX2+FMA dense kernels (x86-64 only)" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -87,8 +88,66 @@ nanobind_add_module(
 target_include_directories(_spsolve PRIVATE src)
 target_include_directories(_spsolve PRIVATE "${ORDERING_DIR}")
 target_link_libraries(_spsolve PRIVATE Threads::Threads spsolve_ordering)
-# No AVX2 kernel translation unit is compiled yet; dispatch lists sse2/scalar.
-target_compile_definitions(_spsolve PRIVATE SPSOLVE_HAVE_AVX2_KERNELS=0)
+
+# AVX2+FMA dense kernels live in their own translation unit, the only one
+# compiled for AVX2; everything else targets the baseline ISA. The kernels
+# are selected at run time after a CPUID/XCR0 check (see src/dense_kernels.cpp
+# and the rules at the top of src/dense_kernels_avx2.cpp). Never enable
+# link-time code generation (/GL, -flto) for this target.
+set(SP_X86_64 OFF)
+if(CMAKE_OSX_ARCHITECTURES)
+  if("x86_64" IN_LIST CMAKE_OSX_ARCHITECTURES)
+    set(SP_X86_64 ON)
+  endif()
+elseif(MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID)
+  # The compiler's target: Visual Studio generators report the host
+  # processor in CMAKE_SYSTEM_PROCESSOR even for -A Win32 or -A ARM64.
+  if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
+    set(SP_X86_64 ON)
+  endif()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+  set(SP_X86_64 ON)
+endif()
+# 1 or 0, not ON/OFF: the value is tested by the preprocessor.
+if(SP_ENABLE_AVX2 AND SP_X86_64)
+  set(SP_HAVE_AVX2_KERNELS 1)
+else()
+  set(SP_HAVE_AVX2_KERNELS 0)
+endif()
+target_compile_definitions(_spsolve PRIVATE SPSOLVE_HAVE_AVX2_KERNELS=${SP_HAVE_AVX2_KERNELS})
+
+if(SP_HAVE_AVX2_KERNELS)
+  target_sources(_spsolve PRIVATE src/dense_kernels_avx2.cpp)
+  # Per-source options follow the target's options on the command line.
+  if(MSVC)
+    # SP_ARCH_NATIVE already compiles every source with /arch:AVX2; repeating
+    # it would only trigger warning D9025.
+    if(NOT SP_ARCH_NATIVE)
+      set_source_files_properties(src/dense_kernels_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    endif()
+  else()
+    # The target-wide -ffp-contract=off below also covers this file: its
+    # running order multiplies and subtracts separately, which GCC would
+    # otherwise fuse under -mfma. Explicit FMA intrinsics are unaffected.
+    list(LENGTH CMAKE_OSX_ARCHITECTURES SP_OSX_ARCH_COUNT)
+    if(APPLE AND SP_OSX_ARCH_COUNT GREATER 1)
+      # Universal build: only the x86_64 slice may use AVX2; the source is
+      # empty in the other slices.
+      set_source_files_properties(src/dense_kernels_avx2.cpp PROPERTIES COMPILE_OPTIONS
+        "-Xarch_x86_64;-mavx2;-Xarch_x86_64;-mfma")
+    else()
+      set_source_files_properties(src/dense_kernels_avx2.cpp PROPERTIES COMPILE_OPTIONS
+        "-mavx2;-mfma")
+    endif()
+  endif()
+  message(STATUS "Building runtime-dispatched AVX2+FMA dense kernels")
+else()
+  if(NOT SP_ENABLE_AVX2)
+    message(STATUS "AVX2+FMA dense kernels disabled (SP_ENABLE_AVX2=OFF); using sse2/scalar kernels")
+  else()
+    message(STATUS "AVX2+FMA dense kernels not built: target is not x86-64; using baseline kernels")
+  endif()
+endif()
 
 if(MSVC)
   target_compile_options(_spsolve PRIVATE /O2 /EHsc)
@@ -100,9 +159,14 @@ else()
   if(SP_ARCH_NATIVE)
     target_compile_options(_spsolve PRIVATE -march=native)
   endif()
-  # The baseline kernels promise a separate multiply and add/subtract per
-  # term; keep -march=native from fusing them into FMA.
-  set_source_files_properties(src/dense_kernels.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+  # The whole module is built without floating-point contraction, so every
+  # scalar and vector path (the dense kernels, the eager row updates and
+  # pivot-tail materialization in sparse_lu.cpp and sparse_lu_panels.hpp)
+  # rounds a*b and the following subtraction separately. Exact singular
+  # detection relies on those paths rounding identically; GCC's C++ default
+  # -ffp-contract=fast would fuse them under -march=native or -mfma. MSVC
+  # does not contract under its default /fp:precise.
+  target_compile_options(_spsolve PRIVATE -ffp-contract=off)
 endif()
 
 if(OpenMP_CXX_FOUND)

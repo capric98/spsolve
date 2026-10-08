@@ -373,22 +373,26 @@ one while both are tiny. No condition estimate is computed.
 - Every engine performs each output entry's accumulation in one fixed order
   (ascending pivot or contributor index), so results are bitwise reproducible
   across thread counts. Parallel work is always over disjoint output sets.
-- The dense tile kernels (`src/dense_kernels.cpp`) use one of two fixed
-  accumulation orders, each term a multiply followed by an addition or
-  subtraction (two roundings). The blocked LU flush updates every output from
-  its current value,
+- The dense tile kernels (`src/dense_kernels.cpp`,
+  `src/dense_kernels_avx2.cpp`) use one of two fixed accumulation orders.
+  The blocked LU flush updates every output from its current value,
   $c \leftarrow (\cdots((c - a_0 b_0) - a_1 b_1) \cdots) - a_{k-1} b_{k-1}$,
-  the same recurrence as its eager rank-1 updates. The supernodal $LDL^T$
-  rank-$k$ update forms $s = (\cdots((0 + a_0 b_0) + a_1 b_1) \cdots) +
-  a_{k-1} b_{k-1}$ and then $c \leftarrow c - s$: when $|c|$ is much larger
-  than the terms, as on a dominant diagonal, the running form would round at
-  the scale of $c$ once per term instead of once in total. In both orders an
-  element's result depends only on its own operands, so tiling, edge
-  handling, in-place versus gathered operands and the executing thread cannot
-  change it, and the `sse2` and `scalar` kernels agree bitwise on x86-64. A
-  fused multiply-add kernel rounds once per term and changes results in the
-  last bits; kernels are therefore selectable explicitly (`set_dense_kernel`,
-  `SPSOLVE_FORCE_KERNEL`) so cross-machine reproducibility remains possible.
+  each term a rounded product and a rounded subtraction in every kernel: this
+  is the recurrence of its eager rank-1 updates and of pivot-tail
+  materialization, which apply the same terms outside the kernels, so a
+  duplicated row still cancels exactly. The supernodal $LDL^T$ rank-$k$
+  update forms $s = (\cdots((0 + a_0 b_0) + a_1 b_1) \cdots) + a_{k-1}
+  b_{k-1}$ and then $c \leftarrow c - s$: when $|c|$ is much larger than the
+  terms, as on a dominant diagonal, the running form would round at the scale
+  of $c$ once per term instead of once in total. The `sse2` and `scalar`
+  kernels round each product and each addition (two roundings per term); the
+  `avx2-fma` kernel forms each $s \leftarrow \mathrm{fma}(a_k, b_k, s)$ with
+  one rounding. In both orders an element's result depends only on its own
+  operands, so tiling, edge handling, in-place versus gathered operands and
+  the executing thread cannot change it. LU factors agree bitwise across the
+  kernels on x86-64; $LDL^T$ factors from `avx2-fma` differ in the last bits,
+  so kernels are selectable explicitly (`set_dense_kernel`,
+  `SPSOLVE_FORCE_KERNEL`) and cross-machine reproducibility remains possible.
 - Non-finite values cannot be produced by finite input without overflow or a
   zero pivot. The engines check the pivot column maximum and pivot, the
   multipliers, and every updated entry (or, where documented, every retained

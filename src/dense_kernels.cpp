@@ -16,6 +16,15 @@
 #define SPSOLVE_DENSE_SSE2 0
 #endif
 
+// The AVX2 translation unit defines avx2_kernels only on x86-64, which can be
+// narrower than the build-wide switch (an Apple universal build compiles both
+// translation units for every architecture slice).
+#if SPSOLVE_HAVE_AVX2_KERNELS && (defined(__x86_64__) || defined(_M_X64))
+#define SPSOLVE_DENSE_AVX2 1
+#else
+#define SPSOLVE_DENSE_AVX2 0
+#endif
+
 #if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
 #define SPSOLVE_CPUID_MSVC 1
 #include <intrin.h>
@@ -27,7 +36,9 @@
 // This translation unit must not contract c - a*b or s + a*b into a fused
 // multiply-add: the baseline kernels promise two roundings per term on every
 // compiler and target. CMake passes -ffp-contract=off for non-MSVC compilers; MSVC does
-// not contract under its default /fp:precise.
+// not contract under its default /fp:precise. The AVX2 kernel, which fuses
+// only the sum_then_subtract order, is the separately compiled
+// dense_kernels_avx2.cpp.
 
 namespace dense_kernels {
 namespace {
@@ -438,7 +449,8 @@ std::atomic<const Kernels*> selected{nullptr};
 void initialize() {
     std::call_once(initialized, [] {
         std::size_t count = 0;
-#if SPSOLVE_HAVE_AVX2_KERNELS
+#if SPSOLVE_DENSE_AVX2
+        // The only way baseline code reaches the AVX2 translation unit.
         if (cpu_supports_avx2_fma()) usable[count++] = &avx2_kernels;
 #endif
 #if SPSOLVE_DENSE_SSE2

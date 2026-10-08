@@ -87,18 +87,20 @@ value comes from `OMP_NUM_THREADS` or `os.cpu_count()`.
 ```python
 from spsolve.spparms import available_dense_kernels, get_dense_kernel, set_dense_kernel
 
-available_dense_kernels()   # usable kernels, best first, e.g. ['sse2', 'scalar']
+available_dense_kernels()   # usable kernels, best first, e.g. ['avx2-fma', 'sse2', 'scalar']
 set_dense_kernel("scalar")  # case-insensitive: 'auto', 'avx2'/'avx2-fma', 'sse2', 'scalar'
 get_dense_kernel()          # 'scalar'
 set_dense_kernel(None)      # restore the startup selection
 ```
 
 Native blocked LU panel flushes and supernodal LDL^T updates run on a dense
-tile kernel. The startup selection is the best kernel this build and CPU
-support, unless the environment variable `SPSOLVE_FORCE_KERNEL` (`auto`,
-`avx2` or `avx2-fma`, `sse2`, or `scalar`, case-insensitive) names a usable
-kernel when the extension first selects one; an unknown or unsupported value
-is ignored.
+tile kernel: `avx2-fma` on x86-64 CPUs with AVX2 and FMA (detected at run
+time; builds with `SP_ENABLE_AVX2=OFF` omit it), `sse2` on other x86-64 CPUs,
+and the portable `scalar` kernel elsewhere. The startup selection is the best
+kernel this build and CPU support, unless the environment variable
+`SPSOLVE_FORCE_KERNEL` (`auto`, `avx2` or `avx2-fma`, `sse2`, or `scalar`,
+case-insensitive) names a usable kernel when the extension first selects one;
+an unknown or unsupported value is ignored.
 `set_dense_kernel` raises `ValueError` for an unknown or unsupported name and
 `TypeError` for a non-string; `'auto'` selects the best available kernel and
 `None` restores the startup selection.
@@ -106,6 +108,9 @@ is ignored.
 The setting is process-wide. Each factorization takes one snapshot when it
 starts, so a concurrent change never mixes kernels within a factor, and
 `stats["dense_kernel"]` reports the kernel used. Within one kernel, factors are
-bitwise identical at every thread count. Different kernels may differ in the
-last bits (a fused multiply-add kernel rounds once per term instead of twice);
-select a kernel explicitly to reproduce factors across machines.
+bitwise identical at every thread count. General LU factors are also bitwise
+identical across the three kernels on x86-64. Supernodal LDL^T factors (symmetric
+positive-definite inputs) differ in the last bits between `avx2-fma`, which
+rounds once per update term with a fused multiply-add, and `sse2`/`scalar`,
+which round twice; select a kernel explicitly, for example `sse2` on any
+x86-64 machine, to reproduce factors across machines.

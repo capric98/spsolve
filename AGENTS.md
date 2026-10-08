@@ -21,6 +21,7 @@ implements), `docs/benchmarking.md` (the promotion gate), `docs/api.md`.
 | `src/sparse_lu_panels.hpp` | `DensePanel`: deferred dense-row updates and the tiled `L_panel * U_panel` flush of the row-hybrid LU. |
 | `src/dense_kernels.hpp` | Dense tile kernel interface (`dense_kernels::Kernels`: `gemm_sub`, `gemm_sub_rows`, `gemm_sub_lower`, `axpy_sub`) and selection API. Declarations only: it is included by wider-ISA translation units. |
 | `src/dense_kernels.cpp` | Scalar and SSE2 kernels, CPUID/XCR0 detection, `SPSOLVE_FORCE_KERNEL` and runtime selection behind an atomic pointer. |
+| `src/dense_kernels_avx2.cpp` | `avx2-fma` kernel (4x8 microkernel; FMA only in the LDL^T `sum_then_subtract` order). The only file compiled with `/arch:AVX2` / `-mavx2 -mfma`; see its header comment for the hygiene rules. Built when `SP_ENABLE_AVX2` (default ON) and the target is x86-64. |
 | `src/spsolve_triangular*.hpp` | CSR triangular solve for C- and Fortran-ordered right-hand sides. |
 | `third_party/suitesparse_ordering/` | Vendored SuiteSparse AMD 3.3.4 and COLAMD 3.3.5 (BSD-3) plus a minimal config shim. Do not edit; upgrade wholesale and update `THIRD_PARTY_NOTICES.md`. |
 | `tests/` | `unittest` suites. `tests/__init__.py` is empty; tests import the installed package. |
@@ -43,8 +44,11 @@ python benchmarks/factorization.py --threads 8 --repeats 5 --gate   # promotion 
   code.
 - CMake options: `SP_USE_OPENMP` (default ON, only the triangular kernels and
   multi-RHS solves use OpenMP), `SP_ARCH_NATIVE` (default OFF; wheels target
-  baseline x64, so never make correctness depend on it). Pass options through
-  pip as `-Ccmake.define.SP_ARCH_NATIVE=ON`.
+  baseline x64, so never make correctness depend on it), `SP_ENABLE_AVX2`
+  (default ON; builds the runtime-dispatched AVX2+FMA dense kernel on x86-64
+  targets). Pass options through pip as `-Ccmake.define.SP_ARCH_NATIVE=ON`.
+  `SPSOLVE_FORCE_KERNEL=sse2` (or `scalar`, `avx2`) runs the tests or
+  benchmarks on another dense kernel without rebuilding.
 - On Windows the build uses MSVC; a manual `cmake` run needs `vcvars64.bat`.
 - Benchmarks pin BLAS libraries to one thread before importing NumPy so the
   SuperLU comparison is factorization versus factorization. Run them on an
@@ -93,11 +97,20 @@ python benchmarks/factorization.py --threads 8 --repeats 5 --gate   # promotion 
 
 - C++20, `index_t = std::int64_t`, exceptions for errors (workers capture and
   rethrow through `FactorExecutor`), no global mutable state except the
-  executor's own and the dense-kernel selection. SIMD is SSE2 intrinsics
-  guarded by the existing `__SSE2__ || _M_X64` test with a scalar fallback;
-  dense tile arithmetic goes through the `dense_kernels::Kernels` snapshot a
-  factorization takes once. Anything wider must be runtime-dispatched from a
-  separately compiled translation unit so baseline wheels keep running.
+  executor's own and the dense-kernel selection. Baseline translation units
+  use SSE2 intrinsics only, guarded by the existing `__SSE2__ || _M_X64` test
+  with a scalar fallback; dense tile arithmetic goes through the
+  `dense_kernels::Kernels` snapshot a factorization takes once. Wider ISAs
+  live only in separately compiled translation units (today
+  `src/dense_kernels_avx2.cpp`) reached through the `dense_kernels` table
+  after the CPUID/XCR0 check, so baseline wheels keep running. Such a unit
+  includes only `<immintrin.h>`, typedef-only standard headers and the
+  declarations-only `dense_kernels.hpp` (no STL inline code, which could be
+  COMDAT-folded into baseline callers), keeps helpers in an anonymous
+  namespace, exports only its kernel table (`constinit`) and entry points,
+  and is never built with LTO (`/GL`, `-flto`) or `-mno-vzeroupper`. A kernel
+  order may fuse multiply-adds only if no other code path applies the same
+  terms with separate roundings (see "Dense kernels" in `docs/native-lu.md`).
 - `.clang-format` has `DisableFormat: true`: match the surrounding style by
   hand (4-space indent, `static_cast`, `[[nodiscard]]`, braces on the same
   line).

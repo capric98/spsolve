@@ -154,9 +154,9 @@ after U has been retained; eliminated rows never participate in a later flush.
 Both blocked paths call one kernel table, `dense_kernels::Kernels`
 (`src/dense_kernels.hpp`): `gemm_sub` (`C -= A @ B`), `gemm_sub_rows` (the
 same with per-row output pointers), `gemm_sub_lower` (writes only entries with
-`i + shift >= j`), and `axpy_sub` (`y -= alpha * x`, not yet used by the
-engines). The GEMM entry points take an accumulation order, each with a
-separate multiply per term (no fused multiply-add):
+`i + shift >= j`), and `axpy_sub` (`y -= alpha * x`, one `running` term per
+element; not yet used by the engines). The GEMM entry points take an
+accumulation order:
 
 - `running`: the output starts from its current value and subtracts each
   term in ascending `k`, `c = (c - a0*b0) - a1*b1 - ...`;
@@ -175,11 +175,44 @@ error `max|P^T S A S P - L D L^T|` grew about fourfold (for example from
 6.7e-16 to 2.6e-15 on four dense 600-wide SPD blocks).
 
 In either order an element's result depends only on its own operands, never
-on its tile, path, or thread. The `sse2` kernel generalizes the earlier 4-by-4
-microkernel to 1-4 rows by 4, 2, or 1 columns, so edges use the same
-arithmetic, and reproduces the previous LU and LDL^T results bit for bit. The
-portable `scalar` kernel performs the same operations and, on x86-64,
-produces the same bits.
+on its tile, path, or thread. Three kernels implement the table:
+
+- `scalar`: portable C++, one output row at a time.
+- `sse2`: the baseline x86-64 kernel. It generalizes the earlier 4-by-4
+  microkernel to 1-4 rows by 4, 2, or 1 columns, so edges use the same
+  arithmetic, and reproduces the earlier LU and LDL^T results bit for bit.
+  `scalar` performs the same operations and, on x86-64, produces the same
+  bits. Both round each product and each addition or subtraction separately
+  (two roundings per term).
+- `avx2-fma` (`src/dense_kernels_avx2.cpp`): a 4-by-8 microkernel with eight
+  YMM accumulators. Per `k` it loads two YMM of `B`, broadcasts four elements
+  of `A`, and issues eight multiply-subtract pairs (`running`) or eight fused
+  multiply-adds (`sum_then_subtract`). Edges use 1-4 rows by 8, 4, 2, or 1
+  columns with the same per-element operations and read nothing outside the
+  requested rows and columns. `gemm_sub_lower` computes a microtile that the
+  diagonal crosses in an aligned 4-by-8 scratch block holding only the
+  entries on or below the diagonal, stores back only those entries, and
+  tests only those for finiteness. On an i5-13600K, 16-by-64 rank-32 LU flush
+  tiles run at about 52 GFLOPS (`sse2`: 21) and off-diagonal 16-by-16 LDL^T
+  tiles at about 60-64 GFLOPS (`sse2`: 18-22) for ranks 32-320. Diagonal
+  16-by-16 tiles (`gemm_sub_lower`) reach about 35-48 GFLOPS (`sse2`: 16),
+  counting only the entries written, because of the scratch gather and
+  scalar scatter of their diagonal-crossing microtiles.
+
+`avx2-fma` fuses only the `sum_then_subtract` order: `s = fma(a_k, b_k, s)`
+rounds once per term, followed by the single subtraction `c - s`. Supernodal
+LDL^T factors therefore differ from the `sse2` and `scalar` ones in the last
+bits (normwise about 1e-16 on the benchmark SPD cases) with the same backward
+error (for example 6.7e-16 on four dense 600-wide SPD blocks with every
+kernel). The `running` order, and `axpy_sub`, deliberately round twice per
+term, so LU factors are bitwise identical under all three kernels. The reason
+is the row-hybrid recurrence above: a dense row's tail receives each panel
+term either from the flush or, when the row becomes a pivot first, from the
+scalar pivot-tail materialization (`DensePanel::materialize_pivot`), and both
+must round identically. With a fused flush, a dense row duplicated from a
+pivot row kept a residue near 1e-18 instead of cancelling to zero, and the
+exactly singular matrix factored instead of raising. Fusing `running` first
+requires every path that applies the same terms to call the kernel table.
 
 Every kernel reports whether any element it wrote is non-finite. The SIMD
 kernels fold `x - x` of every stored register into one witness per microtile
@@ -188,18 +221,56 @@ element is covered. A kernel may stop at its first non-finite block, leaving
 later elements uncomputed, so its flag is authoritative on every path: a
 false flag raises the usual LU non-finite error or rejects the SPD attempt
 before any gathered tile is scattered back, and no path scatters an element
-the kernel was not asked to compute.
+the kernel was not asked to compute. A kernel never reports an element it
+did not write: the diagonal-crossing blocks of `avx2-fma` compute entries
+above the diagonal in scratch but neither store nor test them.
 
 A factorization snapshots the active kernel once, before ordering, and passes
 it to both engines; `stats["dense_kernel"]` names it (`avx2-fma`, `sse2`, or
 `scalar`) even when the selected engine performs no tile updates. The default
-is the best kernel the build and CPU support; `SPSOLVE_FORCE_KERNEL` and
-`spsolve.spparms.set_dense_kernel` override it (see `docs/api.md`). Wider
-kernels belong in separately compiled translation units behind a CPUID and
-XCR0 check (`cpu_supports_avx2_fma`); the shared header holds declarations
-only, so no inline code compiled for a wider target can be linked into the
-baseline paths. This build has no AVX2 translation unit yet
-(`SPSOLVE_HAVE_AVX2_KERNELS=0`).
+is the best kernel the build and CPU support: `avx2-fma` when
+`cpu_supports_avx2_fma` finds AVX, FMA, AVX2, and OSXSAVE in CPUID and XMM
+plus YMM state enabled in XCR0, otherwise `sse2` on x86-64 and `scalar`
+elsewhere. `SPSOLVE_FORCE_KERNEL` and `spsolve.spparms.set_dense_kernel`
+override it (see `docs/api.md`). Within one kernel, factors are bitwise
+identical at every thread count; across machines they are bitwise identical
+only when the same kernel runs, so force a kernel (for example `sse2`, which
+every x86-64 CPU supports) to reproduce LDL^T factors across machines.
+
+Wider kernels live in separately compiled translation units reached only
+through the kernel table after the CPU check. CMake compiles
+`src/dense_kernels_avx2.cpp`, and only that file, with `/arch:AVX2` (MSVC) or
+`-mavx2 -mfma` (GCC/Clang; `-Xarch_x86_64` in an Apple universal build) when `SP_ENABLE_AVX2` (default `ON`) is set and the target
+is x86-64; it then defines `SPSOLVE_HAVE_AVX2_KERNELS=1`. The rest of the
+module, including wheels, targets baseline x86-64. Hygiene rules for such a
+translation unit, also stated in its header comment:
+
+- it includes only `<immintrin.h>`, typedef-only standard headers, and the
+  declarations-only `dense_kernels.hpp`: an inline function or template
+  instantiated there would be emitted as a COMDAT with VEX encoding, and the
+  linker could keep that copy for baseline callers;
+- every helper has internal linkage, and only the kernel table and its entry
+  points are external;
+- the table is `constinit`, so loading the module runs none of its code;
+- link-time code generation (`/GL`, `-flto`) stays off, and `vzeroupper`
+  stays enabled (never `-mno-vzeroupper`);
+- it relies on the module-wide `-ffp-contract=off` (below) to keep GCC from
+  fusing the separate multiply and subtract of the `running` order into FMA;
+  the intended FMA intrinsics are unaffected.
+
+The whole module is built without floating-point contraction
+(`-ffp-contract=off` target-wide on GCC/Clang; MSVC does not contract under
+its default `/fp:precise`), so every scalar and vector path, including the
+eager row updates and pivot-tail materialization in `sparse_lu.cpp` and
+`sparse_lu_panels.hpp`, rounds `a*b` and the following subtraction
+separately, even with `SP_ARCH_NATIVE` on an FMA host. The exact cancellation
+of duplicated rows described above depends on it.
+
+Disassembling a Windows release module (`dumpbin /disasm` with a linker map)
+showed YMM and VEX-encoded instructions only in functions from
+`dense_kernels_avx2.cpp`, apart from Microsoft's STL vector algorithms
+(`msvcprt:vector_algorithms.obj`, called from `sparse_lu.cpp` and
+`spsolve.cpp` before this kernel existed), which check the CPU themselves.
 
 ## Threading behavior
 
@@ -290,6 +361,10 @@ when their backward residual is small.
   span, so a row that is dense in a prefix but has one far column (for
   example, a bordered system ordered border-last) has a wide span: it stays
   sparse, or its dense tail covers that whole span;
+- the `avx2-fma` kernel does not fuse the LU flush (`running` order): scalar
+  pivot-tail materialization applies the same terms outside the kernel table
+  and must round identically, so dense LU gains only from the wider vectors
+  (see "Dense kernels");
 - there is no out-of-core mode or symbolic-factor reuse across matrices with
   the same pattern.
 

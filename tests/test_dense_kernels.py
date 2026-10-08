@@ -14,10 +14,22 @@ from tests.test_blocked_lu import dense_pivoted, sparse_to_dense
 from tests.test_supernodal_ldlt import overlapping_cliques
 
 
+AVX2_AVAILABLE = "avx2-fma" in available_dense_kernels()
+
+
 def spd_block(size):
     dense = 0.125 * np.ones((size, size))
     dense[np.diag_indices(size)] = 4.0
     return csc_array(dense)
+
+
+def random_spd_block(size, seed=352):
+    # Exactly symmetric with unstructured values; spd_block's repeated values
+    # give products that a fused multiply-add rounds no differently.
+    rng = np.random.default_rng(seed)
+    factor = rng.uniform(-1.0, 1.0, (size, size))
+    gram = factor @ factor.T / size
+    return csc_array((gram + gram.T) / 2 + np.eye(size))
 
 
 def normalized(name):
@@ -69,6 +81,9 @@ class DenseKernelTests(unittest.TestCase):
         self.assertTrue(set(names) <= {"avx2-fma", "sse2", "scalar"})
         if platform.machine().lower() in {"amd64", "x86_64", "x64"}:
             self.assertIn("sse2", names)
+        if "avx2-fma" in names:
+            # The fused kernel is the best one whenever the CPU supports it.
+            self.assertEqual(names[0], "avx2-fma")
         for name in names:
             set_dense_kernel(name.upper())
             self.assertEqual(get_dense_kernel(), name)
@@ -147,6 +162,54 @@ class DenseKernelTests(unittest.TestCase):
                         self.assertGreater(serial.stats["dense_update_flops"], 0)
                     self.assert_same_factors(serial, parallel)
                     self.assert_close_factors(serial, reference)
+
+    @unittest.skipUnless(AVX2_AVAILABLE, "avx2-fma kernel not available on this build or CPU")
+    def test_avx2_kernel_matches_scalar(self):
+        cases = (
+            # An odd size leaves row and column remainders for the 4x8
+            # microkernel edges in the LU flush tiles.
+            ("dense-225", dense_pivoted(225), "row-hybrid"),
+            ("spd-352", random_spd_block(352), "symmetric-supernodal-ldlt"),
+        )
+        for label, matrix, engine in cases:
+            set_dense_kernel("scalar")
+            reference = splu(matrix, backend="native", permc_spec="NATURAL", num_threads=1)
+            set_dense_kernel("avx2-fma")
+            factors = []
+            for threads in (1, 4):
+                with self.subTest(case=label, threads=threads):
+                    factor = splu(matrix, backend="native", permc_spec="NATURAL",
+                                  num_threads=threads)
+                    self.assertEqual(factor.stats["dense_kernel"], "avx2-fma")
+                    self.assertEqual(factor.stats["numeric_engine"], engine)
+                    self.check_factor(matrix, factor, 3e-12)
+                    if engine == "row-hybrid":
+                        self.assertGreater(factor.stats["lu_dense_panels"], 0)
+                        # The LU flush (running order) does not fuse: it must
+                        # match the scalar pivot-tail materialization, so its
+                        # factors equal the scalar kernel's bit for bit.
+                        self.assert_same_factors(factor, reference)
+                    else:
+                        self.assertGreater(factor.stats["dense_update_flops"], 0)
+                        self.assert_close_factors(factor, reference)
+                    factors.append(factor)
+            with self.subTest(case=label, check="threads"):
+                self.assert_same_factors(factors[0], factors[1])
+            if engine != "row-hybrid":
+                with self.subTest(case=label, check="fused"):
+                    # The LDL.T update rounds once per term, so some last bits
+                    # differ, which shows that the fused kernel actually ran.
+                    self.assertFalse(np.array_equal(factors[0].L.data, reference.L.data)
+                                     and np.array_equal(factors[0].U.data, reference.U.data))
+        # A duplicated dense row cancels exactly whichever path (flush or
+        # pivot-tail materialization) applies each panel term.
+        duplicated = dense_pivoted(193).toarray()
+        duplicated[150, :] = duplicated[149, :]
+        for threads in (1, 4):
+            with self.subTest(case="duplicated-row", threads=threads):
+                with self.assertRaisesRegex(np.linalg.LinAlgError, "singular"):
+                    splu(csc_array(duplicated), backend="native", permc_spec="NATURAL",
+                         num_threads=threads)
 
     def test_every_kernel_reports_nonfinite_updates(self):
         n = 1030

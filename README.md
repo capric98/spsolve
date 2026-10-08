@@ -20,8 +20,9 @@ pip install -U git+https://github.com/capric98/spsolve
 
 The build needs a C++20 compiler. OpenMP is detected automatically; without it,
 triangular kernels fall back to serial while LU still uses `std::thread`.
-Wheels and ordinary builds target baseline x64 CPUs; use
-`-DSP_ARCH_NATIVE=ON` only for a machine-local build.
+Wheels and ordinary builds target baseline x64 CPUs; AVX2+FMA dense kernels
+are selected at runtime when the CPU supports them; use `-DSP_ARCH_NATIVE=ON`
+only for a machine-local build.
 
 ## General sparse LU
 
@@ -98,6 +99,12 @@ python -m unittest discover -v -s tests -t .
 python benchmarks/factorization.py --quick
 python benchmarks/factorization.py --threads 8 --gate
 ```
+
+Set `SPSOLVE_FORCE_KERNEL` (`auto`, `avx2`/`avx2-fma`, `sse2`, or `scalar`) to
+run the native factorizations on a specific dense kernel, for example
+`SPSOLVE_FORCE_KERNEL=sse2` to test the baseline kernel on an AVX2 machine or
+to reproduce factors across machines. Build with
+`-Ccmake.define.SP_ENABLE_AVX2=OFF` to omit the AVX2 kernel entirely.
 
 The project is BSD-licensed. NumPy, SciPy, nanobind, CMake, the platform C++
 runtime, and optional OpenMP are the runtime/build foundations. BSD-licensed
