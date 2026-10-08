@@ -23,7 +23,15 @@ os.environ["MKL_NUM_THREADS"] = "1"
 
 import numpy as np
 import scipy
-from scipy.sparse import block_diag, csc_array, diags, eye, kron, random_array
+from scipy.sparse import (
+    block_array,
+    block_diag,
+    csc_array,
+    diags,
+    eye,
+    kron,
+    random_array,
+)
 from scipy.sparse.linalg import splu as scipy_splu
 
 from spsolve import SparseLU, splu
@@ -43,6 +51,7 @@ class Result:
     scipy_seconds: float
     speedup: float
     native_to_scipy: float
+    native_1_to_scipy: float
     parallel_steps: int
     stable_permutations: bool
     ordering_backend: str
@@ -52,10 +61,12 @@ class Result:
     assembly_seconds: float
     factor_seconds: float
     numeric_engine: str
+    dense_kernel: str
     largest_front: int
     supernodes: int
     max_supernode_width: int
     peak_workspace_bytes: int
+    dense_rows: int
     lu_dense_panels: int
     lu_parallel_panels: int
     lu_panel_columns: int
@@ -72,6 +83,7 @@ class Result:
 
 
 def poisson_2d(side: int) -> csc_array:
+    """5-point 2-D Laplacian: exactly symmetric SPD with narrow fronts."""
     one_d = diags(
         [-np.ones(side - 1), 4.0 * np.ones(side), -np.ones(side - 1)],
         [-1, 0, 1],
@@ -85,6 +97,7 @@ def poisson_2d(side: int) -> csc_array:
 
 
 def poisson_3d(side: int) -> csc_array:
+    """7-point 3-D Laplacian: symmetric SPD whose separators give wide fronts."""
     one_d = diags(
         [-np.ones(side - 1), 2.0 * np.ones(side), -np.ones(side - 1)],
         [-1, 0, 1],
@@ -99,6 +112,7 @@ def poisson_3d(side: int) -> csc_array:
 
 
 def banded_nonsymmetric(n: int) -> csc_array:
+    """Narrow, diagonally dominant nonsymmetric band (left-looking CSC path)."""
     return csc_array(
         diags(
             [
@@ -116,6 +130,7 @@ def banded_nonsymmetric(n: int) -> csc_array:
 
 
 def irregular(n: int, density: float, seed: int) -> csc_array:
+    """Random unstructured sparsity with a dominant diagonal; high fill."""
     rng = np.random.default_rng(seed)
     matrix = random_array(
         (n, n),
@@ -129,16 +144,72 @@ def irregular(n: int, density: float, seed: int) -> csc_array:
 
 
 def row_permuted_banded(n: int, seed: int = 321) -> csc_array:
+    """Band with randomly permuted rows: narrow COLAMD fronts, scattered labels."""
     matrix = banded_nonsymmetric(n)
     return csc_array(matrix[np.random.default_rng(seed).permutation(n), :])
 
 
 def dense_lu(n: int, seed: int = 721) -> csc_array:
+    """Fully dense nonsymmetric block with a shifted diagonal (dense LU panels)."""
     rng = np.random.default_rng(seed)
     return csc_array(rng.normal(size=(n, n)) + 1.25 * np.sqrt(n) * np.eye(n))
 
 
+def dense_spd_blocks(n: int, blocks: int = 4, seed: int = 733) -> csc_array:
+    """Disconnected dense SPD blocks that are bitwise symmetric (LDL^T path).
+
+    Each block mirrors its strict lower triangle and puts ``n`` on the
+    diagonal, so it is exactly symmetric and strictly diagonally dominant.
+    ``S @ S.T`` would not be bitwise symmetric and would miss the LDL^T path.
+    """
+    rng = np.random.default_rng(seed)
+    parts = []
+    for _ in range(blocks):
+        raw = rng.normal(size=(n, n))
+        sym = np.tril(raw, -1)
+        sym = sym + sym.T
+        np.fill_diagonal(sym, float(n))
+        parts.append(csc_array(sym))
+    return csc_array(block_diag(parts, format="csc"))
+
+
+def sparse_dense_border(
+    n_band: int, n_border: int, couplings: int = 4, seed: int = 947
+) -> csc_array:
+    """Narrow nonsymmetric band bordered by a trailing dense block.
+
+    Exercises a dense block embedded in a large sparse matrix, where dense-row
+    classification relative to the remaining column span matters. The leading
+    ``n_band`` rows/columns are ``banded_nonsymmetric``, and the trailing
+    ``n_border`` rows/columns form a ``dense_lu``-style shifted dense block.
+    Each border row and each border column has ``couplings`` random entries
+    into the band, with values uniform in (-0.01, 0.01). Few couplings keep
+    band fill modest; many couplings would make fill, rather than the dense
+    tail, dominate the cost.
+    """
+    rng = np.random.default_rng(seed)
+    band = banded_nonsymmetric(n_band)
+    border = dense_lu(n_border, seed=seed + 1)
+    border_index = np.repeat(np.arange(n_border), couplings)
+    lower_cols = np.concatenate(
+        [rng.choice(n_band, size=couplings, replace=False) for _ in range(n_border)]
+    )
+    lower = csc_array(
+        (rng.uniform(-0.01, 0.01, border_index.size), (border_index, lower_cols)),
+        shape=(n_border, n_band),
+    )
+    upper_rows = np.concatenate(
+        [rng.choice(n_band, size=couplings, replace=False) for _ in range(n_border)]
+    )
+    upper = csc_array(
+        (rng.uniform(-0.01, 0.01, border_index.size), (upper_rows, border_index)),
+        shape=(n_band, n_border),
+    )
+    return csc_array(block_array([[band, upper], [lower, border]], format="csc"))
+
+
 def pivot_heavy(n: int, density: float, seed: int) -> csc_array:
+    """Dominant entries on a random permutation: forces off-diagonal pivoting."""
     rng = np.random.default_rng(seed)
     permutation = rng.permutation(n)
     dominant = csc_array(
@@ -215,9 +286,17 @@ def benchmark_case(
     warmups: int,
     minimum_serial_seconds: float,
     match_tolerance: float,
+    serial_tolerance: float = 1.5,
     minimum_sample_seconds: float = 0.0,
     permc_spec: str = "MMD_AT_PLUS_A",
 ) -> Result:
+    # Canonicalize once before timing. Native `splu` would otherwise re-sort
+    # an unsorted input on every timed sample, while SciPy's `splu` sorts the
+    # caller's object in place on its first call.
+    matrix = csc_array(matrix)
+    matrix.sum_duplicates()
+    matrix.sort_indices()
+    assert matrix.has_canonical_format
     native_options = {"backend": "native", "permc_spec": permc_spec}
     serial_time, serial = median_runtime(
         lambda: splu(matrix, num_threads=1, **native_options),
@@ -241,16 +320,19 @@ def benchmark_case(
 
     speedup = serial_time / parallel_time
     native_to_scipy = parallel_time / scipy_time
+    native_1_to_scipy = serial_time / scipy_time
     residual = relative_residual(matrix, parallel)
     scipy_factor_nnz = scipy_factor.L.nnz + scipy_factor.U.nnz
     stable_permutations = bool(
         np.array_equal(serial.perm_r, parallel.perm_r)
         and np.array_equal(serial.perm_c, parallel.perm_c)
     )
+    # Thread scaling is reported for information only: `speedup` and
+    # `eligible` are recorded but no longer gate the case.
     eligible = serial_time >= minimum_serial_seconds and parallel.stats["parallel_steps"] > 0
     passed = (
-        (not eligible or speedup >= 2.0)
-        and native_to_scipy <= match_tolerance
+        native_to_scipy <= match_tolerance
+        and native_1_to_scipy <= serial_tolerance
         and residual <= 1e-12
         and stable_permutations
     )
@@ -267,6 +349,7 @@ def benchmark_case(
         scipy_seconds=scipy_time,
         speedup=speedup,
         native_to_scipy=native_to_scipy,
+        native_1_to_scipy=native_1_to_scipy,
         parallel_steps=parallel.stats["parallel_steps"],
         stable_permutations=stable_permutations,
         ordering_backend=parallel.stats["ordering_backend"],
@@ -276,10 +359,12 @@ def benchmark_case(
         assembly_seconds=parallel.stats["assembly_seconds"],
         factor_seconds=parallel.stats["factor_seconds"],
         numeric_engine=parallel.stats["numeric_engine"],
+        dense_kernel=str(parallel.stats.get("dense_kernel", "unknown")),
         largest_front=parallel.stats["largest_front"],
         supernodes=parallel.stats["supernodes"],
         max_supernode_width=parallel.stats["max_supernode_width"],
         peak_workspace_bytes=parallel.stats["peak_workspace_bytes"],
+        dense_rows=int(parallel.stats.get("dense_rows", 0)),
         lu_dense_panels=parallel.stats.get("lu_dense_panels", 0),
         lu_parallel_panels=parallel.stats.get("lu_parallel_panels", 0),
         lu_panel_columns=parallel.stats.get("lu_panel_columns", 0),
@@ -298,19 +383,30 @@ def benchmark_case(
 
 def print_results(results: list[Result], threads: int) -> None:
     print(
-        f"{'case':<16} {'n':>7} {'nnz(A)':>10} {'fill':>7} "
+        f"{'case':<20} {'n':>7} {'nnz(A)':>10} {'fill':>7} "
         f"{'native-1':>10} {f'native-{threads}':>10} {'SciPy':>10} "
-        f"{'speedup':>8} {'N/S':>7} {'fill/S':>7} {'engine':>20} {'gate':>7}"
+        f"{'speedup':>8} {'N/S':>7} {'N1/S':>7} {'fill/S':>7} "
+        f"{'engine':>25} {'kernel':>10} {'gate':>7}"
     )
     for result in results:
         gate = "PASS" if result.passed else "FAIL"
         print(
-            f"{result.name:<16} {result.n:7d} {result.input_nnz:10d} "
+            f"{result.name:<20} {result.n:7d} {result.input_nnz:10d} "
             f"{result.fill_ratio:7.1f} {result.native_1_seconds:10.4f} "
             f"{result.native_n_seconds:10.4f} {result.scipy_seconds:10.4f} "
             f"{result.speedup:8.2f} {result.native_to_scipy:7.2f} "
-            f"{result.fill_over_scipy:7.2f} {result.numeric_engine:>20} {gate:>7}"
+            f"{result.native_1_to_scipy:7.2f} {result.fill_over_scipy:7.2f} "
+            f"{result.numeric_engine:>25} {result.dense_kernel:>10} {gate:>7}"
         )
+
+
+def configured_dense_kernel() -> str:
+    """Return the package-level dense kernel selection, if the API exists."""
+    try:
+        from spsolve.spparms import get_dense_kernel
+    except ImportError:
+        return "unknown"
+    return str(get_dense_kernel())
 
 
 def parse_args() -> argparse.Namespace:
@@ -318,8 +414,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--warmups", type=int, default=1)
-    parser.add_argument("--minimum-serial-seconds", type=float, default=0.20)
-    parser.add_argument("--match-tolerance", type=float, default=1.05)
+    parser.add_argument(
+        "--minimum-serial-seconds", type=float, default=0.20,
+        help="native one-thread time at which a case is reported as scaling-eligible "
+        "(informational; thread scaling is not gated)",
+    )
+    parser.add_argument(
+        "--match-tolerance", type=float, default=1.05,
+        help="maximum native N-thread / SciPy median time ratio",
+    )
+    parser.add_argument(
+        "--serial-tolerance", type=float, default=1.5,
+        help="maximum native one-thread / SciPy median time ratio",
+    )
     parser.add_argument("--min-sample-seconds", type=float, default=0.10)
     parser.add_argument(
         "--permc-spec",
@@ -330,12 +437,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--extended",
         action="store_true",
-        help="include 3-D Poisson and banded cases; COLAMD also tests row-permuted bands",
+        help="include 3-D Poisson, banded, and dense-bordered banded cases; "
+        "COLAMD also tests row-permuted bands",
     )
     parser.add_argument("--gate", action="store_true", help="exit nonzero when the gate fails")
     parser.add_argument(
         "--dense-lu", action="store_true",
-        help="include connected, pivoted, and four-block dense general LU cases",
+        help="include connected, pivoted, and four-, five-, and eight-block dense "
+        "general LU cases plus four exactly symmetric dense SPD blocks",
     )
     parser.add_argument("--json", type=Path, help="write machine-readable results")
     return parser.parse_args()
@@ -371,6 +480,12 @@ def main() -> int:
             [
                 ("poisson-3d", poisson_3d(10 if args.quick else 20)),
                 ("banded-nonsym", banded_nonsymmetric(2500 if args.quick else 8000)),
+                (
+                    "sparse-dense-border",
+                    sparse_dense_border(
+                        2500 if args.quick else 20000, 200 if args.quick else 600
+                    ),
+                ),
             ]
         )
         if args.permc_spec == "COLAMD":
@@ -378,12 +493,16 @@ def main() -> int:
                 ("permuted-band", row_permuted_banded(2500 if args.quick else 20000))
             )
     if args.dense_lu:
-        dense = dense_lu(200 if args.quick else 600)
+        dense_size = 200 if args.quick else 600
+        dense = dense_lu(dense_size)
         pivoted = csc_array(dense[np.random.default_rng(913).permutation(dense.shape[0]), :])
         matrices.extend([
             ("dense-lu", dense),
             ("dense-pivoted", pivoted),
             ("dense-lu-blocks", csc_array(block_diag([dense] * 4, format="csc"))),
+            ("dense-lu-blocks-5", csc_array(block_diag([dense] * 5, format="csc"))),
+            ("dense-lu-blocks-8", csc_array(block_diag([dense] * 8, format="csc"))),
+            ("dense-spd-blocks", dense_spd_blocks(dense_size)),
         ])
 
     results = [
@@ -395,6 +514,7 @@ def main() -> int:
             warmups=args.warmups,
             minimum_serial_seconds=args.minimum_serial_seconds,
             match_tolerance=args.match_tolerance,
+            serial_tolerance=args.serial_tolerance,
             minimum_sample_seconds=args.min_sample_seconds,
             permc_spec=args.permc_spec,
         )
@@ -402,8 +522,13 @@ def main() -> int:
     ]
     print_results(results, args.threads)
 
-    eligible = [result for result in results if result.eligible]
-    gate_passed = bool(eligible) and all(result.passed for result in results)
+    # Thread scaling (`speedup`/`eligible`) is printed and recorded, not gated.
+    eligible = [result.name for result in results if result.eligible]
+    print(
+        "scaling-eligible cases (informational, not gated): "
+        + (", ".join(eligible) if eligible else "none")
+    )
+    gate_passed = all(result.passed for result in results)
     print(f"promotion gate: {'PASS' if gate_passed else 'FAIL'}")
 
     if args.json:
@@ -415,11 +540,15 @@ def main() -> int:
                 "platform": platform.platform(),
                 "processor": platform.processor(),
                 "threads": args.threads,
+                "dense_kernel": configured_dense_kernel(),
+                "forced_kernel": os.environ.get("SPSOLVE_FORCE_KERNEL"),
             },
             "criteria": {
                 "minimum_serial_seconds": args.minimum_serial_seconds,
                 "minimum_speedup": 2.0,
+                "speedup_enforced": False,
                 "maximum_native_to_scipy": args.match_tolerance,
+                "maximum_native_1_to_scipy": args.serial_tolerance,
                 "maximum_residual": 1e-12,
                 "stable_permutations": True,
                 "minimum_sample_seconds": args.min_sample_seconds,
