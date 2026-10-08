@@ -62,7 +62,13 @@ systems.
      is bounded, and restart preserves the requested column permutation and
      equilibration. Both engines perform threshold partial pivoting.
    - Wider or fill-heavy patterns use the row-hybrid LU. Sorted sparse rows
-     convert to dense tails when their remaining front is at least 25% dense.
+     with at least 64 entries convert to dense tails when at least 25% of
+     their own remaining span, from first to last remaining nonzero column,
+     is nonzero. The tail is allocated for that span with its end rounded up
+     to 64 columns, and grows on demand; columns outside it are exact zeros.
+     Later blocks of a block-diagonal matrix therefore carry no leading zero
+     columns, and pivot candidate scans skip dense rows whose storage
+     excludes the pivot column.
      Sparse rows receive eager updates and retain their fill adjacency. When
      at least 32 active rows are dense with at least 128 columns remaining,
      dense rows use panels of up to 32 pivot columns. A persistent `std::thread`
@@ -215,7 +221,12 @@ when their backward residual is small.
 - no complex native factors yet (the SciPy backend handles them);
 - ordering and pivot selection are single-threaded;
 - general LU retains serial pivot selection and pivot-tail materialization;
-  dense-row panels still retain full dense tails in the row engine;
+  dense-row panels still retain each dense row's span-wide tail in the row
+  engine;
+- dense-row classification measures density over a row's whole remaining
+  span, so a row that is dense in a prefix but has one far column (for
+  example, a bordered system ordered border-last) has a wide span: it stays
+  sparse, or its dense tail covers that whole span;
 - there is no out-of-core mode or symbolic-factor reuse across matrices with
   the same pattern.
 

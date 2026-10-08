@@ -30,6 +30,7 @@ public:
     void begin(index_t first, index_t last, index_t n, int threads) {
         first_ = first;
         last_ = last;
+        n_ = n;
         if (pending_mark_.empty()) {
             pending_mark_.assign(static_cast<std::size_t>(n), -1);
             conversion_mark_.assign(static_cast<std::size_t>(n), -1);
@@ -81,6 +82,9 @@ public:
             const auto& source = sources[static_cast<std::size_t>(lower->col)];
             auto entry = std::lower_bound(source.begin(), source.end(), last_,
                 [](const auto& value, index_t col) { return value.col < col; });
+            if (entry == source.end()) continue;
+            // The row starts at or before pivot_col < last_; extend its end.
+            row.grow_dense(source.back().col + 1, n_);
             for (; entry != source.end(); ++entry) {
                 double& value = row.dense[static_cast<std::size_t>(entry->col - row.dense_offset)];
                 value -= lower->value * entry->value;
@@ -121,6 +125,12 @@ public:
         std::sort(columns_.begin(), columns_.end());
         for (std::size_t col = 0; col < columns_.size(); ++col) {
             column_position_[static_cast<std::size_t>(columns_[col])] = static_cast<index_t>(col);
+        }
+        // Every target was a candidate inside this panel, so its storage
+        // starts before last_ <= columns_.front(). Extend only the ends, and
+        // do so serially: resizing invalidates storage used by the tiles.
+        for (index_t row : targets_) {
+            rows[static_cast<std::size_t>(row)].grow_dense(columns_.back() + 1, n_);
         }
 
         const std::size_t rank = static_cast<std::size_t>(last_ - first_);
@@ -260,7 +270,7 @@ private:
         workspace_bytes_ = std::max(workspace_bytes_, bytes);
     }
 
-    index_t first_ = 0, last_ = 0;
+    index_t first_ = 0, last_ = 0, n_ = 0;
     index_t flushes_ = 0, parallel_flushes_ = 0, maximum_columns_ = 0;
     std::uint64_t update_flops_ = 0, workspace_bytes_ = 0;
     std::vector<index_t> pending_mark_, conversion_mark_, column_position_;
