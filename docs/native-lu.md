@@ -121,31 +121,89 @@ change about 1e-16) and did not increase the backward error
 `max|P^T S A S P - L D L^T|` (3-D Poisson of side 20: 1.44e-15 to 1.22e-15
 with `MMD_AT_PLUS_A`, 1.89e-15 unchanged with `COLAMD`).
 
-The diagonal block is factored in panels of at most 32 columns. The below-panel
-solve applies `inv(L_panel.T)` and `inv(D_panel)` once, followed by a tiled
-rank-k update (k at most 32) of the remaining lower triangle and rectangular
-tail. Contributor and trailing updates use the same tile driver: independent
-16-by-16 output tiles call the shared dense kernels described below and run on
-the persistent worker team when the update has at least two threads, at least
-2 MFLOP (2^21 counted operations, as in `dense_update_flops`), and at least
-two tiles per thread, counting at most eight threads and including tiles that
-lie entirely above the diagonal. Otherwise the calling thread runs the tiles
-in order. A dispatch costs about 20 microseconds at four to eight threads and
-2 MFLOP is about 35 microseconds of `avx2-fma` tile work, so smaller phases
-ran slower in parallel. Capping the counted threads keeps a team larger than
-eight from running serially an update that eight threads would share; its
-extra workers only cost the dispatch. The rule is an efficiency heuristic that
-depends only on the update's size and the thread count, and it decides only
-which thread computes a tile, never the tile's arithmetic. A tile whose output
-rows and columns are both contiguous node positions (always true for trailing
-updates) is updated in place in the node rectangle; a tile that straddles the
-diagonal writes only its lower entries, and tiles entirely above it are
-skipped. An irregular intersection tile is gathered into a 16-by-16 scratch
-block, updated, and scattered back. Because the output columns are a prefix of
-the ascending output rows, a tile that straddles the diagonal is a diagonal
-tile, and only its lower triangle is gathered, computed, and scattered. Tiny
-intersections (fewer than 256 output rows times columns) retain sparse outer
-products.
+A contributor update runs as independent 16-by-16 output tiles that call the
+shared dense kernels described below. A tile whose output rows and columns are
+both contiguous node positions is updated in place in the node rectangle; a
+tile that straddles the diagonal writes only its lower entries, and tiles
+entirely above it are skipped. An irregular intersection tile is gathered into
+a 16-by-16 scratch block, updated, and scattered back. Because the output
+columns are a prefix of the ascending output rows, a tile that straddles the
+diagonal is a diagonal tile, and only its lower triangle is gathered,
+computed, and scattered. Tiny intersections (fewer than 256 output rows times
+columns) retain sparse outer products.
+
+The node's columns are then factored in panels `P = [begin, end)` of at most
+32 columns. For each panel:
+
+1. The diagonal block is factored right-looking. Each pivot must be positive
+   and finite. Column `p` is divided by its pivot and copied to a contiguous
+   buffer, so its rank-1 update of each later block row `i` is an AXPY over
+   `j`, `f[i][j] -= w * l[j][p]` with `w = l[i][p] * d[p]`: the same
+   per-element sequence as the scalar loop it replaced, so an entry that
+   cancels exactly still stores an exact zero.
+2. Rows below the block are solved in AXPY form, `L[i,P] = F[i,P]
+   inv(L_PP.T) inv(D_P)`. The panel forms `S[k][p] = d[k] * l[p][k]` once
+   (only when rows below the block exist); each row then runs, for `k`
+   ascending, `x[k] /= d[k]` followed by `x[p] -= x[k] * S[k][p]` for every
+   `p > k`, contiguous in `p`. Four rows are interleaved to overlap their
+   division chains. Each entry subtracts its terms in ascending `k`, each a
+   rounded product and a rounded subtraction, and then divides by its pivot.
+   Earlier builds formed each term as `(l[i][k] * d[k]) * l[p][k]` inside a
+   dot-product loop; the new association `l[i][k] * (d[k] * l[p][k])`
+   changed LDL^T factors only in the last bits (largest change about 2e-16 of
+   the largest `U` entry, relative Frobenius change about 1e-17) and left the
+   backward error unchanged (3-D Poisson of side 20: 1.89e-15 with `COLAMD`
+   and 1.22e-15 with `MMD_AT_PLUS_A`, Frobenius norms within 0.2%).
+3. The trailing update `F[R,J] -= (L[R,P] D_P) L[J,P].T` covers the remaining
+   node columns `J = [end, width)`, lower part only, and the rows `R` below the
+   block. Rows `[end, width)` are solved first, in order, on the calling
+   thread, because their L entries form the shared right operand
+   `L[J,P].T`, which is packed once. One phase then covers rows
+   `[end, height)` in fixed strips of 16 node rows, claimed bottom-up because
+   lower rows update more columns. A strip solves its own rows at or below
+   `width`, forms `L D` for its rows, and applies one rank-`|P|` kernel call
+   (`sum_then_subtract`) to its rows' entries in columns `[end, min(row,
+   width - 1)]`. A strip reads only its own rows and the shared, read-only
+   pivots, `S`, and right operand, and writes only its own rows, so neither
+   the strip partition (fixed by position) nor the thread that runs a strip
+   can change a result.
+
+A contributor update or a panel's strip phase runs on the persistent worker
+team when it has at least two threads, at least 2 MFLOP (2^21 counted
+operations, as in `dense_update_flops`; a strip phase counts its solves and
+its update), and at least two items per thread (16-by-16 tiles, including
+those entirely above the diagonal, or strips), counting at most eight threads.
+Otherwise the calling thread runs the items in order. A dispatch costs about
+20 microseconds at four to eight threads and 2 MFLOP is about 35 microseconds
+of `avx2-fma` tile work, so smaller phases ran slower in parallel. Capping the
+counted threads keeps a team larger than eight from running serially an
+update that eight threads would share; its extra workers only cost the
+dispatch. The rule is an efficiency heuristic that depends only on the
+update's size and the thread count, and it decides only which thread computes
+an item, never its arithmetic. Strips are 16 rows rather than 32 so that, under
+this rule, panels with 256 to 512 rows below them also run in parallel at
+eight threads; the kernel runs at the same speed on either strip height.
+
+Finiteness is tested where values become final rather than where they are
+produced. Original entries are tested when scattered. Afterwards every
+node-rectangle entry on or below the diagonal ends as a pivot or as an L
+entry: each pivot is tested (positive and finite) before it is used, and each
+panel's L entries are scanned once (`fabs(v) <= DBL_MAX`) after their last
+write, the diagonal block's after its factorization, rows `[end, width)` after
+their serial solve, and each strip's rows after its solve. Dense kernel calls
+report through their flag, which is authoritative: a kernel may stop early, so
+a false flag rejects the attempt at once. This is complete because entries
+combine only through addition, subtraction, multiplication, and division by a
+tested pivot, which keep an Inf or NaN operand non-finite (`Inf*0` and
+`Inf-Inf` are NaN), and because every auxiliary product reaches an entry or a
+flag: a sparse update's `l * d` updates its own diagonal position with the
+nonzero `l`; the diagonal block's `l[i][p] * d[p]` updates the future pivot
+`(i, i)`; `S[k][p]` enters every lower row's `l[i][p]`; and a packed `L D` row
+updates output column 0, which every kernel call computes. A rejected attempt
+publishes nothing and falls back to pivoted LU. Matrices whose denormal pivot
+makes L overflow in the serially solved rows or in strip-solved tail rows are
+rejected by those scans; overflow inside the diagonal block reaches the next
+pivot test first.
 
 For node width `W` and height `R`, predicted internal update terms are
 `W*(W-1)*(3*R-2*W+1)/6`. Only nodes at least 320 columns wide contribute useful
@@ -459,25 +517,35 @@ Workspace diagnostics include the temporary restart snapshot (the requested
 permutation and both scale vectors; the probe's counters and empty factor
 buffers are restored alongside) and discarded CSC buffers on fallback.
 
-For blocked SPD, `parallel_panels` counts actual parallel tile phases (a
-contributor update or a trailing panel update that met the threshold in
+For blocked SPD, `parallel_panels` counts actual parallel phases (a
+contributor update or a panel's strip phase that met the threshold in
 "Blocked SPD panels") and is also included in `parallel_steps`.
-`dense_update_flops` counts two operations
-per executed multiply/subtract term, including small panel and sparse
-intersection work; diagonal weighting, divisions, and operand packing are
-excluded.
+`dense_update_flops` counts two operations per executed multiply/subtract
+term, including the diagonal-block, below-panel solve, and sparse
+intersection work; diagonal weighting (including the panel's `S` and the
+strips' `L D` operands), divisions, and operand packing are excluded.
 `largest_front` is the actual largest filled node height on either SPD path;
 `spd_panel_entries` is the largest allocated dense node rectangle. A rectangle
 uses less than twice its node's lower-triangular CSC entries, and does not
 densify unrelated matrix rows or columns. `peak_workspace_bytes` estimates
 simultaneously live numeric and symbolic vector buffers, including CSC factors,
 row incidence, packed operands, and the node rectangle; thread runtime storage
-is excluded.
+is excluded, including the fixed per-call stack blocks of the panel steps (the
+32-by-32 `S`, a 32-entry column, and each strip's 16-by-32 `L D` operand).
+The estimate sums vector capacities, which grow geometrically, so a change in
+which buffers are resized, and in what order, can move it by a few hundred KB
+either way between builds: removing the trailing-update operand buffers
+lowered it on most SPD cases but raised 3-D Poisson with `MMD_AT_PLUS_A` by
+about 53 KB.
 
 `spd_source_seconds` measures prior-node updates including intersection lookup
-and packing; `spd_panel_seconds` measures node factorization and trailing
-updates. `spd_pack_seconds` is the dense-buffer packing portion of those two
-times, so it must not be added to them. `failed_spd_seconds` records a discarded
+and packing; `spd_panel_seconds` measures node factorization, below-panel
+solves, and trailing updates. `spd_pack_seconds` is the dense-buffer packing
+portion of those two times, so it must not be added to them: it covers the
+contributor operands and each panel's shared right operand, which are packed
+on the calling thread. Each strip forms its own `L D` operand inside its work
+item, possibly on a worker, so that formation is counted only in
+`spd_panel_seconds`. `failed_spd_seconds` records a discarded
 SPD attempt, and is included in the subsequent LU numeric/factor time. Peak
 workspace also includes that attempt's maximum live buffers.
 
@@ -494,7 +562,10 @@ build without OpenMP remains functional.
 
 - row and column infinity-norm equilibration;
 - threshold partial pivoting in every active column;
-- positive-pivot validation before accepting the SPD specialization;
+- positive-pivot validation before accepting the SPD specialization; the
+  supernodal path tests each pivot and scans each panel's L entries once
+  instead of testing every intermediate, with the completeness argument in
+  "Blocked SPD panels";
 - structural and exact numerical singular detection;
 - rejection of non-finite inputs by default;
 - overflow checks during scaling and row updates (the dense panel path checks
@@ -529,6 +600,15 @@ when their backward residual is small.
   span, so a row that is dense in a prefix but has one far column (for
   example, a bordered system ordered border-last) has a wide span: it stays
   sparse, or its dense tail covers that whole span;
+- supernodal LDL^T keeps serial work around its parallel phases: each panel
+  solves the node's own rows `[end, width)` on the calling thread before its
+  strip phase (for a dense node, that is the whole below-panel solve), in
+  baseline (SSE2) arithmetic outside the kernel table, and prior-node
+  intersection lookup, packing, and sparse outer products are serial (on 3-D
+  Poisson of side 20 with `COLAMD`, the prior-node phase takes about 69 of the
+  82 ms numeric time at eight threads); a panel's rank-32 update also reads
+  and writes the whole trailing block once per panel, which limits its
+  eight-thread scaling on large dense nodes;
 - the `avx2-fma` kernel does not fuse the LU flush (`running` order): the
   scalar U-entry walks of sparse pivot rows (pivot-tail materialization and
   dense-row updates outside panels) apply the same terms outside the kernel

@@ -269,9 +269,16 @@ $$F_{P,P} = L_{P,P} D_P L_{P,P}^T, \qquad
   F_{R',J'} \leftarrow F_{R',J'} - L_{R',P}\, D_P\, L_{J',P}^{\,T}$$
 
 for the remaining node columns $J'$ (lower triangle only) and the tail rows.
-In the code the triangular solve is written entry by entry as
-$f_{ip} \leftarrow (f_{ip} - \sum_{k<p} f_{ik}\, d_k\, f_{pk}) / d_p$, the
-same recurrence as the simplicial kernel restricted to the node.
+The triangular solve is the recurrence
+$l_{ip} = (f_{ip} - \sum_{k<p} l_{ik}\, d_k\, l_{pk}) / d_p$, the same as the
+simplicial kernel restricted to the node. The code evaluates it in AXPY form
+with $s_{kp} = d_k\, l_{pk}$ formed once per panel: for $k$ ascending,
+$l_{ik} = x_k / d_k$, then $x_p \leftarrow x_p - l_{ik}\, s_{kp}$ for all
+$p > k$, so each entry subtracts its terms in ascending $k$, each term
+rounded as $l_{ik} \cdot (d_k\, l_{pk})$. The update of each row $i \in R'$
+depends only on that row, so rows are processed in independent strips; the
+rows of $J'$ are solved first because $L_{J',P}$ is the shared operand of
+the update.
 
 ### Work estimate used for engine selection
 
@@ -426,7 +433,12 @@ one while both are tiny. No condition estimate is computed.
   row-hybrid panel path gives the completeness argument in
   `docs/native-lu.md`), and abort with a non-finite
   error, or a singular error if an exactly singular column is reached before
-  a deferred check, before any factor is published. Pivot growth is bounded
+  a deferred check, before any factor is published. The supernodal $LDL^T$
+  engine tests each pivot and scans each panel's L entries once: every node
+  entry ends as a pivot or an L entry, the arithmetic keeps Inf and NaN
+  non-finite, and each auxiliary product reaches an entry or a kernel flag
+  (argument in `docs/native-lu.md`, "Blocked SPD panels"); a failed test
+  falls back to pivoted LU. Pivot growth is bounded
   only by the usual $2^{n-1}$ worst case of partial pivoting; refinement, not
   pivoting, is the second line of defence against moderate growth.
 

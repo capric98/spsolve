@@ -171,8 +171,11 @@ compiler, allocator, and SciPy build all matter.
 
 These results use `MMD_AT_PLUS_A`. An explicitly requested `COLAMD` permutation
 also passed the three representative cases. The blocked SPD kernel improves
-larger fronts, but still trails SuperLU for some high-fill permutations and
-dense blocks, as the focused comparison below shows.
+larger fronts. It trailed SuperLU on the `COLAMD` 3-D Poisson case and on
+dense SPD blocks until the contributor and panel steps described under
+"Blocked SPD comparison" below; since then, the only case that still fails
+in the full `--extended --dense-lu` runs is the `COLAMD` row-permuted band,
+a general LU case (1.14x).
 
 ### Dense LU panel comparison
 
@@ -346,6 +349,27 @@ from 48.3 to 49.3 MB (`COLAMD`) and from 24.1 to 25.4 MB (`MMD_AT_PLUS_A`).
 Across three full `COLAMD` runs 3-D Poisson took 0.89-1.03x SuperLU time with
 eight threads (1.07x before), so the case now sits just inside the gate;
 general LU cases were unchanged within noise.
+
+The panel step that followed (contiguous AXPY updates in the diagonal block,
+an AXPY-form below-panel solve over four interleaved rows, finiteness scans of
+each panel's L entries instead of per-element tests, and one parallel phase
+per panel over 16-row strips that solve their own tail rows and apply the
+rank-32 update; see [the design notes](native-lu.md#blocked-spd-panels))
+changed LDL^T factors only in the last bits, with unchanged backward error.
+Interleaved runs against the previous build (`avx2-fma`, medians of five
+rounds) measured four dense SPD blocks of size 600 (`MMD_AT_PLUS_A`) at 32.4
+instead of 44.0 ms with one thread and 31.0 instead of 43.1 ms with eight
+(`spd_panel_seconds` 20.1 to 8.4 and 19.1 to 6.3 ms), 3-D Poisson of side 20
+with `COLAMD` at 113.6 instead of 144.2 ms and 105.9 instead of 138.4 ms, and
+with `MMD_AT_PLUS_A` at 33.9 instead of 45.7 ms and 31.5 instead of 43.7 ms.
+A 1,000-wide dense block beside a 20,000-row chain ran in 29.0 instead of
+38.8 ms with eight threads. In the full benchmark the dense SPD blocks took
+0.76x (`MMD_AT_PLUS_A`) and 0.86x (`COLAMD`) SuperLU time with eight threads
+and now pass the gate; 3-D Poisson took 0.17x and 0.78x. Simplicial and
+general LU cases were unchanged within noise in interleaved runs. That
+`MMD_AT_PLUS_A` run passed the gate for every case of
+`--extended --dense-lu`; the `COLAMD` run failed only on the row-permuted
+band (1.14x). One run on one platform does not meet the promotion rule below.
 
 The row-permuted 20,000-row COLAMD band exposes a separate classifier problem.
 Using an unrelated AMD analysis previously reported a front of 11,309 despite

@@ -114,15 +114,16 @@ struct NumericInfo {
 
 struct NonPositiveDefinite {};
 
-// A tile phase runs on the worker team only when its serial time spans
-// several dispatches: FactorExecutor::parallel_for costs about 20 us at 4-8
-// threads, and 2 MFLOP (2^21) is about 35 us of avx2-fma tile work. It also
-// needs two tiles per thread, counting at most eight threads: a small team is
-// then mostly busy, while a larger team does not turn serial an update that
-// eight threads would share (its extra workers only cost the dispatch). This
-// is an efficiency heuristic. The decision only chooses which thread computes
-// a tile: every tile performs the same arithmetic on either path, so it cannot
-// change any result.
+// A parallel phase (contributor tiles or a panel's row strips) runs on the
+// worker team only when its serial time spans several dispatches:
+// FactorExecutor::parallel_for costs about 20 us at 4-8 threads, and 2 MFLOP
+// (2^21) is about 35 us of avx2-fma tile work. It also needs two items per
+// thread, counting at most eight threads: a small team is then mostly busy,
+// while a larger team does not turn serial an update that eight threads would
+// share (its extra workers only cost the dispatch). This is an efficiency
+// heuristic. The decision only chooses which thread computes an item: every
+// item performs the same arithmetic on either path, so it cannot change any
+// result.
 [[nodiscard]] inline bool worth_parallel(std::uint64_t flops, std::size_t tiles, int threads) {
     constexpr int counted_threads = 8;
     return threads > 1 && flops >= (std::uint64_t{1} << 21) &&
@@ -138,9 +139,9 @@ struct NonPositiveDefinite {};
 // Terms are often far smaller than the dominant diagonal they update, so
 // summing first avoids rounding at the entry's scale once per term. A prior
 // supernode's intersection is applied in one call with rank equal to its
-// width; a trailing panel update has rank at most panel_width. The kernel's
-// finiteness flag is authoritative on every tile path, and no path scatters
-// an entry the kernel was not asked to compute.
+// width (a node's own panels use the row strips in factorize instead). The
+// kernel's finiteness flag is authoritative on every tile path, and no path
+// scatters an entry the kernel was not asked to compute.
 template <typename Executor>
 void rank_update(
     std::vector<double>& front, index_t columns,
@@ -246,6 +247,95 @@ void rank_update(
     }
 }
 
+// True when no value is Inf or NaN (fabs(NaN) <= DBL_MAX is false).
+[[nodiscard]] inline bool all_finite(const double* values, index_t count) noexcept {
+    bool finite = true;
+    for (index_t i = 0; i < count; ++i) {
+        finite &= std::fabs(values[i]) <= std::numeric_limits<double>::max();
+    }
+    return finite;
+}
+
+// Factor the panel's diagonal block F[begin:end, begin:end] in place (the
+// lower triangle of the row-major node rectangle, row stride width) and store
+// its pivots in pivots[0, end - begin). Pivot p must be positive and finite;
+// it divides column p, which is then copied to a contiguous buffer so that its
+// rank-1 update of each later row i is an AXPY over j. Every element performs
+// the same scalar sequence as before, value -= weighted * L[j][p] with
+// weighted = L[i][p] * pivot, so an entry that cancels exactly still stores an
+// exact zero. The block's L entries are not tested here; factorize scans them.
+inline void factor_diagonal_block(
+    double* front, index_t width, index_t begin, index_t end, double* pivots
+) {
+    double column[panel_width];
+    for (index_t p = begin; p < end; ++p) {
+        const double pivot = front[p * width + p];
+        if (!(pivot > 0.0) || !std::isfinite(pivot)) throw NonPositiveDefinite{};
+        pivots[p - begin] = pivot;
+        for (index_t i = p + 1; i < end; ++i) {
+            double& value = front[i * width + p];
+            value /= pivot;
+            column[i - begin] = value;
+        }
+        for (index_t i = p + 1; i < end; ++i) {
+            double* const row = front + i * width;
+            const double weighted = row[p] * pivot;
+            for (index_t j = p + 1; j <= i; ++j) row[j] -= weighted * column[j - begin];
+        }
+    }
+}
+
+// Below-panel solve, L[i,P] = F[i,P] inv(L_PP.T) inv(D_P), of count rows
+// x + r * stride (block entries each, holding the updated F[i,P] on entry), in
+// AXPY form. For k ascending, x[k] /= d[k] completes L[i][k], and then
+// x[p] -= x[k] * S[k][p] for every p > k, where weights holds
+// S[k][p] = d[k] * L[p][k] with row stride panel_width. Each entry therefore
+// subtracts its terms in ascending k, each a rounded product and a rounded
+// subtraction, and finally divides by its own pivot. Rows are independent;
+// four are interleaved so that their division and update chains overlap, and
+// the update over p is contiguous in every row. Neither changes any entry's
+// operations.
+inline void solve_panel_rows(
+    double* x, index_t stride, index_t count,
+    const double* pivots, const double* weights, index_t block
+) noexcept {
+    index_t row = 0;
+    for (; row + 4 <= count; row += 4) {
+        double* const x0 = x + row * stride;
+        double* const x1 = x0 + stride;
+        double* const x2 = x1 + stride;
+        double* const x3 = x2 + stride;
+        for (index_t k = 0; k < block; ++k) {
+            const double pivot = pivots[k];
+            const double v0 = x0[k] / pivot;
+            const double v1 = x1[k] / pivot;
+            const double v2 = x2[k] / pivot;
+            const double v3 = x3[k] / pivot;
+            x0[k] = v0;
+            x1[k] = v1;
+            x2[k] = v2;
+            x3[k] = v3;
+            const double* const weight = weights + k * panel_width;
+            for (index_t p = k + 1; p < block; ++p) {
+                const double factor = weight[p];
+                x0[p] -= v0 * factor;
+                x1[p] -= v1 * factor;
+                x2[p] -= v2 * factor;
+                x3[p] -= v3 * factor;
+            }
+        }
+    }
+    for (; row < count; ++row) {
+        double* const x0 = x + row * stride;
+        for (index_t k = 0; k < block; ++k) {
+            const double v0 = x0[k] / pivots[k];
+            x0[k] = v0;
+            const double* const weight = weights + k * panel_width;
+            for (index_t p = k + 1; p < block; ++p) x0[p] -= v0 * weight[p];
+        }
+    }
+}
+
 template <typename Int, typename Executor>
 bool factorize(
     const double* data, const Int* indices, const Int* indptr,
@@ -340,6 +430,8 @@ bool factorize(
                 if (checked_product(active_rows, active_cols) < 256) {
                     // Tiny intersections use sparse outer products, retaining
                     // the same source order without packing structural zeros.
+                    // Every target is a front entry, tested later as a pivot
+                    // or an L entry (see the finiteness note below).
                     for (index_t source = source_first; source < source_last; ++source) {
                         const auto source_begin = std::lower_bound(rows.begin() +
                             col_ptr[static_cast<std::size_t>(source)], rows.begin() +
@@ -349,18 +441,20 @@ bool factorize(
                             const double weighted = values[static_cast<std::size_t>(
                                 offset + source_offsets[static_cast<std::size_t>(j)])] *
                                 diagonal[static_cast<std::size_t>(source)];
-                            if (!std::isfinite(weighted)) throw NonPositiveDefinite{};
                             for (index_t i = j; i < active_rows; ++i) {
                                 double& value = front[static_cast<std::size_t>(
                                     output_rows[static_cast<std::size_t>(i)] * width +
                                     output_columns[static_cast<std::size_t>(j)])];
                                 value -= weighted * values[static_cast<std::size_t>(
                                     offset + source_offsets[static_cast<std::size_t>(i)])];
-                                if (!std::isfinite(value)) throw NonPositiveDefinite{};
-                                info.update_flops += 2;
                             }
                         }
                     }
+                    // Each source column applies active_rows - j terms to
+                    // output column j.
+                    info.update_flops += 2 * static_cast<std::uint64_t>(source_last - source_first) *
+                        static_cast<std::uint64_t>(active_cols * active_rows -
+                            active_cols * (active_cols - 1) / 2);
                     continue;
                 }
                 // Pack the whole contributor once, left = L[R,Q] D_Q as
@@ -384,8 +478,9 @@ bool factorize(
                     for (index_t i = 0; i < active_rows; ++i) {
                         const double value = values[static_cast<std::size_t>(
                             offset + source_offsets[static_cast<std::size_t>(i)])];
+                        // An overflow here reaches the kernel's flag through
+                        // output column 0, which every packed row updates.
                         const double weighted = value * diagonal[static_cast<std::size_t>(source)];
-                        if (!std::isfinite(weighted)) throw NonPositiveDefinite{};
                         left[static_cast<std::size_t>(i * source_width + k)] = weighted;
                         if (i < active_cols) right[static_cast<std::size_t>(k * active_cols + i)] = value;
                     }
@@ -398,67 +493,141 @@ bool factorize(
             }
             info.source_seconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - source_start).count();
+            // Finiteness. Original entries are tested when scattered. After
+            // that no arithmetic result is tested where it is produced;
+            // instead every node-rectangle entry on or below the diagonal ends
+            // as a pivot or as an L entry, and both are tested: each pivot
+            // before it is used (positive and finite), each panel's L
+            // entries by one scan after their last write, before the node is
+            // published. This is complete because:
+            // - entries combine only through +, -, * and division by a tested
+            //   pivot, and these keep an Inf or NaN operand non-finite (Inf*0
+            //   and Inf-Inf are NaN), so a non-finite entry stays non-finite
+            //   until it is tested;
+            // - each auxiliary product reaches an entry: a sparse update's
+            //   weighted = l * d updates its own diagonal position with the
+            //   nonzero l; the diagonal block's weighted = L[i][p] * pivot
+            //   updates the future pivot (i, i) with L[i][p]; S[k][p] =
+            //   d[k] * L[p][k] is formed only when rows below the block exist,
+            //   and enters each such row's L[i][p];
+            // - packed kernel operands (l * d) reach the kernel's flag, which
+            //   is authoritative: every packed row updates output column 0,
+            //   which each kernel call computes, and a false flag (a kernel
+            //   may stop early) rejects the attempt before any later use.
+            // A rejected attempt publishes nothing and falls back to LU.
+            constexpr auto order = dense_kernels::Accumulate::sum_then_subtract;
+            // Trailing work is split into fixed strips of node rows, so the
+            // partition depends on positions only. Rows are independent: a
+            // strip reads only its own rows and the shared, read-only pivots,
+            // S and right operand, and writes only its own rows. Sixteen rows
+            // (four kernel row groups) keep panels with 256-512 rows below
+            // them parallel at eight threads under worth_parallel's two items
+            // per thread.
+            constexpr index_t strip_rows = 16;
+            double* const rect = front.data();
             const auto panel_start = std::chrono::steady_clock::now();
             for (index_t begin = 0; begin < width; begin += panel_width) {
                 const index_t end = std::min(width, begin + panel_width);
-                for (index_t p = begin; p < end; ++p) {
-                    const double pivot = front[static_cast<std::size_t>(p * width + p)];
-                    if (!(pivot > 0.0) || !std::isfinite(pivot)) throw NonPositiveDefinite{};
-                    diagonal[static_cast<std::size_t>(first + p)] = pivot;
-                    for (index_t i = p + 1; i < end; ++i) {
-                        double& value = front[static_cast<std::size_t>(i * width + p)];
-                        value /= pivot;
-                        if (!std::isfinite(value)) throw NonPositiveDefinite{};
-                    }
-                    for (index_t i = p + 1; i < end; ++i) {
-                        const double weighted = front[static_cast<std::size_t>(i * width + p)] * pivot;
-                        for (index_t j = p + 1; j <= i; ++j) {
-                            double& value = front[static_cast<std::size_t>(i * width + j)];
-                            value -= weighted * front[static_cast<std::size_t>(j * width + p)];
-                            if (!std::isfinite(value)) throw NonPositiveDefinite{};
-                            info.update_flops += 2;
+                const index_t block = end - begin;
+                double* const pivots = diagonal.data() + first + begin;
+                factor_diagonal_block(rect, width, begin, end, pivots);
+                for (index_t i = begin + 1; i < end; ++i) {
+                    if (!all_finite(rect + i * width + begin, i - begin)) throw NonPositiveDefinite{};
+                }
+                // Multiply-subtract terms: the diagonal block, then the solve
+                // and trailing update below.
+                std::uint64_t terms = static_cast<std::uint64_t>((block - 1) * block * (block + 1) / 6);
+                if (end < height) {
+                    // L_RP = F_RP * inv(L_PP.T) * inv(D_P), then
+                    // F_RJ -= (L_RP D_P) L_JP.T for the remaining node columns
+                    // J = [end, width), lower part only.
+                    double weights[panel_width * panel_width];
+                    for (index_t k = 0; k < block; ++k) {
+                        for (index_t p = k + 1; p < block; ++p) {
+                            weights[k * panel_width + p] = pivots[k] * rect[(begin + p) * width + begin + k];
                         }
                     }
-                }
-                // L_RP = F_RP * inv(L_PP.T) * inv(D_P). D appears once in
-                // this solve and once in the following L_RP D_P L_RP.T update.
-                for (index_t i = end; i < height; ++i) {
-                    for (index_t p = begin; p < end; ++p) {
-                        double& value = front[static_cast<std::size_t>(i * width + p)];
-                        for (index_t k = begin; k < p; ++k) {
-                            value -= front[static_cast<std::size_t>(i * width + k)] *
-                                diagonal[static_cast<std::size_t>(first + k)] *
-                                front[static_cast<std::size_t>(p * width + k)];
-                            info.update_flops += 2;
+                    // Rows [end, width) form the shared right operand, so
+                    // they are solved and scanned first, in order.
+                    const index_t columns = width - end;
+                    solve_panel_rows(rect + end * width + begin, width, columns, pivots, weights, block);
+                    for (index_t i = end; i < width; ++i) {
+                        if (!all_finite(rect + i * width + begin, block)) throw NonPositiveDefinite{};
+                    }
+                    if (columns > 0) {
+                        const auto pack_start = std::chrono::steady_clock::now();
+                        right.resize(checked_product(block, columns));
+                        workspace();
+                        for (index_t i = end; i < width; ++i) {
+                            for (index_t k = 0; k < block; ++k) {
+                                right[static_cast<std::size_t>(k * columns + i - end)] =
+                                    rect[i * width + begin + k];
+                            }
                         }
-                        value /= diagonal[static_cast<std::size_t>(first + p)];
-                        if (!std::isfinite(value)) throw NonPositiveDefinite{};
+                        info.pack_seconds += std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - pack_start).count();
+                    }
+                    const double* const shared = right.data();
+                    // Each strip solves and scans its rows at or below width
+                    // (rows above it were solved above), packs L_RP D_P, and
+                    // applies the rank-block update to its rows' entries in
+                    // columns [end, min(row, width - 1)].
+                    const auto strips = static_cast<std::size_t>(
+                        (height - end + strip_rows - 1) / strip_rows);
+                    // Strips are claimed bottom-up: lower rows update more
+                    // columns, so the largest items start first.
+                    auto strip = [&](std::size_t index, int) {
+                        const index_t row_first = end +
+                            static_cast<index_t>(strips - 1 - index) * strip_rows;
+                        const index_t row_last = std::min(height, row_first + strip_rows);
+                        const index_t solve_first = std::max(row_first, width);
+                        if (solve_first < row_last) {
+                            solve_panel_rows(rect + solve_first * width + begin, width,
+                                row_last - solve_first, pivots, weights, block);
+                            for (index_t i = solve_first; i < row_last; ++i) {
+                                if (!all_finite(rect + i * width + begin, block)) throw NonPositiveDefinite{};
+                            }
+                        }
+                        if (columns == 0) return;
+                        double packed[strip_rows * panel_width];
+                        for (index_t i = row_first; i < row_last; ++i) {
+                            const double* const x = rect + i * width + begin;
+                            double* const a = packed + (i - row_first) * panel_width;
+                            for (index_t k = 0; k < block; ++k) a[k] = x[k] * pivots[k];
+                        }
+                        double* const c = rect + row_first * width + end;
+                        const auto m = static_cast<std::size_t>(row_last - row_first);
+                        const auto n_columns = static_cast<std::size_t>(columns);
+                        const auto ldc = static_cast<std::size_t>(width);
+                        const auto lda = static_cast<std::size_t>(panel_width);
+                        const auto rank = static_cast<std::size_t>(block);
+                        // Rows at or below width update every column; rows
+                        // above it update only entries with row >= column.
+                        const bool finite = row_first >= width
+                            ? kernels.gemm_sub(c, ldc, packed, lda, shared, n_columns,
+                                  m, n_columns, rank, order)
+                            : kernels.gemm_sub_lower(c, ldc, packed, lda, shared, n_columns,
+                                  m, n_columns, rank, static_cast<std::ptrdiff_t>(row_first - end), order);
+                        if (!finite) throw NonPositiveDefinite{};
+                    };
+                    const index_t tail_rows = height - width;
+                    const auto pair_terms = static_cast<std::uint64_t>(block * (block - 1) / 2);
+                    // Entries with row >= column in rows [end, height) and
+                    // columns [end, width).
+                    const auto entries = static_cast<std::uint64_t>(
+                        columns * (columns + 1) / 2 + tail_rows * columns);
+                    const std::uint64_t strip_terms =
+                        static_cast<std::uint64_t>(tail_rows) * pair_terms +
+                        entries * static_cast<std::uint64_t>(block);
+                    terms += static_cast<std::uint64_t>(columns) * pair_terms + strip_terms;
+                    if (worth_parallel(2 * strip_terms, strips, threads)) {
+                        executor.parallel_for(strips, strip);
+                        ++info.parallel_panels;
+                    } else {
+                        for (std::size_t index = 0; index < strips; ++index) strip(index, 0);
                     }
                 }
-                if (end < width) {
-                    const auto pack_start = std::chrono::steady_clock::now();
-                    output_rows.clear();
-                    output_columns.clear();
-                    for (index_t i = end; i < height; ++i) output_rows.push_back(i);
-                    for (index_t i = end; i < width; ++i) output_columns.push_back(i);
-                    left.resize(checked_product(height - end, panel_width));
-                    right.resize(checked_product(width - end, panel_width));
-                    workspace();
-                    for (index_t i = end; i < height; ++i) {
-                        for (index_t k = begin; k < end; ++k) {
-                            const double value = front[static_cast<std::size_t>(i * width + k)];
-                            const double weighted = value * diagonal[static_cast<std::size_t>(first + k)];
-                            if (!std::isfinite(weighted)) throw NonPositiveDefinite{};
-                            left[static_cast<std::size_t>((i - end) * panel_width + k - begin)] = weighted;
-                            if (i < width) right[static_cast<std::size_t>((k - begin) * (width - end) + i - end)] = value;
-                        }
-                    }
-                    info.pack_seconds += std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - pack_start).count();
-                    // left_stride == panel_width >= rank == end - begin.
-                    rank_update(front, width, output_rows, output_columns, left, panel_width, right,
-                        end - begin, kernels, executor, threads, info);
-                }
+                info.update_flops += 2 * terms;
             }
             info.panel_seconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - panel_start).count();
