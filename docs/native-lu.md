@@ -108,21 +108,44 @@ and filled rows. It scatters original matrix entries, then subtracts prior
 node contributions `L[R,Q] @ D[Q] @ L[J,Q].T`. Sparse row incidence discovers
 contributors without scanning all prior nodes. Contributors are deduplicated
 and visited in factor order; only their actual row and column intersections
-are packed, including noncontiguous and partial overlaps.
+are packed, including noncontiguous and partial overlaps. Each contributor is
+packed once, `L[R,Q] @ D[Q]` as a rows-by-`|Q|` block and `L[J,Q].T` as a
+`|Q|`-by-columns block, and applied in one tiled rank-`|Q|` update: every
+target entry sums all of that node's terms from zero in ascending column order
+and subtracts the sum once (see "Dense kernels"). Each packed block holds at
+most `|Q|` times the contributor's height, the size of that contributor's own
+dense rectangle. Earlier builds packed and subtracted one sum per 32 columns of
+a contributor; the single sum changed LDL^T factors only in the last bits
+(largest entry change about 8e-16 of the largest `U` entry, relative Frobenius
+change about 1e-16) and did not increase the backward error
+`max|P^T S A S P - L D L^T|` (3-D Poisson of side 20: 1.44e-15 to 1.22e-15
+with `MMD_AT_PLUS_A`, 1.89e-15 unchanged with `COLAMD`).
 
 The diagonal block is factored in panels of at most 32 columns. The below-panel
 solve applies `inv(L_panel.T)` and `inv(D_panel)` once, followed by a tiled
-rank-k update of the remaining lower triangle and rectangular tail. Independent
-16-by-16 output tiles share the persistent worker team and call the shared
-dense kernels described below. A tile whose output rows and columns are both
-contiguous node positions (always true for trailing updates) is updated in
-place in the node rectangle; a tile that straddles the diagonal writes only its
-lower entries, and tiles entirely above it are skipped. An irregular
-intersection tile is gathered into a 16-by-16 scratch block, updated, and
-scattered back. Because the output columns are a prefix of the ascending
-output rows, a tile that straddles the diagonal is a diagonal tile, and only
-its lower triangle is gathered, computed, and scattered. Tiny intersections
-retain sparse outer products.
+rank-k update (k at most 32) of the remaining lower triangle and rectangular
+tail. Contributor and trailing updates use the same tile driver: independent
+16-by-16 output tiles call the shared dense kernels described below and run on
+the persistent worker team when the update has at least two threads, at least
+2 MFLOP (2^21 counted operations, as in `dense_update_flops`), and at least
+two tiles per thread, counting at most eight threads and including tiles that
+lie entirely above the diagonal. Otherwise the calling thread runs the tiles
+in order. A dispatch costs about 20 microseconds at four to eight threads and
+2 MFLOP is about 35 microseconds of `avx2-fma` tile work, so smaller phases
+ran slower in parallel. Capping the counted threads keeps a team larger than
+eight from running serially an update that eight threads would share; its
+extra workers only cost the dispatch. The rule is an efficiency heuristic that
+depends only on the update's size and the thread count, and it decides only
+which thread computes a tile, never the tile's arithmetic. A tile whose output
+rows and columns are both contiguous node positions (always true for trailing
+updates) is updated in place in the node rectangle; a tile that straddles the
+diagonal writes only its lower entries, and tiles entirely above it are
+skipped. An irregular intersection tile is gathered into a 16-by-16 scratch
+block, updated, and scattered back. Because the output columns are a prefix of
+the ascending output rows, a tile that straddles the diagonal is a diagonal
+tile, and only its lower triangle is gathered, computed, and scattered. Tiny
+intersections (fewer than 256 output rows times columns) retain sparse outer
+products.
 
 For node width `W` and height `R`, predicted internal update terms are
 `W*(W-1)*(3*R-2*W+1)/6`. Only nodes at least 320 columns wide contribute useful
@@ -436,8 +459,10 @@ Workspace diagnostics include the temporary restart snapshot (the requested
 permutation and both scale vectors; the probe's counters and empty factor
 buffers are restored alongside) and discarded CSC buffers on fallback.
 
-For blocked SPD, `parallel_panels` counts actual parallel tile phases and is
-also included in `parallel_steps`. `dense_update_flops` counts two operations
+For blocked SPD, `parallel_panels` counts actual parallel tile phases (a
+contributor update or a trailing panel update that met the threshold in
+"Blocked SPD panels") and is also included in `parallel_steps`.
+`dense_update_flops` counts two operations
 per executed multiply/subtract term, including small panel and sparse
 intersection work; diagonal weighting, divisions, and operand packing are
 excluded.

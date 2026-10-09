@@ -323,9 +323,29 @@ with a 360,000-double node rectangle (2.88 MB). These are local node workspaces,
 with sparse CSC factors retained throughout.
 
 Unrefined normal/transpose solves and identical one/eight-thread factors were
-checked alongside timing. The COLAMD 3-D and dense-block cases still exceed
-the unchanged 1.05x SuperLU criterion, so these gains do not establish universal
-parity or authorize default promotion. Linux results remain required.
+checked alongside timing. At that time, before the contributor change below,
+the COLAMD 3-D and dense-block cases still exceeded the unchanged 1.05x
+SuperLU criterion, so these gains did not establish universal parity or
+authorize default promotion. Linux results remain required.
+
+Packing each prior supernode once and applying it as one rank-`|Q|` update,
+with a dispatch-aware parallel threshold (at least 2 MFLOP and two tiles per
+thread, counting at most eight threads; see
+[the design notes](native-lu.md#blocked-spd-panels)), cut the
+eight-thread parallel tile phases of 3-D Poisson (side 20) from 579 to 95
+with `COLAMD` and from 124 to 31 with `MMD_AT_PLUS_A`; `dense_update_flops`
+is unchanged. Interleaved runs against the previous build (`avx2-fma`,
+medians of five rounds) measured the `COLAMD` case at 143.6 instead of
+151.9 ms with one thread and 138.4 instead of 147.8 ms with eight (prior-node
+update time 83.9 to 76.2 ms), and the `MMD_AT_PLUS_A` case at 45.4 instead of
+47.9 ms and 43.1 instead of 45.0 ms. Four dense SPD blocks of size 600, whose
+nodes have no contributors, moved within 1.5% either way; their parallel
+trailing updates fell from 60 to 40 because updates below 2 MFLOP now run on
+the calling thread. Wider packed operands raised estimated peak workspace
+from 48.3 to 49.3 MB (`COLAMD`) and from 24.1 to 25.4 MB (`MMD_AT_PLUS_A`).
+Across three full `COLAMD` runs 3-D Poisson took 0.89-1.03x SuperLU time with
+eight threads (1.07x before), so the case now sits just inside the gate;
+general LU cases were unchanged within noise.
 
 The row-permuted 20,000-row COLAMD band exposes a separate classifier problem.
 Using an unrelated AMD analysis previously reported a front of 11,309 despite

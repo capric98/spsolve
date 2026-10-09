@@ -114,20 +114,40 @@ struct NumericInfo {
 
 struct NonPositiveDefinite {};
 
-// Pack only the exact intersection with a prior fundamental supernode.
-// Output tiles are disjoint, and every entry visits packed sources in order:
-// the kernel sums the left * right terms from zero in ascending source order
-// and subtracts that sum from the entry once (Accumulate::sum_then_subtract).
+// A tile phase runs on the worker team only when its serial time spans
+// several dispatches: FactorExecutor::parallel_for costs about 20 us at 4-8
+// threads, and 2 MFLOP (2^21) is about 35 us of avx2-fma tile work. It also
+// needs two tiles per thread, counting at most eight threads: a small team is
+// then mostly busy, while a larger team does not turn serial an update that
+// eight threads would share (its extra workers only cost the dispatch). This
+// is an efficiency heuristic. The decision only chooses which thread computes
+// a tile: every tile performs the same arithmetic on either path, so it cannot
+// change any result.
+[[nodiscard]] inline bool worth_parallel(std::uint64_t flops, std::size_t tiles, int threads) {
+    constexpr int counted_threads = 8;
+    return threads > 1 && flops >= (std::uint64_t{1} << 21) &&
+        tiles >= 2 * static_cast<std::size_t>(std::min(threads, counted_threads));
+}
+
+// C -= left * right over the lower part of the selected front entries.
+// left is [output rows x rank] with row stride left_stride (>= rank), right is
+// [rank x output columns] with row stride equal to the output column count.
+// Output tiles are disjoint, and every entry visits the rank terms in order:
+// the kernel sums the left * right terms from zero in ascending k and
+// subtracts that sum from the entry once (Accumulate::sum_then_subtract).
 // Terms are often far smaller than the dominant diagonal they update, so
-// summing first avoids rounding at the entry's scale once per term. The
-// kernel's finiteness flag is authoritative on every tile path, and no path
-// scatters an entry the kernel was not asked to compute.
+// summing first avoids rounding at the entry's scale once per term. A prior
+// supernode's intersection is applied in one call with rank equal to its
+// width; a trailing panel update has rank at most panel_width. The kernel's
+// finiteness flag is authoritative on every tile path, and no path scatters
+// an entry the kernel was not asked to compute.
 template <typename Executor>
 void rank_update(
     std::vector<double>& front, index_t columns,
     const std::vector<index_t>& output_rows,
     const std::vector<index_t>& output_columns,
-    const std::vector<double>& left, const std::vector<double>& right,
+    const std::vector<double>& left, index_t left_stride,
+    const std::vector<double>& right,
     index_t rank, const dense_kernels::Kernels& kernels,
     Executor& executor, int threads, NumericInfo& info
 ) {
@@ -161,9 +181,9 @@ void rank_update(
         const auto tile_rows = static_cast<std::size_t>(row_last - row_first);
         const auto tile_cols = static_cast<std::size_t>(col_last - col_first);
         const bool below = top >= rightmost;  // Every entry has row >= col.
-        const double* a = left.data() + static_cast<std::size_t>(row_first * panel_width);
+        const double* a = left.data() + static_cast<std::size_t>(row_first * left_stride);
         const double* b = right.data() + static_cast<std::size_t>(col_first);
-        const auto lda = static_cast<std::size_t>(panel_width);
+        const auto lda = static_cast<std::size_t>(left_stride);
         const auto ldb = static_cast<std::size_t>(cols);
         constexpr auto order = dense_kernels::Accumulate::sum_then_subtract;
         // The kernel flag is authoritative on every path. A kernel may stop
@@ -218,7 +238,7 @@ void rank_update(
             }
         }
     };
-    if (threads > 1 && flops >= 262'144 && tiles >= 4) {
+    if (worth_parallel(flops, tiles, threads)) {
         executor.parallel_for(tiles, update_tile);
         ++info.parallel_panels;
     } else {
@@ -343,32 +363,38 @@ bool factorize(
                     }
                     continue;
                 }
-                left.resize(checked_product(active_rows, panel_width));
-                right.resize(checked_product(active_cols, panel_width));
+                // Pack the whole contributor once, left = L[R,Q] D_Q as
+                // [active_rows x source_width] and right = L[J,Q].T as
+                // [source_width x active_cols], and apply it in one rank
+                // source_width update: each entry sums all of this node's
+                // terms in ascending source column and subtracts them once.
+                // Each buffer holds at most source_width times the source
+                // node's height, the size of that node's dense rectangle.
+                const index_t source_width = source_last - source_first;
+                left.resize(checked_product(active_rows, source_width));
+                right.resize(checked_product(source_width, active_cols));
                 workspace();
-                for (index_t begin = source_first; begin < source_last; begin += panel_width) {
-                    const index_t rank = std::min(panel_width, source_last - begin);
-                    const auto pack_start = std::chrono::steady_clock::now();
-                    for (index_t k = 0; k < rank; ++k) {
-                        const index_t source = begin + k;
-                        const auto source_begin = std::lower_bound(rows.begin() +
-                            col_ptr[static_cast<std::size_t>(source)], rows.begin() +
-                            col_ptr[static_cast<std::size_t>(source + 1)], first);
-                        const index_t offset = static_cast<index_t>(source_begin - rows.begin());
-                        for (index_t i = 0; i < active_rows; ++i) {
-                            const double value = values[static_cast<std::size_t>(
-                                offset + source_offsets[static_cast<std::size_t>(i)])];
-                            const double weighted = value * diagonal[static_cast<std::size_t>(source)];
-                            if (!std::isfinite(weighted)) throw NonPositiveDefinite{};
-                            left[static_cast<std::size_t>(i * panel_width + k)] = weighted;
-                            if (i < active_cols) right[static_cast<std::size_t>(k * active_cols + i)] = value;
-                        }
+                const auto pack_start = std::chrono::steady_clock::now();
+                for (index_t k = 0; k < source_width; ++k) {
+                    const index_t source = source_first + k;
+                    const auto source_begin = std::lower_bound(rows.begin() +
+                        col_ptr[static_cast<std::size_t>(source)], rows.begin() +
+                        col_ptr[static_cast<std::size_t>(source + 1)], first);
+                    const index_t offset = static_cast<index_t>(source_begin - rows.begin());
+                    for (index_t i = 0; i < active_rows; ++i) {
+                        const double value = values[static_cast<std::size_t>(
+                            offset + source_offsets[static_cast<std::size_t>(i)])];
+                        const double weighted = value * diagonal[static_cast<std::size_t>(source)];
+                        if (!std::isfinite(weighted)) throw NonPositiveDefinite{};
+                        left[static_cast<std::size_t>(i * source_width + k)] = weighted;
+                        if (i < active_cols) right[static_cast<std::size_t>(k * active_cols + i)] = value;
                     }
-                    info.pack_seconds += std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - pack_start).count();
-                    rank_update(front, width, output_rows, output_columns, left, right, rank,
-                        kernels, executor, threads, info);
                 }
+                info.pack_seconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - pack_start).count();
+                // left_stride == rank == source_width.
+                rank_update(front, width, output_rows, output_columns, left, source_width, right,
+                    source_width, kernels, executor, threads, info);
             }
             info.source_seconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - source_start).count();
@@ -429,8 +455,9 @@ bool factorize(
                     }
                     info.pack_seconds += std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - pack_start).count();
-                    rank_update(front, width, output_rows, output_columns, left, right, end - begin,
-                        kernels, executor, threads, info);
+                    // left_stride == panel_width >= rank == end - begin.
+                    rank_update(front, width, output_rows, output_columns, left, panel_width, right,
+                        end - begin, kernels, executor, threads, info);
                 }
             }
             info.panel_seconds += std::chrono::duration<double>(

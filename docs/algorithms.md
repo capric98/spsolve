@@ -257,7 +257,9 @@ row list (a consequence of the elimination tree: once a column of $Q$ has a
 nonzero in a row of $J$, all its later rows are in $R$), which is what makes
 the operands dense rectangles. Contributors are visited in increasing node
 order, and each output entry accumulates its terms in that order regardless of
-threading.
+threading. Each contributor is one rank-$|Q|$ update: an entry forms
+$s = \sum_{q \in Q} (l_{iq} d_q)\, l_{jq}$ from zero in ascending $q$ and
+subtracts $s$ once (Section 11).
 
 The diagonal block $F_{J,J}$ is then factored without pivoting in panels of
 $w = 32$ columns. For a panel $P \subset J$ with the rows $R'$ below it:
@@ -404,7 +406,8 @@ one while both are tiny. No condition estimate is computed.
   materialization, which apply the same terms through `axpy_sub` or, for
   sparse pivot rows during materialization, in scalar code, so a duplicated
   row still cancels exactly. The supernodal $LDL^T$ rank-$k$
-  update forms $s = (\cdots((0 + a_0 b_0) + a_1 b_1) \cdots) + a_{k-1}
+  update ($k$ is a whole contributor's width, or at most 32 for an in-node
+  panel update) forms $s = (\cdots((0 + a_0 b_0) + a_1 b_1) \cdots) + a_{k-1}
   b_{k-1}$ and then $c \leftarrow c - s$: when $|c|$ is much larger than the
   terms, as on a dominant diagonal, the running form would round at the scale
   of $c$ once per term instead of once in total. The `sse2` and `scalar`
