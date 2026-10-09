@@ -118,8 +118,8 @@ of full rows of `Q`'s finished block and is read in place with row stride
 `|Q|`. Only the right operand `D[Q] @ L[J,Q].T`, from those of the rows that
 are target columns, is packed, as a `|Q|`-by-columns block with
 `right[k][j] = d[k] * l[j][k]`. The rows' target positions may be
-noncontiguous and the overlap partial. The contributor is applied in one
-tiled rank-`|Q|` update: every target entry sums all of that node's terms
+noncontiguous and the overlap partial. Each contributor is applied as one
+rank-`|Q|` update: every target entry sums all of that node's terms
 `l[i][k] * (d[k] * l[j][k])` from zero in ascending column order and subtracts
 the sum once (see "Dense kernels"). The packed operand holds at most `|Q|`
 times the contributor's height, the size of that contributor's block. A
@@ -142,17 +142,85 @@ of the largest `U` entry, relative Frobenius change about 1e-16) and did not
 increase the backward error (3-D Poisson of side 20: 1.44e-15 to 1.22e-15
 with `MMD_AT_PLUS_A`, 1.89e-15 unchanged with `COLAMD`).
 
-A contributor update runs as independent 16-by-16 output tiles that call the
-shared dense kernels described below. A tile whose output rows and columns are
-both contiguous node positions is updated in place in the node rectangle; a
-tile that straddles the diagonal writes only its lower entries, and tiles
-entirely above it are skipped. An irregular intersection tile is gathered into
-a 16-by-16 scratch block, updated, and scattered back. Because the output
-columns are a prefix of the ascending output rows, a tile that straddles the
-diagonal is a diagonal tile, and only its lower triangle is gathered,
-computed, and scattered. Tiny intersections (fewer than 256 output rows times
-columns) retain sparse outer products, also reading the contributor's block in
-place: per source column `k`, `f[i][j] -= (l[j][k] * d[k]) * l[i][k]`.
+All contributions to a node are applied in one fan-in phase. For each
+contributor the node records its target positions (the positions of its rows
+in the node rectangle, ascending; those that are node columns come first, so
+output entry `(i, j)` lies on or below the diagonal exactly when `i >= j`),
+its first and last target rows, and, unless the intersection is tiny, the
+offset of its packed operand. The node rectangle is split into fixed strips of
+16 rows (at multiples of 16, spanning every column), so the partition depends
+on the node's shape only. A strip visits the contributions in ascending node
+order, finds by binary search the output rows of each that fall in the strip,
+and applies them together with the output columns up to the last of those rows
+(later columns are above the diagonal), in parts of at most 16 rows by 128
+columns:
+
+- Tiny intersections (fewer than 256 output rows times columns in the whole
+  contribution) retain sparse outer products, reading the contributor's block
+  in place: per source column `k`, `f[i][j] -= (l[j][k] * d[k]) * l[i][k]`.
+- Otherwise a part whose output columns are contiguous node positions is
+  updated in place in the node rectangle: its rows that are also its columns
+  are then contiguous too and `gemm_sub_lower` updates them with the matching
+  diagonal shift, and its rows below every column are updated by `gemm_sub`
+  when contiguous or by `gemm_sub_rows` through one pointer per row. A part
+  with noncontiguous columns is gathered into the worker's 16-by-128 scratch
+  block (only its entries on or below the diagonal), updated by `gemm_sub` or
+  `gemm_sub_lower`, and scattered back.
+
+The choice between a sparse and a kernel update depends on the whole
+contribution's size, never on its part in a strip, and a kernel element's
+result depends only on its own operands, so every entry receives the same
+operations, in the same contributor order, as with one update per contributor:
+the fan-in left `LDL^T` factors bitwise identical to the previous build (one
+tiled update per contributor) under all three kernels. A node whose fan-in
+meets the parallel threshold below (counting its strips as items) packs every
+operand into one buffer first and runs its strips on the worker team, claimed
+from the bottom up because lower rows reach more columns. Otherwise the
+calling thread applies one whole contribution after another, as one strip of
+all rows, packing each operand just before it is used, so the buffer only needs
+room for the largest one. Strips write disjoint rows and only read the
+finished contributor blocks, the operands, and the target positions, so
+neither the thread that runs a strip nor the order of strips can change a
+result. The packed operand buffer, which the panels' shared right operand also
+uses, and the gather blocks start on 64-byte boundaries: the allocator only
+guarantees 16 bytes, and a shared panel operand that started 16 bytes into a
+cache line made the strip phase of four dense 600-wide SPD blocks about 30%
+slower at one thread (22 instead of 17 million cycles; starts 0 or 32 bytes
+into a line were unaffected, 48 bytes at most 4% slower) in some processes and
+not in others, depending only on where the heap placed the buffer.
+
+The strip shape was chosen by interleaved runs (three rounds of seven
+batched samples, `avx2-fma`, i5-13600K) of builds whose shape was set at run
+time, measuring `spd_source_seconds` at eight threads, for two-dimensional
+tiles (rows by columns, aligned at multiples of the tile shape; a part is at
+most one tile) and for full-width strips (parts of at most 128 columns):
+
+| shape | 3-D Poisson 20, `COLAMD` | 3-D Poisson 20, `MMD_AT_PLUS_A` | random SPD, n=3,000, `MMD_AT_PLUS_A` |
+|---|---:|---:|---:|
+| 2-D tiles 32 x 128 | 20.8-21.2 ms | 5.9-6.0 ms | 8.6-9.0 ms |
+| 2-D tiles 16 x 16 | 27.4 ms | 7.7 ms | 52.8 ms |
+| 2-D tiles 64 x 64 | 26.9 ms | 5.9 ms | 9.6 ms |
+| 2-D tiles 32 x 256 | 21.2 ms | 5.8 ms | 6.7 ms |
+| strips of 32 rows | 19.8 ms | 5.9 ms | 5.0 ms |
+| strips of 24 rows | 20.1 ms | 5.7 ms | 4.4 ms |
+| strips of 16 rows | 20.5 ms | 5.6 ms | 4.5 ms |
+| strips of 64 rows | 35.0 ms | 8.1 ms | 5.4 ms |
+
+The random SPD matrix (a symmetric random pattern of density 0.004 plus a
+dominant diagonal) ends in one dense root node of width 2,158 that receives
+842 rank-1 contributions with irregular columns; with two-dimensional tiles
+every tile repeats its binary searches per contribution and column range, and
+the small parts make many short kernel calls, so full-width strips cost about
+half as much there. Taller tiles or strips leave fewer items and fall below
+the two-items-per-thread rule on more nodes (64-row strips: 26 instead of 55
+parallel phases on 3-D Poisson with `COLAMD`); 16 x 16 tiles multiply the
+per-part overhead. Strips of 16 rows also keep the 350-column root of the
+`overlapping_cliques` test matrix parallel at eight threads (1.76 instead of
+2.03 ms numeric time with 32-row strips). Parts of 256 columns instead of
+128 were slower in five of the six strip comparisons, by up to 20% (the random
+matrix with 16-row strips). At one thread every node takes the whole-node
+path, where the part shape (16 to 64 rows, 128 to 512 columns) moved
+`spd_source_seconds` by at most 4%.
 
 The node's columns are then factored in panels `P = [begin, end)` of at most
 32 columns. For each panel:
@@ -190,21 +258,24 @@ The node's columns are then factored in panels `P = [begin, end)` of at most
    the strip partition (fixed by position) nor the thread that runs a strip
    can change a result.
 
-A contributor update or a panel's strip phase runs on the persistent worker
-team when it has at least two threads, at least 2 MFLOP (2^21 counted
-operations, as in `dense_update_flops`; a strip phase counts its solves and
-its update), and at least two items per thread (16-by-16 tiles, including
-those entirely above the diagonal, or strips), counting at most eight threads.
-Otherwise the calling thread runs the items in order. A dispatch costs about
-20 microseconds at four to eight threads and 2 MFLOP is about 35 microseconds
-of `avx2-fma` tile work, so smaller phases ran slower in parallel. Capping the
-counted threads keeps a team larger than eight from running serially an
-update that eight threads would share; its extra workers only cost the
-dispatch. The rule is an efficiency heuristic that depends only on the
-update's size and the thread count, and it decides only which thread computes
-an item, never its arithmetic. Strips are 16 rows rather than 32 so that, under
-this rule, panels with 256 to 512 rows below them also run in parallel at
-eight threads; the kernel runs at the same speed on either strip height.
+A node's fan-in or a panel's strip phase runs on the persistent worker team
+when it has at least two threads, at least 2 MFLOP (2^21 counted operations,
+as in `dense_update_flops`: a fan-in counts all of its contributions, sparse
+ones included, and a strip phase counts its solves and its update), and at
+least two items per thread (the node's 16-row fan-in strips, or the panel's
+strips), counting at most eight threads. Otherwise the calling thread does
+the work: a panel's strips in order, or a fan-in one whole contribution after
+another (see above). A dispatch costs about 20 microseconds at four to eight
+threads and 2 MFLOP is about 35 microseconds of `avx2-fma` tile work, so
+smaller phases ran slower in parallel. Capping the counted threads keeps a
+team larger than eight from running serially an update that eight threads
+would share; its extra workers only cost the dispatch. The rule is an
+efficiency heuristic that depends only on the update's size and the thread
+count, and it decides only which thread computes which entries, never their
+arithmetic (the fan-in rule was kept unchanged; its measured strip shape is
+discussed above). Panel strips are 16 rows rather than 32 so that, under this
+rule, panels with 256 to 512 rows below them also run in parallel at eight
+threads; the kernel runs at the same speed on either strip height.
 
 Finiteness is tested where values become final rather than where they are
 produced. Original entries are tested when scattered. Afterwards every
@@ -223,9 +294,12 @@ flag: a sparse update's `l * d` updates its own diagonal position with the
 nonzero `l`; the diagonal block's `l[i][p] * d[p]` updates the future pivot
 `(i, i)`; `S[k][p]` enters every lower row's `l[i][p]`; and a contributor's
 packed `d[k] * l[j][k]` enters output entry `(j, j)` with the nonzero
-`l[j][k]` (a zero `l` gives a zero product), a diagonal entry that lies in a
-diagonal tile, which every update computes. The contributor's in-place left
-operand holds only tested L entries. A rejected attempt assembles and
+`l[j][k]` (a zero `l` gives a zero product), a diagonal entry that the
+contribution's part in the strip holding row `j` (or the whole contribution,
+on the calling thread) always includes and a kernel computes. The
+contributor's in-place left operand holds only tested L entries. Every fan-in
+strip runs unless an earlier item has already failed, in which case the
+attempt is rejected anyway. A rejected attempt assembles and
 publishes nothing and falls back to pivoted LU. Matrices whose denormal pivot
 makes L overflow in the serially solved rows or in strip-solved tail rows are
 rejected by those scans; overflow inside the diagonal block reaches the next
@@ -439,11 +513,13 @@ on its tile, path, or thread. Three kernels implement the table:
   diagonal crosses in an aligned 4-by-8 scratch block holding only the
   entries on or below the diagonal, stores back only those entries, and
   tests only those for finiteness. On an i5-13600K, 16-by-64 rank-32 LU flush
-  tiles run at about 52 GFLOPS (`sse2`: 21) and off-diagonal 16-by-16 LDL^T
-  tiles at about 60-64 GFLOPS (`sse2`: 18-22) for ranks 32-320. Diagonal
-  16-by-16 tiles (`gemm_sub_lower`) reach about 35-48 GFLOPS (`sse2`: 16),
-  counting only the entries written, because of the scratch gather and
-  scalar scatter of their diagonal-crossing microtiles.
+  tiles run at about 52 GFLOPS (`sse2`: 21). Measured on the 16-by-16 output
+  tiles that earlier builds used for each LDL^T contributor update (the
+  fan-in now issues parts of up to 16 by 128; no isolated throughput figure
+  was taken for them), off-diagonal tiles ran at about 60-64 GFLOPS (`sse2`:
+  18-22) for ranks 32-320, and diagonal tiles (`gemm_sub_lower`) at about
+  35-48 GFLOPS (`sse2`: 16), counting only the entries written, because of the
+  scratch gather and scalar scatter of their diagonal-crossing microtiles.
 
 `avx2-fma` fuses only the `sum_then_subtract` order: `s = fma(a_k, b_k, s)`
 rounds once per term, followed by the single subtraction `c - s`. Supernodal
@@ -531,6 +607,19 @@ Statistics expose `numeric_engine`, `parallel_steps`, `row_updates`, and
 `largest_front` so users can tell which path ran and whether a problem supplied
 meaningful parallel work.
 
+Partitions elsewhere depend on sizes and positions only. The one exception is
+the supernodal LDL^T fan-in: through `worth_parallel`, the thread count
+decides whether a node's contributions are applied whole on the calling thread
+(parts cut from each contribution's own rows and columns) or in 16-row strips
+on the worker team (parts cut at node-row positions). Its factors stay bitwise
+identical at every thread count only because of the kernel contract in
+`src/dense_kernels.hpp`: an element's result depends only on its own operands,
+never on the tile shape, its position in a tile, or the call path (exercised
+by `test_kernels_agree_across_threads_and_tile_paths` and the thread-count
+comparisons of the factor tests). Any future kernel must keep that contract;
+for example, blocking the rank (`k`) dimension into shape-dependent partial
+sums would make LDL^T factors depend on the thread count.
+
 `lu_dense_panels` counts nonempty dense tail flushes, and
 `lu_parallel_panels` counts flushes that used the worker team; the latter is
 included in `parallel_steps`. `lu_panel_columns` is the maximum packed U-tail
@@ -565,9 +654,13 @@ Workspace diagnostics include the temporary restart snapshot (the requested
 permutation and both scale vectors; the probe's counters and empty factor
 buffers are restored alongside) and discarded CSC buffers on fallback.
 
-For blocked SPD, `parallel_panels` counts actual parallel phases (a
-contributor update or a panel's strip phase that met the threshold in
-"Blocked SPD panels") and is also included in `parallel_steps`.
+For blocked SPD, `parallel_panels` counts actual parallel phases (a node's
+contributor fan-in or a panel's strip phase that met the threshold in
+"Blocked SPD panels") and is also included in `parallel_steps`. A fan-in is
+one phase per node; earlier builds counted one phase per contributor update
+that met the threshold, so the count fell, for example from 98 to 55 on 3-D
+Poisson of side 20 with `COLAMD` and from 31 to 25 with `MMD_AT_PLUS_A` at
+eight threads.
 `dense_update_flops` counts two operations per executed multiply/subtract
 term, including the diagonal-block, below-panel solve, and sparse
 intersection work; diagonal weighting (including the panel's `S`, the
@@ -586,23 +679,47 @@ throughout the numeric phase and assembly. Earlier builds counted one node
 rectangle instead, so the estimate rose with the block storage, for example
 from 49.3 to 62.6 MB on 3-D Poisson of side 20 with `COLAMD`, 25.5 to
 30.3 MB with `MMD_AT_PLUS_A`, and 20.5 to 29.1 MB on four dense SPD blocks of
-size 600. Thread runtime storage is excluded, including the fixed per-call
-stack blocks of the panel steps (the 32-by-32 `S`, a 32-entry column, and each
-strip's 16-by-32 `L D` operand).
+size 600. It also counts the fan-in's contribution list and target positions,
+one 16-by-128 gather block per thread (16 KB each, allocated once per
+factorization), and the packed operand buffer, which the fan-ins and the
+panels share. That buffer only grows. A fan-in on the worker team packs all
+of its node's operands at once: the sum over its kernel contributors `Q` of
+`|Q|` times the contribution's output columns doubles, which is at most the
+sum of those contributors' blocks (each operand holds at most `|Q|` times the
+contributor's height); the target positions add one index per output row of
+every contribution. On the calling thread the buffer needs room for the
+largest operand only. On the blocked SPD path the estimate therefore depends
+on the thread count: 3-D Poisson of side 20 with `COLAMD` reports 62.9 MB with
+one thread and 66.0, 66.1, and 66.3 MB with four, eight, and twenty (62.6 MB
+at every thread count before the fan-in), 30.7 and 32.4-32.6 MB with
+`MMD_AT_PLUS_A` (30.3 MB before), and the random SPD matrix of the strip
+measurements above (n=3,000, `COLAMD`) 141.7 MB with one thread and
+152.2-152.5 MB with four to twenty (137.3 MB before). Four dense SPD blocks of
+size 600, which have no contributors, report 29.1-29.3 MB (29.1 MB before).
+Packing a parallel fan-in's operands in batches would bound the buffer
+further; this build does not. Thread runtime storage is excluded, including
+the fixed per-call stack blocks of the panel steps (the 32-by-32 `S`, a
+32-entry column, and each strip's 16-by-32 `L D` operand) and the fan-in's 16
+row pointers per part.
 The estimate sums vector capacities, which grow geometrically, so a change in
 which buffers are resized, and in what order, can move it by a few hundred KB
 either way between builds: removing the trailing-update operand buffers
 lowered it on most SPD cases but raised 3-D Poisson with `MMD_AT_PLUS_A` by
 about 53 KB.
 
-`spd_source_seconds` measures prior-node updates including intersection lookup
-and packing; `spd_panel_seconds` measures node factorization, below-panel
-solves, and trailing updates. `spd_pack_seconds` is the dense-buffer packing
-portion of those two times, so it must not be added to them: it covers each
-contributor's `D L.T` right operand (its left operand is read in place and not
-packed) and each panel's shared right operand, which are packed on the calling
-thread. Each strip forms its own `L D` operand inside its work item, possibly
-on a worker, so that formation is counted only in `spd_panel_seconds`.
+`spd_source_seconds` measures prior-node updates: building each node's
+contribution list and target positions, packing, and the fan-in itself, on
+the calling thread or the worker team (contributor discovery and the scatter
+of original entries before it are not included); `spd_panel_seconds` measures
+node factorization, below-panel solves, and trailing updates.
+`spd_pack_seconds` is the dense-buffer packing portion of those two times, so
+it must not be added to them: it covers each contributor's `D L.T` right
+operand (its left operand is read in place and not packed) and each panel's
+shared right operand, which are packed on the calling thread, all of a node's
+operands before a parallel fan-in or each one just before its update
+otherwise. Each strip forms its own `L D` operand inside its work item,
+possibly on a worker, so that formation is counted only in
+`spd_panel_seconds`.
 `numeric_seconds` of the blocked path ends when the last node is factored;
 `assembly_seconds` then also covers copying the node blocks into the CSC
 values, releasing the blocks, and stopping the worker team.
@@ -664,16 +781,27 @@ when their backward residual is small.
 - supernodal LDL^T keeps serial work around its parallel phases: each panel
   solves the node's own rows `[end, width)` on the calling thread before its
   strip phase (for a dense node, that is the whole below-panel solve), in
-  baseline (SSE2) arithmetic outside the kernel table, and the prior-node
-  phase is serial: nodes are processed one at a time in ascending order, each
-  applying its contributors one after another, with intersection lookup,
-  right-operand packing, and sparse outer products on the calling thread, and
+  baseline (SSE2) arithmetic outside the kernel table; nodes are processed one
+  at a time in ascending order, so a node whose fan-in falls below the
+  parallel threshold applies its contributions on the calling thread, and
   independent subtrees are not yet factored concurrently (finished node blocks
-  are read-only, which would allow it). On 3-D Poisson of side 20 with
-  `COLAMD` the prior-node phase takes about 52 of the 64 ms numeric time at
-  eight threads (69 of 83 ms before contributors were read in place); a
-  panel's rank-32 update also reads and writes the whole trailing block once
-  per panel, which limits its eight-thread scaling on large dense nodes;
+  are read-only, which would allow it); contributor discovery, target
+  positions, and operand packing run on the calling thread even before a
+  parallel fan-in. On 3-D Poisson of side 20 with `COLAMD` at eight threads
+  the prior-node phase takes about 20 of the 32 ms numeric time: about 2.9 ms
+  of contribution lists and target positions, 1.3 ms of packing for the 29
+  parallel fan-ins and 8 ms for their strips, and 8 ms in the fan-ins of the
+  other 2,552 nodes with contributors on the calling thread (2,581 fan-ins in
+  all; 51 of 64 ms with one update per contributor, 69 of 83 ms before
+  contributors were read in place). Strips cut
+  each contribution's rows by node position, so a sparse contribution is
+  applied in short parts, and every strip scans the node's contribution list:
+  the 29 parallel fan-ins cost about 23 ms on the whole-node path at one
+  thread but 32 ms as strips on one thread, 33 ms in total on two, 36 ms on
+  four, and 53 ms on eight threads of the i5-13600K, whose workers then also
+  land on its efficiency cores; a panel's rank-32 update also reads and writes
+  the whole trailing block once per panel, which limits its eight-thread
+  scaling on large dense nodes;
 - the blocked LDL^T path keeps every node block until assembly, up to
   `2*nnz(L) + n` doubles beside the CSC factor (1.14 to 2 times the L entries
   on the benchmark cases), and fresh block memory costs page faults and a

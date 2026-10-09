@@ -47,6 +47,48 @@ def overlapping_cliques():
     return csc_array((raw[row, col], (row, col)), shape=(n, n)), widths
 
 
+def fan_in_rejection(contiguous, overflow=True):
+    # NATURAL order: ten 12-wide leaves coupled to 200 random rows of a dense
+    # 400-wide root, then a 2-wide leaf coupled to 40 root rows (scattered, or
+    # one contiguous run), then the root. The root's fan-in exceeds 2 MFLOP
+    # over 25 strips, so it runs on the worker team at four threads and on the
+    # calling thread at one. With overflow, the 2-wide leaf's subnormal pivots
+    # (1e-308) make its L entries about 1e308, still finite, and its rank-2
+    # kernel update sums two terms of about 1e308 into every diagonal output
+    # entry (j, j), which overflows in a gathered (scattered rows) or in-place
+    # (contiguous rows) kernel part of the fan-in; the kernel flag must reject
+    # the SPD attempt. The second leaf column alternates signs so the two
+    # columns are independent and the matrix stays well conditioned for the LU
+    # fallback.
+    rng = np.random.default_rng(5)
+    leaves, width, root = 10, 12, 400
+    pair = leaves * width
+    first_root = pair + 2
+    n = first_root + root
+    dense = np.zeros((n, n))
+    for leaf in range(leaves):
+        cols = np.arange(leaf * width, (leaf + 1) * width)
+        dense[np.ix_(cols, cols)] = 5e-4
+        rows = first_root + np.sort(rng.choice(root, size=200, replace=False))
+        dense[np.ix_(rows, cols)] = 0.005
+        dense[np.ix_(cols, rows)] = 0.005
+    rows = first_root + (np.arange(100, 140) if contiguous
+                         else np.sort(rng.choice(root, size=40, replace=False)))
+    coupling = 1.0 if overflow else 0.01
+    signs = np.where(np.arange(rows.size) % 2 == 0, coupling, -coupling)
+    dense[rows, pair] = dense[pair, rows] = coupling
+    dense[rows, pair + 1] = dense[pair + 1, rows] = signs
+    dense[pair, pair + 1] = dense[pair + 1, pair] = 1e-320 if overflow else 0.01
+    dense[first_root:, first_root:] = 5e-4
+    np.fill_diagonal(dense, 1.0)
+    if overflow:
+        # Subnormal values (1e-308 pivots, 1e-320 coupling): under
+        # flush-to-zero/denormals-are-zero the attempt would be rejected at the
+        # pivot instead, so the test would pass without reaching the fan-in.
+        dense[pair, pair] = dense[pair + 1, pair + 1] = 1e-308
+    return csc_array(dense)
+
+
 class SupernodalLDLTTests(unittest.TestCase):
     def check_factor(self, matrix, factor, *, tolerance=3e-12):
         self.assertEqual(factor.nnz, factor.L.nnz + factor.U.nnz)
@@ -163,6 +205,31 @@ class SupernodalLDLTTests(unittest.TestCase):
                     self.assertGreater(factor.stats["failed_spd_seconds"], 0.0)
                     self.assertGreaterEqual(factor.stats["factor_seconds"], factor.stats["failed_spd_seconds"])
                     self.assertGreater(factor.stats["peak_workspace_bytes"], 320 * 320 * 8)
+                    self.check_factor(matrix, factor)
+                self.assert_same_factors(serial, parallel)
+
+    def test_overflow_inside_contributor_fan_in_falls_back(self):
+        for contiguous in (False, True):
+            with self.subTest(contiguous=contiguous):
+                # The same structure without the overflow takes the blocked
+                # path, so the rejection below happens inside it.
+                control = fan_in_rejection(contiguous, overflow=False)
+                serial = splu(control, backend="native", permc_spec="NATURAL", num_threads=1)
+                parallel = splu(control, backend="native", permc_spec="NATURAL", num_threads=4)
+                for factor in (serial, parallel):
+                    self.assertEqual(factor.stats["numeric_engine"], "symmetric-supernodal-ldlt")
+                if parallel.stats["num_threads"] > 1:
+                    self.assertGreater(parallel.stats["parallel_panels"], 0)
+                self.assert_same_factors(serial, parallel)
+
+                matrix = fan_in_rejection(contiguous)
+                serial = splu(matrix, backend="native", permc_spec="NATURAL", num_threads=1)
+                parallel = splu(matrix, backend="native", permc_spec="NATURAL", num_threads=4)
+                for factor in (serial, parallel):
+                    self.assertNotIn("ldlt", factor.stats["numeric_engine"])
+                    self.assertEqual(factor.stats["parallel_panels"], 0)
+                    self.assertEqual(factor.stats["spd_panel_entries"], 0)
+                    self.assertGreater(factor.stats["failed_spd_seconds"], 0.0)
                     self.check_factor(matrix, factor)
                 self.assert_same_factors(serial, parallel)
 

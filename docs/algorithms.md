@@ -268,7 +268,14 @@ blocks hold at most $2\,\mathrm{nnz}(L) + n$ entries. Contributors are
 visited in increasing node order, and each output entry accumulates its terms
 in that order regardless of threading. Each contributor is one rank-$|Q|$
 update: an entry forms $s = \sum_{q \in Q} l_{iq}\, (d_q\, l_{jq})$ from zero
-in ascending $q$ and subtracts $s$ once (Section 11).
+in ascending $q$ and subtracts $s$ once (Section 11). All contributions to a
+node are applied in one pass (the fan-in): the rows of $F$ are split into
+fixed strips of 16, and each strip applies every contribution that reaches
+its rows, in increasing node order, to its own entries. Since an entry's
+result depends only on the contributions it receives and their order, the
+strips are independent and run in parallel, and a node too small for that
+applies its contributions one after another to all of its rows with the same
+result.
 
 The diagonal block $F_{J,J}$ is then factored without pivoting in panels of
 $w = 32$ columns. For a panel $P \subset J$ with the rows $R'$ below it:

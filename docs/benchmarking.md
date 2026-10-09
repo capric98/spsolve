@@ -400,6 +400,45 @@ whose row-hybrid code did not change: builds that differ only in the SPD
 code measured it at 0.98x to 1.05x of the previous build, a code-placement
 effect in the shared translation unit.
 
+Applying all contributions to a node in one fan-in phase (fixed 16-row strips
+of the node rectangle run on the worker team when the node's update is large
+enough, otherwise one whole contribution after another on the calling thread;
+see [the design notes](native-lu.md#blocked-spd-panels)) kept every factor,
+permutation, and scale bitwise identical to the previous build under all
+three kernels and at 1, 2, 3, 4, 8, and 20 threads; `dense_update_flops` is
+unchanged. Interleaved runs against the previous build (`avx2-fma`, medians of
+five rounds) measured 3-D Poisson of side 20 with `COLAMD` at 74.6 instead of
+96.8 ms with one thread and 57.1 instead of 89.7 ms with eight (numeric phase
+49.3 instead of 70.8 and 32.3 instead of 64.4 ms; prior-node updates 34.4
+instead of 56.1 and 19.5 instead of 51.3 ms), and with `MMD_AT_PLUS_A` at
+28.3 instead of 32.3 ms and 24.6 instead of 29.5 ms (numeric 12.7 instead of
+17.3 ms at eight threads). A random sparse SPD matrix (n=3,000, density 0.004,
+`MMD_AT_PLUS_A`), whose dense 2,158-wide root receives 842 rank-1
+contributions, ran in 71.5 instead of 105.5 ms with eight threads (prior-node
+updates 5.1 instead of 39.8 ms). The one-thread gain comes from the
+whole-node path itself: kernel parts of up to 16 by 128 entries instead of
+16-by-16 tiles, in-place updates (through row pointers when the rows are not
+contiguous) of every part whose columns are contiguous, each operand packed
+just before its use, and less bookkeeping per contribution. Four dense SPD
+blocks of size 600, which have no
+contributors, moved by +0.5% (one thread) and -1.7% (eight threads), and a
+1,000-wide dense block beside a 20,000-row chain by +1.7% and 0.0% (its
+20,000 one-contributor nodes each pay about 12 ns more of bookkeeping).
+General LU controls (irregular n=2,500 with both orderings, dense LU of size
+600, `sparse-dense-border`, pivot-heavy, 2-D Poisson) moved between -5% and
++3% across two sets of runs, without a consistent sign; every function
+outside the SPD path compiles to identical machine code (MSVC `/FAs`
+listings), so these are placement effects and noise. `parallel_panels` fell
+from 98 to 55 (`COLAMD`) and from 31 to 25 (`MMD_AT_PLUS_A`) at eight
+threads, since a fan-in counts once per node. Estimated peak workspace rose
+from 62.6 to 62.9 MB with one thread and to 66.0-66.1 MB with four or eight
+(`COLAMD`), and from 30.3 to 30.7 and 32.4 MB (`MMD_AT_PLUS_A`). In the full
+benchmark 3-D Poisson took 0.40-0.43x (`COLAMD`, 0.65x before) and 0.13x
+(`MMD_AT_PLUS_A`) SuperLU time with eight threads, and 0.54-0.55x and 0.15x
+with one thread; the `MMD_AT_PLUS_A` runs passed the gate for every case, and
+the `COLAMD` runs failed only on the row-permuted band (1.14x and 1.19x).
+One run on one platform does not meet the promotion rule below.
+
 The row-permuted 20,000-row COLAMD band exposes a separate classifier problem.
 Using an unrelated AMD analysis previously reported a front of 11,309 despite
 only 359,878 factor entries and narrow actual fronts. Replacing that analysis

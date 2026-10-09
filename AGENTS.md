@@ -17,7 +17,7 @@ implements), `docs/benchmarking.md` (the promotion gate), `docs/api.md`.
 | `src/spsolve/*.py` | Public API: `splu`, `spsolve`, `factorized`, `spsolve_triangular`, `spparms` (thread/order/dense-kernel settings). Canonicalizes input, maps native errors to `LinAlgError`, runs iterative refinement. |
 | `src/spsolve.cpp` | nanobind module `_spsolve`: binds the triangular kernels and the dense-kernel selection, and calls `bind_sparse_lu`. |
 | `src/sparse_lu.cpp`, `src/sparse_lu.hpp` | `NativeSparseLU` and `factorize_typed`: validation, equilibration, ordering calls, engine selection, the SPD attempt, the left-looking CSC LU, the row-hybrid LU, `solve_inplace`, CSC export, `stats`. Also `FactorExecutor`, the persistent `std::thread` team. |
-| `src/sparse_ldlt.hpp` | Supernodal LDL^T kernels: fundamental supernodes, row incidence, rank-k tile update, per-node panel factorization. |
+| `src/sparse_ldlt.hpp` | Supernodal LDL^T kernels: fundamental supernodes, row incidence, block offsets, the per-node contribution fan-in (fixed 16-row strips; in-place `gemm_sub`/`gemm_sub_lower`/`gemm_sub_rows` parts, gather/scatter for noncontiguous columns), per-node panel factorization, and CSC assembly. |
 | `src/sparse_lu_panels.hpp` | `DensePanel`: deferred dense-row updates and the tiled `L_panel * U_panel` flush of the row-hybrid LU. |
 | `src/dense_kernels.hpp` | Dense tile kernel interface (`dense_kernels::Kernels`: `gemm_sub`, `gemm_sub_rows`, `gemm_sub_lower`, `axpy_sub`) and selection API. Declarations only: it is included by wider-ISA translation units. |
 | `src/dense_kernels.cpp` | Scalar and SSE2 kernels, CPUID/XCR0 detection, `SPSOLVE_FORCE_KERNEL` and runtime selection behind an atomic pointer. |
@@ -68,7 +68,14 @@ python benchmarks/factorization.py --threads 8 --repeats 5 --gate   # promotion 
   Every output entry accumulates its terms in one fixed order. Checked by
   `assert_same_factors` in `tests/test_blocked_lu.py` and
   `tests/test_supernodal_ldlt.py` and by exact comparisons in
-  `tests/test_sparse_lu.py`.
+  `tests/test_sparse_lu.py`. The one exception is the supernodal LDL^T
+  fan-in, whose partition (whole-node parts on the calling thread vs 16-row
+  strips on the worker team) depends on the thread count through
+  `worth_parallel`; its factors stay invariant only because a dense-kernel
+  element's result is independent of tile shape and call path
+  (`src/dense_kernels.hpp`, `test_kernels_agree_across_threads_and_tile_paths`),
+  so every kernel must keep that contract (for example, no shape-dependent
+  K-blocking).
 - **Pivoting semantics.** Threshold partial pivoting with `diag_pivot_thresh`
   and the preferred row `perm_c[k]`; ties break by current row position.
   Exact singularity raises an error containing "singular" (Python maps it to
