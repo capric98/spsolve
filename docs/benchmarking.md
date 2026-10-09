@@ -371,6 +371,35 @@ general LU cases were unchanged within noise in interleaved runs. That
 `--extended --dense-lu`; the `COLAMD` run failed only on the row-permuted
 band (1.14x). One run on one platform does not meet the promotion rule below.
 
+Keeping every supernode in one contiguous block array, reading contributors'
+L rows in place, packing only `D L.T`, and copying the blocks into the CSC
+factor once at the end (see [the design notes](native-lu.md#blocked-spd-panels))
+changed LDL^T factors only in the last bits, with unchanged backward error;
+`dense_update_flops`, `parallel_panels`, and `spd_panel_entries` are
+unchanged. Interleaved runs against the previous build (`avx2-fma`, medians of
+five rounds) measured 3-D Poisson of side 20 with `COLAMD` at 96.6 instead of
+112.8 ms with one thread and 88.9 instead of 106.4 ms with eight (numeric
+phase 83.0 to 64.1 ms, prior-node updates 69.4 to 51.5 ms,
+`spd_pack_seconds` 15.8 to 1.1 ms; `assembly_seconds` rose from 0.03 to
+2.3 ms for the block copy and release), and with `MMD_AT_PLUS_A` at 32.3
+instead of 33.9 ms and 29.3 instead of 31.3 ms. A 1,000-wide dense block
+beside a 20,000-row chain ran in 23.2 instead of 23.9 ms with eight threads.
+Four dense SPD blocks of size 600 have no contributors to read in place and
+pay for fresh block memory (page faults on 11.5 MB, and its release): 1-2%
+slower (31.4 instead of 31.0 ms with one thread and 29.4 instead of 29.2 ms
+with eight in these runs; an independent review measured 2.2% and 1.4%).
+Estimated peak workspace rose from 49.3 to 62.6 MB (`COLAMD`), 25.5 to
+30.3 MB (`MMD_AT_PLUS_A`), and 20.5 to 29.1 MB (dense blocks). In the full
+benchmark 3-D Poisson took 0.65x (`COLAMD`, 0.78x before) and 0.15x
+(`MMD_AT_PLUS_A`) SuperLU time with eight threads, and the dense SPD blocks
+0.82x and 0.74x; the `MMD_AT_PLUS_A` run passed the gate for every case, and
+the `COLAMD` run failed only on the row-permuted band (1.15x). Simplicial and
+general LU controls stayed within 1% in interleaved runs except
+`sparse-dense-border` with `MMD_AT_PLUS_A` and one thread (4-5% slower),
+whose row-hybrid code did not change: builds that differ only in the SPD
+code measured it at 0.98x to 1.05x of the previous build, a code-placement
+effect in the shared translation unit.
+
 The row-permuted 20,000-row COLAMD band exposes a separate classifier problem.
 Using an unrelated AMD analysis previously reported a front of 11,309 despite
 only 359,878 factor entries and narrow actual fronts. Replacing that analysis

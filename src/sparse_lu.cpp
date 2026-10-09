@@ -18,6 +18,7 @@
 #include <limits>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <type_traits>
@@ -765,7 +766,10 @@ template <typename Int>
             }
         }
         blocked = useful_work >= required_work;
-        if (blocked) sparse_ldlt::build_row_incidence(nodes, strict_col_ptr, strict_rows);
+        if (blocked) {
+            sparse_ldlt::build_row_incidence(nodes, strict_col_ptr, strict_rows);
+            sparse_ldlt::build_block_offsets(nodes, strict_col_ptr);
+        }
     }
     result->symbolic_seconds_ = std::chrono::duration<double>(
         Clock::now() - symbolic_start).count();
@@ -791,12 +795,17 @@ template <typename Int>
     sparse_ldlt::NumericInfo blocked_info;
     result->peak_workspace_bytes_ = base_workspace;
     std::uint64_t numeric_updates = 0;
+    // The blocked engine factors into contiguous node blocks; they become the
+    // CSC values only at assembly, after every pivot has passed. Its worker
+    // team (started on first use) serves both phases.
+    std::unique_ptr<double[]> blocks;
+    std::optional<FactorExecutor> executor;
     if (blocked) {
-        FactorExecutor executor(result->factor_threads_);
+        executor.emplace(result->factor_threads_);
         const bool succeeded = sparse_ldlt::factorize(
             data, indices, indptr, result->perm_c_, inverse_permutation,
-            symmetric_scale, strict_col_ptr, strict_rows, nodes, strict_values,
-            diagonal, kernels, executor, result->factor_threads_, blocked_info, base_workspace);
+            symmetric_scale, strict_col_ptr, strict_rows, nodes, blocks,
+            diagonal, kernels, *executor, result->factor_threads_, blocked_info, base_workspace);
         result->peak_workspace_bytes_ = blocked_info.workspace_bytes;
         if (!succeeded) return false;
         numeric_updates = blocked_info.update_flops / 2;
@@ -862,6 +871,12 @@ template <typename Int>
     }
 
     const auto assembly_start = Clock::now();
+    if (blocked) {
+        sparse_ldlt::assemble(nodes, strict_col_ptr, blocks.get(), strict_values,
+            *executor, result->factor_threads_);
+        blocks.reset();
+        executor.reset();
+    }
     result->column_storage_ = true;
     result->symmetric_ldlt_ = true;
     result->numeric_engine_ = blocked ? "symmetric-supernodal-ldlt" : "symmetric-ldlt-csc";

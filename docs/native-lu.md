@@ -103,22 +103,43 @@ factor for the same input and options.
 ## Blocked SPD panels
 
 The `symmetric-supernodal-ldlt` engine processes one exact fundamental
-supernode at a time. Its dense workspace contains only that node's columns
-and filled rows. It scatters original matrix entries, then subtracts prior
-node contributions `L[R,Q] @ D[Q] @ L[J,Q].T`. Sparse row incidence discovers
-contributors without scanning all prior nodes. Contributors are deduplicated
-and visited in factor order; only their actual row and column intersections
-are packed, including noncontiguous and partial overlaps. Each contributor is
-packed once, `L[R,Q] @ D[Q]` as a rows-by-`|Q|` block and `L[J,Q].T` as a
-`|Q|`-by-columns block, and applied in one tiled rank-`|Q|` update: every
-target entry sums all of that node's terms from zero in ascending column order
-and subtracts the sum once (see "Dense kernels"). Each packed block holds at
-most `|Q|` times the contributor's height, the size of that contributor's own
-dense rectangle. Earlier builds packed and subtracted one sum per 32 columns of
-a contributor; the single sum changed LDL^T factors only in the last bits
-(largest entry change about 8e-16 of the largest `U` entry, relative Frobenius
-change about 1e-16) and did not increase the backward error
-`max|P^T S A S P - L D L^T|` (3-D Poisson of side 20: 1.44e-15 to 1.22e-15
+supernode at a time, in ascending order. Each node owns a dense row-major
+block of `height x width` entries, its own columns first and then its tail
+rows in ascending order, and all blocks share one array allocated for the
+numeric phase: the symbolic phase computes `block_ptr`, the prefix sums of
+the node rectangles (with overflow checks), which gives each block's offset.
+A node zero-fills its block, scatters original matrix entries into it, then
+subtracts prior node contributions `L[R,Q] @ D[Q] @ L[J,Q].T`. Sparse row
+incidence discovers contributors without scanning all prior nodes.
+Contributors are deduplicated and visited in factor order. The rows of a
+contributor `Q` that fall inside the target are a contiguous suffix of `Q`'s
+rows (elimination-tree containment; the code checks it), so `L[R,Q]` is a run
+of full rows of `Q`'s finished block and is read in place with row stride
+`|Q|`. Only the right operand `D[Q] @ L[J,Q].T`, from those of the rows that
+are target columns, is packed, as a `|Q|`-by-columns block with
+`right[k][j] = d[k] * l[j][k]`. The rows' target positions may be
+noncontiguous and the overlap partial. The contributor is applied in one
+tiled rank-`|Q|` update: every target entry sums all of that node's terms
+`l[i][k] * (d[k] * l[j][k])` from zero in ascending column order and subtracts
+the sum once (see "Dense kernels"). The packed operand holds at most `|Q|`
+times the contributor's height, the size of that contributor's block. A
+finished block is never written again, only read by later nodes.
+
+Earlier builds kept one node rectangle at a time, copied each finished node
+into the CSC values, and packed contributors from there, including
+`L[R,Q] @ D[Q]` as a rows-by-`|Q|` left operand, so each term was rounded as
+`(l[i][k] * d[k]) * l[j][k]`. Reading `L` in place moves the diagonal factor
+to the right operand. This changed LDL^T factors only in the last bits
+(largest entry change 2.2e-16 of the largest `U` entry, relative Frobenius
+change about 1e-17, on 3-D Poisson of side 20 under `avx2-fma` and `sse2`)
+and left the backward error `max|P^T S A S P - L D L^T|` unchanged (1.89e-15
+with `COLAMD` and 1.22e-15 with `MMD_AT_PLUS_A`; Frobenius norms within
+0.1%). Nodes without contributors (such as disconnected dense blocks) and
+updates through tiny intersections are bitwise unchanged. Before that, builds
+packed and subtracted one sum per 32 columns of a contributor; the single sum
+changed LDL^T factors only in the last bits (largest entry change about 8e-16
+of the largest `U` entry, relative Frobenius change about 1e-16) and did not
+increase the backward error (3-D Poisson of side 20: 1.44e-15 to 1.22e-15
 with `MMD_AT_PLUS_A`, 1.89e-15 unchanged with `COLAMD`).
 
 A contributor update runs as independent 16-by-16 output tiles that call the
@@ -130,7 +151,8 @@ a 16-by-16 scratch block, updated, and scattered back. Because the output
 columns are a prefix of the ascending output rows, a tile that straddles the
 diagonal is a diagonal tile, and only its lower triangle is gathered,
 computed, and scattered. Tiny intersections (fewer than 256 output rows times
-columns) retain sparse outer products.
+columns) retain sparse outer products, also reading the contributor's block in
+place: per source column `k`, `f[i][j] -= (l[j][k] * d[k]) * l[i][k]`.
 
 The node's columns are then factored in panels `P = [begin, end)` of at most
 32 columns. For each panel:
@@ -192,18 +214,43 @@ panel's L entries are scanned once (`fabs(v) <= DBL_MAX`) after their last
 write, the diagonal block's after its factorization, rows `[end, width)` after
 their serial solve, and each strip's rows after its solve. Dense kernel calls
 report through their flag, which is authoritative: a kernel may stop early, so
-a false flag rejects the attempt at once. This is complete because entries
+a false flag rejects the attempt at once. A node's L entries are therefore all
+tested before any later node reads its block. This is complete because entries
 combine only through addition, subtraction, multiplication, and division by a
 tested pivot, which keep an Inf or NaN operand non-finite (`Inf*0` and
 `Inf-Inf` are NaN), and because every auxiliary product reaches an entry or a
 flag: a sparse update's `l * d` updates its own diagonal position with the
 nonzero `l`; the diagonal block's `l[i][p] * d[p]` updates the future pivot
-`(i, i)`; `S[k][p]` enters every lower row's `l[i][p]`; and a packed `L D` row
-updates output column 0, which every kernel call computes. A rejected attempt
+`(i, i)`; `S[k][p]` enters every lower row's `l[i][p]`; and a contributor's
+packed `d[k] * l[j][k]` enters output entry `(j, j)` with the nonzero
+`l[j][k]` (a zero `l` gives a zero product), a diagonal entry that lies in a
+diagonal tile, which every update computes. The contributor's in-place left
+operand holds only tested L entries. A rejected attempt assembles and
 publishes nothing and falls back to pivoted LU. Matrices whose denormal pivot
 makes L overflow in the serially solved rows or in strip-solved tail rows are
 rejected by those scans; overflow inside the diagonal block reaches the next
 pivot test first.
+
+After the last node has passed, one assembly pass copies the strict lower
+entries of every block into the CSC values (column `first + c` of a node holds
+block rows `c + 1` to `height - 1` of block column `c`, in order) and then
+releases the blocks; `assembly_seconds` includes it. Entries that cancelled to
+zero are copied as stored zeros. A failed attempt returns before assembly. The
+copy runs in fixed items of eight factor columns, split at node boundaries; it
+uses the worker team when there are at least 2^18 CSC entries and two items
+per thread (counting at most eight threads), and since it only copies, neither
+the partition nor the thread can change a value. A node of width `W` and
+height `R` stores `R*W` block entries for its `R*W - W*(W+1)/2` strict L
+entries, so the blocks hold at most `2*nnz(L) + n` entries, with equality only
+for nodes whose height equals their width (dense diagonal blocks). On 3-D
+Poisson of side 20 they hold 2.11 million entries (16.9 MB, 1.14 times the L
+entries) with `COLAMD` and 1.08 million (8.7 MB, 1.30 times) with
+`MMD_AT_PLUS_A`; four dense SPD blocks of size 600 hold 1.44 million (11.5 MB,
+twice the L entries). The CSC value array is allocated before the numeric
+phase, so it and the blocks coexist throughout the numeric phase and
+assembly, including a failed attempt; the blocked path's peak memory is the
+factor plus all node blocks, where earlier builds held the factor plus one
+node rectangle and its packed operands.
 
 For node width `W` and height `R`, predicted internal update terms are
 `W*(W-1)*(3*R-2*W+1)/6`. Only nodes at least 320 columns wide contribute useful
@@ -216,8 +263,9 @@ an expensive large node solely because it covers few matrix columns.
 The filled CSC pattern, including entries that cancel numerically to zero,
 remains the public storage contract. No factors, symmetric scales, or blocked
 work counters are published until every positive pivot and finite intermediate
-has passed validation. Each output entry visits contributors in the same order
-at every thread count.
+has passed validation, and the CSC values are assembled from the blocks only
+then. Each output entry visits contributors in the same order at every thread
+count.
 
 ## Dense LU panels
 
@@ -522,16 +570,25 @@ contributor update or a panel's strip phase that met the threshold in
 "Blocked SPD panels") and is also included in `parallel_steps`.
 `dense_update_flops` counts two operations per executed multiply/subtract
 term, including the diagonal-block, below-panel solve, and sparse
-intersection work; diagonal weighting (including the panel's `S` and the
-strips' `L D` operands), divisions, and operand packing are excluded.
+intersection work; diagonal weighting (including the panel's `S`, the
+strips' `L D` operands, and the contributors' `D L.T` operands), divisions,
+and operand packing are excluded.
 `largest_front` is the actual largest filled node height on either SPD path;
 `spd_panel_entries` is the largest allocated dense node rectangle. A rectangle
 uses less than twice its node's lower-triangular CSC entries, and does not
 densify unrelated matrix rows or columns. `peak_workspace_bytes` estimates
 simultaneously live numeric and symbolic vector buffers, including CSC factors,
-row incidence, packed operands, and the node rectangle; thread runtime storage
-is excluded, including the fixed per-call stack blocks of the panel steps (the
-32-by-32 `S`, a 32-entry column, and each strip's 16-by-32 `L D` operand).
+row incidence, and packed operands; on the blocked SPD path it counts the
+whole node block array once (every node rectangle, allocated for the numeric
+phase, at most `2*nnz(L) + n` doubles; see "Blocked SPD panels"), which
+coexists with the CSC value array, allocated before the numeric phase,
+throughout the numeric phase and assembly. Earlier builds counted one node
+rectangle instead, so the estimate rose with the block storage, for example
+from 49.3 to 62.6 MB on 3-D Poisson of side 20 with `COLAMD`, 25.5 to
+30.3 MB with `MMD_AT_PLUS_A`, and 20.5 to 29.1 MB on four dense SPD blocks of
+size 600. Thread runtime storage is excluded, including the fixed per-call
+stack blocks of the panel steps (the 32-by-32 `S`, a 32-entry column, and each
+strip's 16-by-32 `L D` operand).
 The estimate sums vector capacities, which grow geometrically, so a change in
 which buffers are resized, and in what order, can move it by a few hundred KB
 either way between builds: removing the trailing-update operand buffers
@@ -541,11 +598,15 @@ about 53 KB.
 `spd_source_seconds` measures prior-node updates including intersection lookup
 and packing; `spd_panel_seconds` measures node factorization, below-panel
 solves, and trailing updates. `spd_pack_seconds` is the dense-buffer packing
-portion of those two times, so it must not be added to them: it covers the
-contributor operands and each panel's shared right operand, which are packed
-on the calling thread. Each strip forms its own `L D` operand inside its work
-item, possibly on a worker, so that formation is counted only in
-`spd_panel_seconds`. `failed_spd_seconds` records a discarded
+portion of those two times, so it must not be added to them: it covers each
+contributor's `D L.T` right operand (its left operand is read in place and not
+packed) and each panel's shared right operand, which are packed on the calling
+thread. Each strip forms its own `L D` operand inside its work item, possibly
+on a worker, so that formation is counted only in `spd_panel_seconds`.
+`numeric_seconds` of the blocked path ends when the last node is factored;
+`assembly_seconds` then also covers copying the node blocks into the CSC
+values, releasing the blocks, and stopping the worker team.
+`failed_spd_seconds` records a discarded
 SPD attempt, and is included in the subsequent LU numeric/factor time. Peak
 workspace also includes that attempt's maximum live buffers.
 
@@ -603,12 +664,26 @@ when their backward residual is small.
 - supernodal LDL^T keeps serial work around its parallel phases: each panel
   solves the node's own rows `[end, width)` on the calling thread before its
   strip phase (for a dense node, that is the whole below-panel solve), in
-  baseline (SSE2) arithmetic outside the kernel table, and prior-node
-  intersection lookup, packing, and sparse outer products are serial (on 3-D
-  Poisson of side 20 with `COLAMD`, the prior-node phase takes about 69 of the
-  82 ms numeric time at eight threads); a panel's rank-32 update also reads
-  and writes the whole trailing block once per panel, which limits its
-  eight-thread scaling on large dense nodes;
+  baseline (SSE2) arithmetic outside the kernel table, and the prior-node
+  phase is serial: nodes are processed one at a time in ascending order, each
+  applying its contributors one after another, with intersection lookup,
+  right-operand packing, and sparse outer products on the calling thread, and
+  independent subtrees are not yet factored concurrently (finished node blocks
+  are read-only, which would allow it). On 3-D Poisson of side 20 with
+  `COLAMD` the prior-node phase takes about 52 of the 64 ms numeric time at
+  eight threads (69 of 83 ms before contributors were read in place); a
+  panel's rank-32 update also reads and writes the whole trailing block once
+  per panel, which limits its eight-thread scaling on large dense nodes;
+- the blocked LDL^T path keeps every node block until assembly, up to
+  `2*nnz(L) + n` doubles beside the CSC factor (1.14 to 2 times the L entries
+  on the benchmark cases), and fresh block memory costs page faults and a
+  release on every factorization: four dense 600-wide SPD blocks, whose nodes
+  have no contributors to read in place, ran 1-2% slower (1.5% to 2.2% with
+  one thread, 0.6% to 1.4% with eight, in two sets of interleaved runs) than
+  with a single reused node rectangle. A failed SPD attempt on a symmetric
+  indefinite matrix also allocates the whole node block array, and touches
+  its pages up to the failing node, before falling back to LU (earlier builds
+  held one node rectangle); `peak_workspace_bytes` reports it;
 - the `avx2-fma` kernel does not fuse the LU flush (`running` order): the
   scalar U-entry walks of sparse pivot rows (pivot-tail materialization and
   dense-row updates outside panels) apply the same terms outside the kernel

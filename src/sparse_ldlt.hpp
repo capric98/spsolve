@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -32,6 +33,9 @@ struct Pattern {
     std::vector<index_t> row_ptr;
     std::vector<index_t> row_sources;
     std::vector<index_t> column_nodes;
+    // Offset of each node's dense block in the numeric phase's single block
+    // array: block_ptr[node + 1] - block_ptr[node] = height * width.
+    std::vector<std::size_t> block_ptr;
     index_t node_count = 0;
     index_t maximum_width = 1;
     index_t maximum_front = 0;
@@ -102,6 +106,26 @@ inline void build_row_incidence(
     }
 }
 
+// Prefix sums of the node rectangles: each node of width W and height R (its
+// columns, then its tail rows) owns R * W consecutive block entries.
+inline void build_block_offsets(Pattern& pattern, const std::vector<index_t>& col_ptr) {
+    const auto maximum = std::vector<double>().max_size();
+    pattern.block_ptr.assign(1, 0);
+    pattern.block_ptr.reserve(pattern.nodes.size());
+    for (std::size_t node = 0; node + 1 < pattern.nodes.size(); ++node) {
+        const index_t first = pattern.nodes[node];
+        const index_t width = pattern.nodes[node + 1] - first;
+        const index_t height = 1 + col_ptr[static_cast<std::size_t>(first + 1)] -
+            col_ptr[static_cast<std::size_t>(first)];
+        const auto entries = checked_product(height, width);
+        const auto total = pattern.block_ptr.back();
+        if (entries > maximum - total) {
+            throw std::overflow_error("symmetric panel allocation overflowed");
+        }
+        pattern.block_ptr.push_back(total + entries);
+    }
+}
+
 struct NumericInfo {
     std::uint64_t workspace_bytes = 0;
     std::uint64_t maximum_panel_entries = 0;
@@ -133,22 +157,25 @@ struct NonPositiveDefinite {};
 // C -= left * right over the lower part of the selected front entries.
 // left is [output rows x rank] with row stride left_stride (>= rank), right is
 // [rank x output columns] with row stride equal to the output column count.
-// Output tiles are disjoint, and every entry visits the rank terms in order:
-// the kernel sums the left * right terms from zero in ascending k and
-// subtracts that sum from the entry once (Accumulate::sum_then_subtract).
-// Terms are often far smaller than the dominant diagonal they update, so
-// summing first avoids rounding at the entry's scale once per term. A prior
-// supernode's intersection is applied in one call with rank equal to its
-// width (a node's own panels use the row strips in factorize instead). The
-// kernel's finiteness flag is authoritative on every tile path, and no path
-// scatters an entry the kernel was not asked to compute.
+// A prior supernode's intersection is applied in one call with rank equal to
+// its width: left is that node's block rows read in place (its L entries,
+// left_stride being its width) and right its packed D * L.T (a node's own
+// panels use the row strips in factorize instead). left is only read, so
+// another node's finished block can serve as it. Output tiles are disjoint,
+// and every entry visits the rank terms in order: the kernel sums the
+// left * right terms from zero in ascending k and subtracts that sum from the
+// entry once (Accumulate::sum_then_subtract). Terms are often far smaller
+// than the dominant diagonal they update, so summing first avoids rounding at
+// the entry's scale once per term. The kernel's finiteness flag is
+// authoritative on every tile path, and no path scatters an entry the kernel
+// was not asked to compute.
 template <typename Executor>
 void rank_update(
-    std::vector<double>& front, index_t columns,
+    double* front, index_t columns,
     const std::vector<index_t>& output_rows,
     const std::vector<index_t>& output_columns,
-    const std::vector<double>& left, index_t left_stride,
-    const std::vector<double>& right,
+    const double* left, index_t left_stride,
+    const double* right,
     index_t rank, const dense_kernels::Kernels& kernels,
     Executor& executor, int threads, NumericInfo& info
 ) {
@@ -182,8 +209,8 @@ void rank_update(
         const auto tile_rows = static_cast<std::size_t>(row_last - row_first);
         const auto tile_cols = static_cast<std::size_t>(col_last - col_first);
         const bool below = top >= rightmost;  // Every entry has row >= col.
-        const double* a = left.data() + static_cast<std::size_t>(row_first * left_stride);
-        const double* b = right.data() + static_cast<std::size_t>(col_first);
+        const double* a = left + static_cast<std::size_t>(row_first * left_stride);
+        const double* b = right + static_cast<std::size_t>(col_first);
         const auto lda = static_cast<std::size_t>(left_stride);
         const auto ldb = static_cast<std::size_t>(cols);
         constexpr auto order = dense_kernels::Accumulate::sum_then_subtract;
@@ -193,7 +220,7 @@ void rank_update(
         if (bottom - top == row_last - 1 - row_first &&
             rightmost - leftmost == col_last - 1 - col_first) {
             // A contiguous block of the front: update it in place.
-            double* c = front.data() + static_cast<std::size_t>(top * columns + leftmost);
+            double* c = front + static_cast<std::size_t>(top * columns + leftmost);
             const auto ldc = static_cast<std::size_t>(columns);
             const bool finite = below
                 ? kernels.gemm_sub(c, ldc, a, lda, b, ldb, tile_rows, tile_cols,
@@ -336,6 +363,16 @@ inline void solve_panel_rows(
     }
 }
 
+// Numeric phase of the supernodal LDL.T. Every node's dense rectangle lives
+// in one array, blocks (allocated here, pattern.block_ptr[node] being the
+// node's offset): row-major [height x width], positions 0..width-1 being the
+// node's own columns and then its tail rows in ascending order. A finished
+// node's block holds its pivots on the diagonal and its L entries below it,
+// and later nodes read it in place as their contributor operand; it is never
+// written again. Each node zero-fills its own block before scattering into
+// it, so blocks of nodes not yet reached are never read. Returns false, with
+// nothing assembled, when a pivot or intermediate fails; on success, assemble
+// copies the blocks into the CSC values.
 template <typename Int, typename Executor>
 bool factorize(
     const double* data, const Int* indices, const Int* indptr,
@@ -343,24 +380,27 @@ bool factorize(
     const std::vector<index_t>& inverse_permutation,
     const std::vector<double>& scale,
     const std::vector<index_t>& col_ptr, const std::vector<index_t>& rows,
-    const Pattern& pattern, std::vector<double>& values,
+    const Pattern& pattern, std::unique_ptr<double[]>& blocks,
     std::vector<double>& diagonal, const dense_kernels::Kernels& kernels,
     Executor& executor, int threads, NumericInfo& info, std::uint64_t base_workspace
 ) {
     const index_t n = static_cast<index_t>(permutation.size());
+    const std::size_t block_entries = pattern.block_ptr.back();
+    blocks.reset(new double[block_entries]);
     std::vector<index_t> row_position(static_cast<std::size_t>(n), -1);
     std::vector<index_t> mark(static_cast<std::size_t>(n), -1);
     std::vector<index_t> contributors;
-    std::vector<index_t> output_rows, output_columns, source_offsets;
-    std::vector<double> front, left, right;
+    std::vector<index_t> output_rows, output_columns;
+    std::vector<double> right;
     auto workspace = [&] {
         info.workspace_bytes = std::max(info.workspace_bytes, base_workspace +
             sizeof(index_t) * (row_position.capacity() + mark.capacity() +
                 contributors.capacity() + pattern.nodes.capacity() +
                 pattern.row_ptr.capacity() + pattern.row_sources.capacity() +
                 pattern.column_nodes.capacity() + output_rows.capacity() +
-                output_columns.capacity() + source_offsets.capacity()) +
-            sizeof(double) * (front.capacity() + left.capacity() + right.capacity()));
+                output_columns.capacity()) +
+            sizeof(std::size_t) * pattern.block_ptr.capacity() +
+            sizeof(double) * (block_entries + right.capacity()));
     };
     workspace();
     try {
@@ -375,8 +415,9 @@ bool factorize(
             for (index_t p = row_begin; p < row_end; ++p) {
                 row_position[static_cast<std::size_t>(rows[p])] = 1 + p - row_begin;
             }
-            const auto panel_entries = checked_product(height, width);
-            front.assign(panel_entries, 0.0);
+            const auto panel_entries = pattern.block_ptr[node + 1] - pattern.block_ptr[node];
+            double* const front = blocks.get() + pattern.block_ptr[node];
+            std::fill_n(front, panel_entries, 0.0);
             info.maximum_panel_entries = std::max(info.maximum_panel_entries,
                 static_cast<std::uint64_t>(panel_entries));
             contributors.clear();
@@ -409,87 +450,84 @@ bool factorize(
             for (index_t source_node : contributors) {
                 const index_t source_first = pattern.nodes[static_cast<std::size_t>(source_node)];
                 const index_t source_last = pattern.nodes[static_cast<std::size_t>(source_node + 1)];
-                const auto common_begin = std::lower_bound(rows.begin() +
-                    col_ptr[static_cast<std::size_t>(source_first)], rows.begin() +
-                    col_ptr[static_cast<std::size_t>(source_first + 1)], first);
+                const index_t source_width = source_last - source_first;
+                const auto source_rows = rows.begin() + col_ptr[static_cast<std::size_t>(source_first)];
+                const auto source_end = rows.begin() + col_ptr[static_cast<std::size_t>(source_first + 1)];
+                const auto common_begin = std::lower_bound(source_rows, source_end, first);
+                // The source rows from the first one inside this node onwards
+                // all lie in this node (elimination tree containment), so they
+                // are a contiguous run of the source block's rows, starting at
+                // block row common_row (row 0 is the diagonal row
+                // source_first). Output columns, the rows among them that are
+                // this node's columns, come first: output_columns is a prefix
+                // of output_rows.
+                const index_t common_row = 1 + static_cast<index_t>(common_begin - source_rows);
                 output_rows.clear();
                 output_columns.clear();
-                source_offsets.clear();
-                for (auto row = common_begin; row != rows.begin() +
-                     col_ptr[static_cast<std::size_t>(source_first + 1)]; ++row) {
+                for (auto row = common_begin; row != source_end; ++row) {
                     const index_t position = row_position[static_cast<std::size_t>(*row)];
-                    if (position < 0) continue;
+                    if (position < 0) throw std::logic_error("noncontiguous symmetric contributor");
                     output_rows.push_back(position);
-                    source_offsets.push_back(static_cast<index_t>(row - common_begin));
                     if (position < width) output_columns.push_back(position);
                 }
                 const index_t active_rows = static_cast<index_t>(output_rows.size());
                 const index_t active_cols = static_cast<index_t>(output_columns.size());
                 workspace();
                 if (active_cols == 0) throw std::logic_error("empty symmetric contributor");
+                // L[R,Q] in place: active_rows full rows of the finished
+                // source block (row stride source_width), each holding final,
+                // scanned L entries in all source_width columns.
+                const double* const source = blocks.get() +
+                    pattern.block_ptr[static_cast<std::size_t>(source_node)] +
+                    static_cast<std::size_t>(common_row * source_width);
+                const double* const pivots = diagonal.data() + source_first;
                 if (checked_product(active_rows, active_cols) < 256) {
                     // Tiny intersections use sparse outer products, retaining
-                    // the same source order without packing structural zeros.
-                    // Every target is a front entry, tested later as a pivot
-                    // or an L entry (see the finiteness note below).
-                    for (index_t source = source_first; source < source_last; ++source) {
-                        const auto source_begin = std::lower_bound(rows.begin() +
-                            col_ptr[static_cast<std::size_t>(source)], rows.begin() +
-                            col_ptr[static_cast<std::size_t>(source + 1)], first);
-                        const index_t offset = static_cast<index_t>(source_begin - rows.begin());
+                    // the same source order without packing structural zeros:
+                    // per source column k, F[i][j] -= (l[j][k] * d[k]) *
+                    // l[i][k]. Every target is a front entry, tested later as
+                    // a pivot or an L entry (see the finiteness note below).
+                    for (index_t k = 0; k < source_width; ++k) {
                         for (index_t j = 0; j < active_cols; ++j) {
-                            const double weighted = values[static_cast<std::size_t>(
-                                offset + source_offsets[static_cast<std::size_t>(j)])] *
-                                diagonal[static_cast<std::size_t>(source)];
+                            const double weighted = source[j * source_width + k] * pivots[k];
                             for (index_t i = j; i < active_rows; ++i) {
                                 double& value = front[static_cast<std::size_t>(
                                     output_rows[static_cast<std::size_t>(i)] * width +
                                     output_columns[static_cast<std::size_t>(j)])];
-                                value -= weighted * values[static_cast<std::size_t>(
-                                    offset + source_offsets[static_cast<std::size_t>(i)])];
+                                value -= weighted * source[i * source_width + k];
                             }
                         }
                     }
                     // Each source column applies active_rows - j terms to
                     // output column j.
-                    info.update_flops += 2 * static_cast<std::uint64_t>(source_last - source_first) *
+                    info.update_flops += 2 * static_cast<std::uint64_t>(source_width) *
                         static_cast<std::uint64_t>(active_cols * active_rows -
                             active_cols * (active_cols - 1) / 2);
                     continue;
                 }
-                // Pack the whole contributor once, left = L[R,Q] D_Q as
-                // [active_rows x source_width] and right = L[J,Q].T as
-                // [source_width x active_cols], and apply it in one rank
-                // source_width update: each entry sums all of this node's
-                // terms in ascending source column and subtracts them once.
-                // Each buffer holds at most source_width times the source
-                // node's height, the size of that node's dense rectangle.
-                const index_t source_width = source_last - source_first;
-                left.resize(checked_product(active_rows, source_width));
+                // Apply the whole contributor in one rank source_width update,
+                // left = L[R,Q] read in place and right = D_Q L[J,Q].T packed
+                // as [source_width x active_cols], right[k][j] = d[k] *
+                // l[j][k]: each entry sums all of this node's terms
+                // l[i][k] * (d[k] * l[j][k]) in ascending source column and
+                // subtracts them once. right holds at most source_width times
+                // the source node's height, the size of its block.
                 right.resize(checked_product(source_width, active_cols));
                 workspace();
                 const auto pack_start = std::chrono::steady_clock::now();
-                for (index_t k = 0; k < source_width; ++k) {
-                    const index_t source = source_first + k;
-                    const auto source_begin = std::lower_bound(rows.begin() +
-                        col_ptr[static_cast<std::size_t>(source)], rows.begin() +
-                        col_ptr[static_cast<std::size_t>(source + 1)], first);
-                    const index_t offset = static_cast<index_t>(source_begin - rows.begin());
-                    for (index_t i = 0; i < active_rows; ++i) {
-                        const double value = values[static_cast<std::size_t>(
-                            offset + source_offsets[static_cast<std::size_t>(i)])];
-                        // An overflow here reaches the kernel's flag through
-                        // output column 0, which every packed row updates.
-                        const double weighted = value * diagonal[static_cast<std::size_t>(source)];
-                        left[static_cast<std::size_t>(i * source_width + k)] = weighted;
-                        if (i < active_cols) right[static_cast<std::size_t>(k * active_cols + i)] = value;
+                for (index_t j = 0; j < active_cols; ++j) {
+                    const double* const l = source + j * source_width;
+                    // An overflow here reaches the kernel's flag through
+                    // output entry (j, j), which every update computes.
+                    for (index_t k = 0; k < source_width; ++k) {
+                        right[static_cast<std::size_t>(k * active_cols + j)] = pivots[k] * l[k];
                     }
                 }
                 info.pack_seconds += std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - pack_start).count();
                 // left_stride == rank == source_width.
-                rank_update(front, width, output_rows, output_columns, left, source_width, right,
-                    source_width, kernels, executor, threads, info);
+                rank_update(front, width, output_rows, output_columns, source, source_width,
+                    right.data(), source_width, kernels, executor, threads, info);
             }
             info.source_seconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - source_start).count();
@@ -498,8 +536,8 @@ bool factorize(
             // instead every node-rectangle entry on or below the diagonal ends
             // as a pivot or as an L entry, and both are tested: each pivot
             // before it is used (positive and finite), each panel's L
-            // entries by one scan after their last write, before the node is
-            // published. This is complete because:
+            // entries by one scan after their last write, before a later
+            // node reads the block. This is complete because:
             // - entries combine only through +, -, * and division by a tested
             //   pivot, and these keep an Inf or NaN operand non-finite (Inf*0
             //   and Inf-Inf are NaN), so a non-finite entry stays non-finite
@@ -510,11 +548,14 @@ bool factorize(
             //   updates the future pivot (i, i) with L[i][p]; S[k][p] =
             //   d[k] * L[p][k] is formed only when rows below the block exist,
             //   and enters each such row's L[i][p];
-            // - packed kernel operands (l * d) reach the kernel's flag, which
-            //   is authoritative: every packed row updates output column 0,
-            //   which each kernel call computes, and a false flag (a kernel
-            //   may stop early) rejects the attempt before any later use.
-            // A rejected attempt publishes nothing and falls back to LU.
+            // - a contributor's in-place left operand holds only tested L
+            //   entries, and its packed right operand d[k] * l[j][k] enters
+            //   output entry (j, j) with the nonzero l[j][k] (a zero l gives
+            //   a zero product). That diagonal entry lies in a diagonal tile,
+            //   which is never skipped, so the kernel's flag sees it; the
+            //   flag is authoritative, and a false flag (a kernel may stop
+            //   early) rejects the attempt before any later use.
+            // A rejected attempt assembles nothing and falls back to LU.
             constexpr auto order = dense_kernels::Accumulate::sum_then_subtract;
             // Trailing work is split into fixed strips of node rows, so the
             // partition depends on positions only. Rows are independent: a
@@ -524,7 +565,7 @@ bool factorize(
             // them parallel at eight threads under worth_parallel's two items
             // per thread.
             constexpr index_t strip_rows = 16;
-            double* const rect = front.data();
+            double* const rect = front;
             const auto panel_start = std::chrono::steady_clock::now();
             for (index_t begin = 0; begin < width; begin += panel_width) {
                 const index_t end = std::min(width, begin + panel_width);
@@ -631,14 +672,6 @@ bool factorize(
             }
             info.panel_seconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - panel_start).count();
-            for (index_t col = first; col < last; ++col) {
-                for (index_t p = col_ptr[static_cast<std::size_t>(col)];
-                     p < col_ptr[static_cast<std::size_t>(col + 1)]; ++p) {
-                    const index_t position = row_position[static_cast<std::size_t>(rows[p])];
-                    values[static_cast<std::size_t>(p)] = front[static_cast<std::size_t>(
-                        position * width + col - first)];
-                }
-            }
             row_position[static_cast<std::size_t>(first)] = -1;
             for (index_t p = row_begin; p < row_end; ++p) {
                 row_position[static_cast<std::size_t>(rows[p])] = -1;
@@ -648,6 +681,68 @@ bool factorize(
         return false;
     }
     return true;
+}
+
+// Copy the strict lower entries of every factored node block into the CSC
+// values, once all pivots have passed. Column first + c of a node stores
+// block rows c + 1, ..., height - 1 of block column c, in this order: the
+// node's later columns, then its tail rows (find_nodes accepts a column only
+// when its strict rows are those of the previous column without its first).
+// Entries that cancelled to zero are copied as stored zeros. Work items are
+// the fixed column ranges [8 * item, 8 * item + 8), split at node boundaries;
+// each part is copied row by row, so each block row is read once. Items write
+// disjoint columns and only copy, so neither the partition nor the thread
+// that runs an item can change a value. The copy is memory bound; it runs on
+// the worker team for at least 2^18 entries (2 MB of values, about 0.15 ms
+// on one thread) and two items per thread, counting at most eight threads.
+template <typename Executor>
+void assemble(
+    const Pattern& pattern, const std::vector<index_t>& col_ptr,
+    const double* blocks, std::vector<double>& values,
+    Executor& executor, int threads
+) {
+    constexpr index_t group = 8;
+    const index_t n = static_cast<index_t>(col_ptr.size()) - 1;
+    const auto items = static_cast<std::size_t>((n + group - 1) / group);
+    auto copy = [&](std::size_t item, int) {
+        const index_t stop = std::min(n, static_cast<index_t>(item + 1) * group);
+        for (index_t start = static_cast<index_t>(item) * group; start < stop;) {
+            const index_t node = pattern.column_nodes[static_cast<std::size_t>(start)];
+            const index_t first = pattern.nodes[static_cast<std::size_t>(node)];
+            const index_t width = pattern.nodes[static_cast<std::size_t>(node + 1)] - first;
+            const index_t height = 1 + col_ptr[static_cast<std::size_t>(first + 1)] -
+                col_ptr[static_cast<std::size_t>(first)];
+            const index_t begin = start - first;
+            const index_t end = std::min(width, stop - first);
+            const double* const block = blocks + pattern.block_ptr[static_cast<std::size_t>(node)];
+            // Block row r of column col goes to CSC position
+            // col_ptr[first + col] + r - (col + 1), that is, base + r.
+            index_t base[group];
+            for (index_t col = begin; col < end; ++col) {
+                const index_t column = first + col;
+                if (col_ptr[static_cast<std::size_t>(column + 1)] -
+                    col_ptr[static_cast<std::size_t>(column)] != height - 1 - col) {
+                    throw std::logic_error("inconsistent symmetric node pattern");
+                }
+                base[col - begin] = col_ptr[static_cast<std::size_t>(column)] - (col + 1);
+            }
+            for (index_t row = begin + 1; row < height; ++row) {
+                const double* const source = block + row * width;
+                const index_t row_end = std::min(end, row);
+                for (index_t col = begin; col < row_end; ++col) {
+                    values[static_cast<std::size_t>(base[col - begin] + row)] = source[col];
+                }
+            }
+            start = first + end;
+        }
+    };
+    constexpr int counted_threads = 8;
+    if (threads > 1 && values.size() >= (std::size_t{1} << 18) &&
+        items >= 2 * static_cast<std::size_t>(std::min(threads, counted_threads))) {
+        executor.parallel_for(items, copy);
+    } else {
+        for (std::size_t item = 0; item < items; ++item) copy(item, 0);
+    }
 }
 
 } // namespace sparse_ldlt

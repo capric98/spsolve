@@ -255,11 +255,20 @@ $$F_{R \cap R_Q,\; J \cap R_Q} \;\leftarrow\; F_{R \cap R_Q,\; J \cap R_Q}
 The rows of $Q$ that fall inside the target are a contiguous suffix of $Q$'s
 row list (a consequence of the elimination tree: once a column of $Q$ has a
 nonzero in a row of $J$, all its later rows are in $R$), which is what makes
-the operands dense rectangles. Contributors are visited in increasing node
-order, and each output entry accumulates its terms in that order regardless of
-threading. Each contributor is one rank-$|Q|$ update: an entry forms
-$s = \sum_{q \in Q} (l_{iq} d_q)\, l_{jq}$ from zero in ascending $q$ and
-subtracts $s$ once (Section 11).
+the operands dense rectangles. Each node's $H \times W$ block is kept, row
+major, in one array for all nodes until every node is factored, so
+$L_{R \cap R_Q,\,Q}$ is a run of consecutive full rows of $Q$'s finished block
+and is read in place; only $D_Q L_{J \cap R_Q,\,Q}^{\,T}$ is packed. The CSC
+factor is copied from the blocks once, after the last pivot has been
+accepted. For a node of width $W$ and height $H$ the block holds
+$HW = \mathrm{nnz} + W(W+1)/2$ entries for its
+$\mathrm{nnz} = HW - W(W+1)/2$ strict entries of $L$, and
+$HW \le 2\,\mathrm{nnz} + W$ because $H \ge W$; summed over the nodes, the
+blocks hold at most $2\,\mathrm{nnz}(L) + n$ entries. Contributors are
+visited in increasing node order, and each output entry accumulates its terms
+in that order regardless of threading. Each contributor is one rank-$|Q|$
+update: an entry forms $s = \sum_{q \in Q} l_{iq}\, (d_q\, l_{jq})$ from zero
+in ascending $q$ and subtracts $s$ once (Section 11).
 
 The diagonal block $F_{J,J}$ is then factored without pivoting in panels of
 $w = 32$ columns. For a panel $P \subset J$ with the rows $R'$ below it:
