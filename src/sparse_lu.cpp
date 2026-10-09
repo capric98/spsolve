@@ -195,6 +195,10 @@ private:
     std::exception_ptr worker_error_;
 };
 
+// Validates the CSC arrays and, in the same pass, accumulates every row's
+// largest magnitude for equilibration into row_max (resized to n), in the
+// order and with the expression of a separate pass. The caller checks the
+// maxima (zero rows, scaling overflow) after ordering, as before.
 template <typename Int>
 void validate_csc(
     const double* data,
@@ -204,7 +208,8 @@ void validate_csc(
     index_t indices_size,
     index_t indptr_size,
     index_t n,
-    bool check_finite
+    bool check_finite,
+    std::vector<double>& row_max
 ) {
     if (n < 0) {
         throw nb::value_error("matrix dimension must be non-negative");
@@ -218,6 +223,7 @@ void validate_csc(
     if (indptr[0] != 0 || static_cast<index_t>(indptr[n]) != data_size) {
         throw nb::value_error("invalid CSC indptr endpoints");
     }
+    row_max.assign(static_cast<std::size_t>(n), 0.0);
     for (index_t col = 0; col < n; ++col) {
         const index_t begin = static_cast<index_t>(indptr[col]);
         const index_t end = static_cast<index_t>(indptr[col + 1]);
@@ -236,6 +242,83 @@ void validate_csc(
             previous = row;
             if (check_finite && !std::isfinite(data[p])) {
                 throw nb::value_error("matrix contains NaN or infinity");
+            }
+            row_max[static_cast<std::size_t>(row)] = std::max(
+                row_max[static_cast<std::size_t>(row)], std::abs(data[p]));
+        }
+    }
+}
+
+// The largest |a_ij| * row_scale[i] of one column. std::max(acc, x) keeps acc
+// when x is NaN, and the accumulators start at +0 and never hold a NaN, so
+// every accumulator is the maximum of its non-NaN terms. max is exact and
+// commutative on those, so four interleaved accumulators return bitwise the
+// value of one running maximum while shortening its dependency chain.
+template <typename Int>
+[[nodiscard]] double scaled_column_max(
+    const double* data,
+    const Int* indices,
+    index_t begin,
+    index_t end,
+    const double* row_scale
+) {
+    double first = 0.0, second = 0.0, third = 0.0, fourth = 0.0;
+    index_t p = begin;
+    for (; p + 4 <= end; p += 4) {
+        first = std::max(first, std::abs(data[p]) *
+            row_scale[static_cast<std::size_t>(indices[p])]);
+        second = std::max(second, std::abs(data[p + 1]) *
+            row_scale[static_cast<std::size_t>(indices[p + 1])]);
+        third = std::max(third, std::abs(data[p + 2]) *
+            row_scale[static_cast<std::size_t>(indices[p + 2])]);
+        fourth = std::max(fourth, std::abs(data[p + 3]) *
+            row_scale[static_cast<std::size_t>(indices[p + 3])]);
+    }
+    for (; p < end; ++p) {
+        first = std::max(first, std::abs(data[p]) *
+            row_scale[static_cast<std::size_t>(indices[p])]);
+    }
+    return std::max(std::max(first, second), std::max(third, fourth));
+}
+
+// Per row of the scaled, column-permuted matrix: the number of nonzero scaled
+// values and the first and last factor columns holding one (first and last
+// are meaningful only for a nonzero count). The row engine sizes its setup
+// storage from these before filling it.
+struct SetupCounts {
+    std::vector<index_t> count;
+    std::vector<index_t> first;
+    std::vector<index_t> last;
+};
+
+// One pass over the columns in factor order. Each value is computed with the
+// expression of the setup fill, data * row_scale * col_scale, so the counts
+// see exactly its nonzeros (a product can underflow to zero).
+template <typename Int>
+void count_scaled_rows(
+    const double* data,
+    const Int* indices,
+    const Int* indptr,
+    index_t n,
+    const std::vector<index_t>& perm_c,
+    const std::vector<double>& row_scale,
+    const std::vector<double>& col_scale,
+    SetupCounts& counts
+) {
+    counts.count.assign(static_cast<std::size_t>(n), 0);
+    counts.first.assign(static_cast<std::size_t>(n), 0);
+    counts.last.assign(static_cast<std::size_t>(n), 0);
+    for (index_t new_col = 0; new_col < n; ++new_col) {
+        const index_t original_col = perm_c[static_cast<std::size_t>(new_col)];
+        const index_t begin = static_cast<index_t>(indptr[original_col]);
+        const index_t end = static_cast<index_t>(indptr[original_col + 1]);
+        const double scale = col_scale[static_cast<std::size_t>(original_col)];
+        for (index_t p = begin; p < end; ++p) {
+            const auto row = static_cast<std::size_t>(indices[p]);
+            const double value = data[p] * row_scale[row] * scale;
+            if (value != 0.0) {
+                if (counts.count[row]++ == 0) counts.first[row] = new_col;
+                counts.last[row] = new_col;
             }
         }
     }
@@ -522,6 +605,20 @@ void update_dense_row(
     }
 }
 
+// True iff every stored entry (row, col) has a stored transpose (col, row)
+// with an exactly equal value. LDL.T uses only one triangle; without a caller
+// symmetry assumption, accepting unequal entries would factor another matrix.
+//
+// O(nnz) transpose walk over sorted CSC: columns are visited in increasing
+// order, so the entries (row, col) that name column `row` as their transpose
+// arrive in increasing col, which is the sorted order of column `row`. Each
+// must therefore be the next unconsumed entry of column `row` (cursor[row])
+// with row index col and an equal value. If A is exactly symmetric every
+// step succeeds. If every step succeeds, each entry has an equal transpose
+// (the consumed one). Consumed positions are distinct, so this is the same
+// test as a lookup per entry. Degree check: when column col starts, its
+// entries above the diagonal must all have been consumed by row col's
+// entries left of the diagonal; a remaining one has no transpose.
 template <typename Int>
 [[nodiscard]] bool is_exactly_symmetric(
     const double* data,
@@ -529,19 +626,23 @@ template <typename Int>
     const Int* indptr,
     index_t n
 ) {
+    std::vector<index_t> cursor(static_cast<std::size_t>(n));
     for (index_t col = 0; col < n; ++col) {
-        for (index_t p = static_cast<index_t>(indptr[col]);
-             p < static_cast<index_t>(indptr[col + 1]); ++p) {
-            const index_t row = static_cast<index_t>(indices[p]);
-            const Int* first = indices + static_cast<index_t>(indptr[row]);
-            const Int* last = indices + static_cast<index_t>(indptr[row + 1]);
-            const Int needle = static_cast<Int>(col);
-            const Int* transpose = std::lower_bound(first, last, needle);
-            if (transpose == last || *transpose != needle) return false;
-            const index_t transpose_position = static_cast<index_t>(transpose - indices);
-            // LDL.T uses only one triangle. Without a caller symmetry assumption,
-            // accepting unequal entries would factor a different matrix.
-            if (data[p] != data[transpose_position]) return false;
+        cursor[static_cast<std::size_t>(col)] = static_cast<index_t>(indptr[col]);
+    }
+    for (index_t col = 0; col < n; ++col) {
+        const index_t end = static_cast<index_t>(indptr[col + 1]);
+        const index_t next = cursor[static_cast<std::size_t>(col)];
+        if (next < end && static_cast<index_t>(indices[next]) < col) return false;
+        for (index_t p = static_cast<index_t>(indptr[col]); p < end; ++p) {
+            const auto row = static_cast<std::size_t>(indices[p]);
+            const index_t transpose = cursor[row];
+            if (transpose >= static_cast<index_t>(indptr[row + 1]) ||
+                static_cast<index_t>(indices[transpose]) != col ||
+                data[p] != data[transpose]) {
+                return false;
+            }
+            cursor[row] = transpose + 1;
         }
     }
     return true;
@@ -802,6 +903,8 @@ template <typename Int>
     return true;
 }
 
+// Every result field this function writes must be listed in ProbeRestart,
+// which restores them when the COLAMD probe restarts in the row engine.
 template <typename Int>
 bool factorize_left_looking(
     const std::shared_ptr<NativeSparseLU>& result,
@@ -1078,6 +1181,85 @@ bool factorize_left_looking(
     return true;
 }
 
+// Restart state of the COLAMD probe. factorize_left_looking reads perm_c_,
+// the scales, input_nnz_ and ordering_estimated_l_nnz_, and writes only the
+// fields below besides numeric_probe_*, which the caller sets after the probe
+// either way. The permutation and scales are kept as the pristine snapshot
+// that the probe's workspace accounting counts. restore() move-assigns every
+// saved field, which also releases the discarded CSC factor buffers. Keep
+// this list in sync with every result field factorize_left_looking writes.
+struct ProbeRestart {
+    std::vector<index_t> perm_c;
+    std::vector<double> row_scale;
+    std::vector<double> col_scale;
+    std::string numeric_engine;
+    bool column_storage = false;
+    std::vector<index_t> perm_r;
+    std::vector<index_t> l_col_ptr;
+    std::vector<index_t> l_row_indices;
+    std::vector<double> l_values;
+    std::vector<index_t> u_col_ptr;
+    std::vector<index_t> u_row_indices;
+    std::vector<double> u_values;
+    index_t factor_nnz = 0;
+    index_t row_updates = 0;
+    index_t pivot_swaps = 0;
+    index_t largest_front = 0;
+    index_t supernodes = 0;
+    double fill_ratio = 0.0;
+    double numeric_seconds = 0.0;
+    double factor_seconds = 0.0;
+    std::uint64_t peak_workspace_bytes = 0;
+
+    void save(const NativeSparseLU& state) {
+        perm_c = state.perm_c_;
+        row_scale = state.row_scale_;
+        col_scale = state.col_scale_;
+        numeric_engine = state.numeric_engine_;
+        column_storage = state.column_storage_;
+        perm_r = state.perm_r_;
+        l_col_ptr = state.l_col_ptr_;
+        l_row_indices = state.l_row_indices_;
+        l_values = state.l_values_;
+        u_col_ptr = state.u_col_ptr_;
+        u_row_indices = state.u_row_indices_;
+        u_values = state.u_values_;
+        factor_nnz = state.factor_nnz_;
+        row_updates = state.row_updates_;
+        pivot_swaps = state.pivot_swaps_;
+        largest_front = state.largest_front_;
+        supernodes = state.supernodes_;
+        fill_ratio = state.fill_ratio_;
+        numeric_seconds = state.numeric_seconds_;
+        factor_seconds = state.factor_seconds_;
+        peak_workspace_bytes = state.peak_workspace_bytes_;
+    }
+
+    void restore(NativeSparseLU& state) {
+        state.perm_c_ = std::move(perm_c);
+        state.row_scale_ = std::move(row_scale);
+        state.col_scale_ = std::move(col_scale);
+        state.numeric_engine_ = std::move(numeric_engine);
+        state.column_storage_ = column_storage;
+        state.perm_r_ = std::move(perm_r);
+        state.l_col_ptr_ = std::move(l_col_ptr);
+        state.l_row_indices_ = std::move(l_row_indices);
+        state.l_values_ = std::move(l_values);
+        state.u_col_ptr_ = std::move(u_col_ptr);
+        state.u_row_indices_ = std::move(u_row_indices);
+        state.u_values_ = std::move(u_values);
+        state.factor_nnz_ = factor_nnz;
+        state.row_updates_ = row_updates;
+        state.pivot_swaps_ = pivot_swaps;
+        state.largest_front_ = largest_front;
+        state.supernodes_ = supernodes;
+        state.fill_ratio_ = fill_ratio;
+        state.numeric_seconds_ = numeric_seconds;
+        state.factor_seconds_ = factor_seconds;
+        state.peak_workspace_bytes_ = peak_workspace_bytes;
+    }
+};
+
 template <typename Int>
 std::shared_ptr<NativeSparseLU> factorize_typed(
     const double* data,
@@ -1092,8 +1274,9 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
     int num_threads,
     bool check_finite
 ) {
+    std::vector<double> row_max;
     validate_csc(data, indices, indptr, data_size, indices_size, indptr_size,
-                 n, check_finite);
+                 n, check_finite, row_max);
     if (!(diag_pivot_thresh >= 0.0 && diag_pivot_thresh <= 1.0)) {
         throw nb::value_error("diag_pivot_thresh must be between 0 and 1");
     }
@@ -1139,16 +1322,9 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
     result->ordering_seconds_ = std::chrono::duration<double>(
         Clock::now() - ordering_start).count();
 
-    // Equilibrate by infinity norms. Zero rows and columns are structurally singular.
-    std::vector<double> row_max(static_cast<std::size_t>(n), 0.0);
-    for (index_t col = 0; col < n; ++col) {
-        for (index_t p = static_cast<index_t>(indptr[col]);
-             p < static_cast<index_t>(indptr[col + 1]); ++p) {
-            const index_t row = static_cast<index_t>(indices[p]);
-            row_max[static_cast<std::size_t>(row)] = std::max(
-                row_max[static_cast<std::size_t>(row)], std::abs(data[p]));
-        }
-    }
+    // Equilibrate by infinity norms. Zero rows and columns are structurally
+    // singular. validate_csc accumulated the row maxima; the checks run here,
+    // after ordering, rows and then columns, each in natural order.
     for (index_t row = 0; row < n; ++row) {
         const double maximum = row_max[static_cast<std::size_t>(row)];
         if (maximum == 0.0) {
@@ -1160,20 +1336,16 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
         }
         result->row_scale_[static_cast<std::size_t>(row)] = scale;
     }
+    std::vector<double>().swap(row_max);
 
-    std::vector<double> col_max(static_cast<std::size_t>(n), 0.0);
     for (index_t col = 0; col < n; ++col) {
-        for (index_t p = static_cast<index_t>(indptr[col]);
-             p < static_cast<index_t>(indptr[col + 1]); ++p) {
-            const index_t row = static_cast<index_t>(indices[p]);
-            col_max[static_cast<std::size_t>(col)] = std::max(
-                col_max[static_cast<std::size_t>(col)],
-                std::abs(data[p]) * result->row_scale_[static_cast<std::size_t>(row)]);
-        }
-        if (col_max[static_cast<std::size_t>(col)] == 0.0) {
+        const double maximum = scaled_column_max(
+            data, indices, static_cast<index_t>(indptr[col]),
+            static_cast<index_t>(indptr[col + 1]), result->row_scale_.data());
+        if (maximum == 0.0) {
             throw std::runtime_error("factor is exactly singular: matrix contains a zero column");
         }
-        const double scale = 1.0 / col_max[static_cast<std::size_t>(col)];
+        const double scale = 1.0 / maximum;
         if (!std::isfinite(scale)) {
             throw std::runtime_error("matrix column scaling overflowed");
         }
@@ -1199,10 +1371,13 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
     };
 
     if (ordering == "COLAMD") {
-        // Restart from pristine state if actual CSC work is unsuitable. Copy
-        // only the construction state; no partial factors exist at this point.
+        // Restart from pristine state if actual CSC work is unsuitable. The
+        // snapshot holds the requested permutation and equilibration, which
+        // the probe only reads (the workspace counted below), and every field
+        // factorize_left_looking writes; no partial factors exist yet.
         const auto probe_start = Clock::now();
-        NativeSparseLU restart_state = *result;
+        ProbeRestart restart_state;
+        restart_state.save(*result);
         const bool completed = factorize_left_looking(
             result, data, indices, indptr, n, diag_pivot_thresh, true);
         const double probe_seconds = std::chrono::duration<double>(
@@ -1220,7 +1395,7 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
                 result->l_row_indices_.capacity() + result->u_row_indices_.capacity());
             probe_workspace += sizeof(double) * (
                 result->l_values_.capacity() + result->u_values_.capacity());
-            *result = std::move(restart_state);
+            restart_state.restore(*result);
         }
         result->numeric_probe_columns_ = probe_columns;
         result->numeric_probe_max_front_ = probe_front;
@@ -1253,23 +1428,20 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
         return result;
     }
 
+    // Setup: rows are sized from their counts before any value is stored.
+    // A row that passes the dense test of should_use_dense(row, 0) on its
+    // initial entries (at least 64, filling at least 25% of the span from
+    // its first to its last column) gets the dense tail convert_to_dense
+    // would build, [first, min(n, first multiple of 64 above last)), and
+    // receives its values there directly. Sparse rows receive sorted Entry
+    // lists with exact capacity. Only sparse rows are listed in
+    // active_columns: a setup-dense row is found through dense_rows, or
+    // through the panel block inside a panel (see the candidate scan).
+    SetupCounts setup_counts;
+    count_scaled_rows(data, indices, indptr, n, result->perm_c_, result->row_scale_,
+                      result->col_scale_, setup_counts);
     std::vector<WorkRow> rows(static_cast<std::size_t>(n));
     std::vector<std::vector<index_t>> active_columns(static_cast<std::size_t>(n));
-    for (index_t new_col = 0; new_col < n; ++new_col) {
-        const index_t original_col = result->perm_c_[static_cast<std::size_t>(new_col)];
-        for (index_t p = static_cast<index_t>(indptr[original_col]);
-             p < static_cast<index_t>(indptr[original_col + 1]); ++p) {
-            const index_t row = static_cast<index_t>(indices[p]);
-            const double value = data[p] *
-                result->row_scale_[static_cast<std::size_t>(row)] *
-                result->col_scale_[static_cast<std::size_t>(original_col)];
-            if (value != 0.0) {
-                rows[static_cast<std::size_t>(row)].active.push_back({new_col, value});
-                active_columns[static_cast<std::size_t>(new_col)].push_back(row);
-            }
-        }
-    }
-
     // Initially dense rows wait in pending_dense, ordered by (dense_offset,
     // row_id), until the factorization reaches their first stored column. A
     // dense row has exact zeros before dense_offset, so it cannot be a
@@ -1279,15 +1451,55 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
     std::size_t pending_dense_cursor = 0;
     index_t converted_dense_rows = 0;
     index_t active_dense_rows = 0;
-    for (index_t row_id = 0; row_id < n; ++row_id) {
-        auto& row = rows[static_cast<std::size_t>(row_id)];
-        if (should_use_dense(row, 0)) {
-            convert_to_dense(row, n, 0);
-            pending_dense.push_back(row_id);
-            ++converted_dense_rows;
-            ++active_dense_rows;
+    {
+        // Dense rows' storage, indexed by row (null for a sparse row); a value
+        // in factor column c lands at dense[c - first].
+        std::vector<double*> dense_storage(static_cast<std::size_t>(n), nullptr);
+        for (index_t row_id = 0; row_id < n; ++row_id) {
+            const auto slot = static_cast<std::size_t>(row_id);
+            auto& row = rows[slot];
+            const index_t count = setup_counts.count[slot];
+            if (count == 0) continue;
+            const index_t first = setup_counts.first[slot];
+            const index_t last = setup_counts.last[slot];
+            if (count >= 64 && static_cast<std::uint64_t>(count) * 4 >=
+                    static_cast<std::uint64_t>(last - first + 1)) {
+                const index_t end = std::min(n, (last + 1 + 63) / 64 * 64);
+                row.dense_offset = first;
+                row.dense.assign(static_cast<std::size_t>(end - first), 0.0);
+                row.dense_mode = true;
+                dense_storage[slot] = row.dense.data();
+                pending_dense.push_back(row_id);
+                ++converted_dense_rows;
+                ++active_dense_rows;
+            } else {
+                row.active.reserve(static_cast<std::size_t>(count));
+            }
+        }
+        std::vector<index_t> column_rows;
+        for (index_t new_col = 0; new_col < n; ++new_col) {
+            const index_t original_col = result->perm_c_[static_cast<std::size_t>(new_col)];
+            const double scale = result->col_scale_[static_cast<std::size_t>(original_col)];
+            column_rows.clear();
+            for (index_t p = static_cast<index_t>(indptr[original_col]);
+                 p < static_cast<index_t>(indptr[original_col + 1]); ++p) {
+                const auto row = static_cast<std::size_t>(indices[p]);
+                const double value = data[p] * result->row_scale_[row] * scale;
+                if (value == 0.0) continue;
+                if (double* dense = dense_storage[row]) {
+                    dense[static_cast<std::size_t>(new_col - setup_counts.first[row])] = value;
+                } else {
+                    rows[row].active.push_back({new_col, value});
+                    column_rows.push_back(static_cast<index_t>(row));
+                }
+            }
+            if (!column_rows.empty()) {
+                active_columns[static_cast<std::size_t>(new_col)].assign(
+                    column_rows.begin(), column_rows.end());
+            }
         }
     }
+    setup_counts = SetupCounts{};
     std::stable_sort(pending_dense.begin(), pending_dense.end(),
         [&](index_t left, index_t right) {
             return rows[static_cast<std::size_t>(left)].dense_offset <
@@ -1355,10 +1567,14 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
             candidates.push_back(row_id);
             candidate_values.push_back(value);
         };
-        // A dense row listed here by an earlier sparse entry is examined once,
-        // through the bounded read; the dense loop skips rows already seen.
-        // Inside a panel, members are examined in the block instead, and no
-        // other dense row can have a nonzero in a panel column.
+        // The column lists hold sparse rows. A setup-dense row is never listed:
+        // it is in dense_rows from its first stored column on, and is found by
+        // the dense loop below or, inside a panel, as a member in the block.
+        // A row converted during the factorization stays listed by its sparse
+        // entries; it is examined once, through the bounded read, and the
+        // dense loop skips rows already seen. Inside a panel, members are
+        // examined in the block instead, and no other dense row can have a
+        // nonzero in a panel column.
         for (const index_t row_id : active_columns[static_cast<std::size_t>(pivot_col)]) {
             if (panel_active && panel.is_member(row_id)) continue;
             if (seen[static_cast<std::size_t>(row_id)] == pivot_col) continue;

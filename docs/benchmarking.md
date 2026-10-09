@@ -249,6 +249,35 @@ its right (NATURAL) packs 369 instead of 1,169 columns per flush and runs
 packs at most 611 (`MMD_AT_PLUS_A`) and 1,913 (`COLAMD`) columns per flush,
 down from 643 and 2,327.
 
+The setup rework that followed (row maxima accumulated during validation,
+column maxima with four running maxima, an O(nnz) symmetry walk instead of a
+binary search per entry, and a count-then-fill row-engine setup that fills
+dense tails directly; see [the design notes](native-lu.md#factorization-pipeline))
+kept every factor, statistic, and error message bitwise identical. Interleaved
+runs against the previous build (`avx2-fma`, medians of five rounds) reduced
+the time outside `ordering_seconds` and `factor_seconds` for connected dense
+LU of size 600 from 8.2 to 3.0 ms (`MMD_AT_PLUS_A`; 8.0 to 2.9 ms with
+`COLAMD`) and for five 600-wide blocks from 40.1 to 15.5 ms; end to end, the
+connected case ran in 11.3 instead of 15.9 ms with one thread and 8.6
+instead of 14.2 ms with eight, and the five blocks in 56.7 instead of 78.4 ms
+and 41.9 instead of 68.1 ms. Four exactly symmetric dense SPD blocks of size
+600 ran 19% faster (53.5 to 43.3 ms), mostly from the symmetry test, and
+`sparse-dense-border` 3% faster with eight threads; sparse controls
+(irregular, pivot-heavy, banded, row-permuted band, 2-D and 3-D Poisson)
+stayed within 1%. One-thread `numeric_seconds` of the dense cases moved
+within a few percent either way in interleaved A/B (one sequential run
+showed up to 7%), because the factor loop now first-touches its L and U
+storage instead of reusing memory freed by the discarded setup lists: page
+faults per connected factorization fell from about 3,400 to 2,300 overall
+but rose from about 540 to 1,330 inside the loop. In full benchmark runs
+every `MMD_AT_PLUS_A` case except `dense-spd-blocks` passed the gate,
+including all dense general LU families; `dense-spd-blocks` sits at the
+1.05x boundary (1.05x and 1.07x in two runs). The `COLAMD` run still failed
+on 3-D Poisson (1.07x, within 1% of the previous build in interleaved
+runs), the row-permuted band (1.14x), and the dense SPD blocks (1.15x, down
+from 1.44x). One run on one platform does not meet the promotion rule
+below.
+
 ### Blocked SPD comparison
 
 Two sequential Windows x64 release comparisons used five batched samples per

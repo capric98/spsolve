@@ -206,6 +206,15 @@ result only when every pivot is positive and finite and otherwise fall back to
 pivoted LU of the same matrix. Indefinite matrices are never factored
 symmetrically.
 
+Exact symmetry ($a_{ij}$ stored iff $a_{ji}$ stored, with equal values) is
+tested in $O(\mathrm{nnz}(A) + n)$ on the sorted CSC input by a transpose
+walk: columns $j = 0, 1, \dots$ are visited in order, and each entry
+$(i, j)$ must equal the next unconsumed entry of column $i$, which must have
+row index $j$. The entries of $A$ that name column $i$ as their transpose
+arrive in increasing $j$, the sorted order of column $i$, so a symmetric
+matrix passes every step; conversely, a passing walk pairs every entry with a
+distinct equal transpose.
+
 ### Column recurrence (simplicial kernel)
 
 Working on the permuted matrix $B = P^T \tilde A P$, step $k$ determines row
@@ -422,7 +431,8 @@ one while both are tiny. No condition estimate is computed.
 
 | Phase | Cost |
 |---|---|
-| Canonicalization, validation, equilibration | $O(\mathrm{nnz}(A))$ |
+| Canonicalization, validation, equilibration, symmetry test | $O(\mathrm{nnz}(A) + n)$ |
+| Row-hybrid setup (count, then fill) | $O(\mathrm{nnz}(A) + n)$ plus the initial dense tails |
 | AMD / COLAMD ordering | near-linear in $\mathrm{nnz}(A)$ for typical graphs |
 | Elimination tree and column counts | $O(\mathrm{nnz}(L))$ |
 | Left-looking CSC LU | $O(\mathrm{flops}(LU) + \mathrm{nnz}(A))$ |

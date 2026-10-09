@@ -23,7 +23,8 @@ systems.
 
 1. Python converts the input to a copied, canonical CSC array, sums duplicate
    entries, removes explicit zeros, sorts indices, and checks shape/dtype.
-2. C++ validates CSC bounds and optional finiteness.
+2. C++ validates CSC bounds and optional finiteness, and in the same pass
+   accumulates each row's largest magnitude for equilibration.
 3. A column ordering is selected:
    - `NATURAL` preserves input order.
    - `COLAMD` uses the vendored COLAMD routine on the input pattern. Engine
@@ -33,14 +34,22 @@ systems.
      `A + A.T`. AMD's fill and maximum-front estimates also guide numeric
      engine selection.
 4. Rows and columns are equilibrated by infinity norms. Structural zero rows or
-   columns are reported as singular before numerical elimination.
+   columns are reported as singular before numerical elimination; rows are
+   checked first, then columns, each in natural order. Column maxima use
+   four interleaved running maxima per column, which is exact (the
+   maximum ignores NaN terms either way, so the scales are bitwise those of
+   one running maximum).
 5. The factorizer chooses one of three numerical engines:
    - An exactly symmetric matrix first attempts a sparse `LDL.T`
      factorization with symmetric equilibration, using whichever column
      permutation the caller requested as a symmetric permutation. Symmetry
      requires matching transpose entries with exactly equal values in the
      canonical input. Unequal entries, even one floating-point step apart,
-     use general LU so that neither triangle of the input is discarded.
+     use general LU so that neither triangle of the input is discarded. The
+     check is one O(nnz) transpose walk: visiting columns in order, each
+     entry `(i, j)` must match the next unconsumed entry of column `i`,
+     which must hold row `j` and an equal value; it stops at the first
+     mismatch.
      Positive pivots certify the SPD path. Its factors are exposed through the
      common LU contract as `L` and `D @ L.T`; internally it retains only the
      strict lower triangle and diagonal, constructing public `L` and `U`
@@ -68,7 +77,13 @@ systems.
      to 64 columns, and grows on demand; columns outside it are exact zeros.
      Later blocks of a block-diagonal matrix therefore carry no leading zero
      columns, and pivot candidate scans skip dense rows whose storage
-     excludes the pivot column.
+     excludes the pivot column. Setup counts each row's scaled nonzeros and
+     their first and last factor columns in one pass over the permuted
+     input, then applies the same dense test to those counts: a dense row's
+     tail is allocated and filled directly, and a sparse row's sorted entry
+     list is allocated at its exact size. Rows dense at setup never enter the
+     per-column candidate lists; they are found through the dense row list,
+     or the panel block inside a panel.
      Sparse rows receive eager updates and retain their fill adjacency. When
      at least 32 active rows are dense with at least 128 columns remaining,
      dense rows use panels of up to 32 pivot columns. A persistent `std::thread`
@@ -401,7 +416,10 @@ block, per-pivot panel state, the segment column mask, segment and tile
 lists, and packed L/U operands. It excludes retained factors, row-engine
 sparse/dense storage (including pivot rows retained until a flush), and
 worker runtime storage, and must not be interpreted as total row-engine peak
-memory.
+memory. At two or more threads its value depends on worker scheduling (it
+sums per-worker vector capacities, which grow with the items each worker
+happened to run), so it is stable only at one thread; it is a diagnostic,
+not part of the thread-count determinism contract.
 The SPD-specific `parallel_panels`, `dense_update_flops`, and `spd_*` fields
 retain their existing meaning. `dense_kernel` names the dense tile kernel the
 factorization snapshotted (`avx2-fma`, `sse2`, or `scalar`; see "Dense
@@ -414,8 +432,9 @@ COLAMD exposes `numeric_probe_columns`, `numeric_probe_max_front`,
 The probe counts completed columns and scalar updates, and records the largest
 observed reach, including the column that triggers a restart. Probe time is
 included in numeric/factor time; on success it is the CSC factorization itself.
-Workspace diagnostics include the temporary restart snapshot and discarded
-CSC buffers on fallback.
+Workspace diagnostics include the temporary restart snapshot (the requested
+permutation and both scale vectors; the probe's counters and empty factor
+buffers are restored alongside) and discarded CSC buffers on fallback.
 
 For blocked SPD, `parallel_panels` counts actual parallel tile phases and is
 also included in `parallel_steps`. `dense_update_flops` counts two operations
@@ -478,8 +497,9 @@ when their backward residual is small.
   dense rows still keep span-wide tails in separately allocated storage,
   and on the dense benchmark cases the flush pass runs only about 2x faster
   with eight threads than with one;
-- a dense row converted at setup stays listed in the sparse column lists,
-  which the candidate scan of a panel still walks and skips;
+- a row that becomes dense during the factorization stays listed in the
+  sparse column lists by its earlier sparse entries, which the candidate
+  scan still visits (rows dense at setup are no longer listed);
 - dense-row classification measures density over a row's whole remaining
   span, so a row that is dense in a prefix but has one far column (for
   example, a bordered system ordered border-last) has a wide span: it stays
