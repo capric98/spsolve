@@ -4,7 +4,7 @@ from fractions import Fraction
 import numpy as np
 from numpy.testing import assert_allclose, assert_array_equal
 from scipy.linalg import hadamard
-from scipy.sparse import block_diag, csc_array, diags, random_array, tril
+from scipy.sparse import block_diag, csc_array, diags, kron, random_array, tril
 
 from spsolve import SparseLU, factorized, splu
 
@@ -20,6 +20,22 @@ def general_matrix(n: int, density: float, seed: int) -> csc_array:
     )
     diagonal = np.asarray(abs(matrix).sum(axis=1)).ravel() + 1.0
     return csc_array(matrix + diags(diagonal, format="csc"), dtype=np.float64)
+
+
+def with_row_engine_block(values, size=200, diagonal=4.0, border=0.01):
+    """A dense array followed, block-diagonally, by a size-row SPD arrow block.
+
+    The block's last column holds size > 192 entries, so NATURAL skips the
+    left-looking probe and factors the result in the row engine, while the
+    leading block keeps its own pivots and scales. Small NATURAL fixtures
+    use it to keep the row engine's branches covered, since NATURAL factors
+    them alone in the CSC engine. The block is exactly symmetric and
+    diagonally dominant, so a symmetric input stays symmetric and still
+    tries the SPD path first.
+    """
+    block = diagonal * np.eye(size)
+    block[-1, :-1] = block[:-1, -1] = border
+    return block_diag((csc_array(np.asarray(values)), csc_array(block))).toarray()
 
 
 def exact_partial_pivoting(matrix, factor, diag_pivot_thresh=1.0):
@@ -397,6 +413,48 @@ class SparseLUTests(unittest.TestCase):
                     self.assert_factor_identity(matrix, factor, atol=0.0)
             self.assert_same_factors(*factors)
 
+    def test_row_engine_breaks_exact_ties_by_row_position(self):
+        # The Hadamard blocks of the test above, factored by the row engine:
+        # with NATURAL and a dyadic arrow block whose last column is wider
+        # than the probe's reach limit, every value stays dyadic.
+        rng = np.random.default_rng(0)
+        block = hadamard(8).astype(np.float64)
+        blocks = block_diag(
+            [csc_array(block * rng.choice([-1.0, 1.0], size=(8, 1))) for _ in range(16)],
+            format="csc",
+        ).toarray()
+        blocks = blocks[rng.permutation(blocks.shape[0]), :]
+        matrix = csc_array(with_row_engine_block(blocks, diagonal=64.0, border=0.25))
+        factors = []
+        for threads in (1, 4):
+            with self.subTest(threads=threads):
+                factor = splu(matrix, backend="native", permc_spec="NATURAL",
+                              num_threads=threads)
+                factors.append(factor)
+                self.assertEqual(factor.stats["numeric_engine"], "row-hybrid")
+                order, ties, dyadic = exact_partial_pivoting(matrix, factor)
+                self.assertTrue(dyadic)
+                self.assertGreater(ties, 64)
+                assert_array_equal(factor.perm_r, order)
+                self.assert_factor_identity(matrix, factor, atol=0.0)
+        self.assert_same_factors(*factors)
+
+    def test_preferred_row_at_the_threshold_is_kept(self):
+        # Unit row and column maxima keep the scaled values exact: the
+        # preferred row 0 holds half the column maximum, which threshold 0.5
+        # accepts and threshold 0.75 rejects, in either engine.
+        small = np.array([[0.5, 1.0], [1.0, 0.25]])
+        for engine, values in (("left-looking-csc", small),
+                               ("row-hybrid", with_row_engine_block(small))):
+            matrix = csc_array(values)
+            for threshold, swaps in ((0.5, 0), (0.75, 1)):
+                with self.subTest(engine=engine, threshold=threshold):
+                    factor = splu(matrix, backend="native", permc_spec="NATURAL",
+                                  diag_pivot_thresh=threshold)
+                    self.assertEqual(factor.stats["numeric_engine"], engine)
+                    self.assertEqual(factor.stats["pivot_swaps"], swaps)
+                    self.assert_factor_identity(matrix, factor)
+
     def test_left_looking_duplicated_row_of_permuted_band_is_singular(self):
         # Two equal rows receive the same updates in the same order: each
         # update comes from a column that both rows depend on, and the search
@@ -479,6 +537,279 @@ class SparseLUTests(unittest.TestCase):
         self.assertLess(16 * n, matrix.nnz // 4 * 2)
         self.assert_factor_identity(matrix, factor)
 
+    def test_natural_probe_keeps_narrow_bands_in_csc(self):
+        # NATURAL runs the bounded left-looking probe as well. A narrow
+        # nonsymmetric band, with its rows in order or permuted, completes in
+        # the CSC engine in the identity column order, with the same factors
+        # at every thread count.
+        n = 1000
+        base = csc_array(
+            diags(
+                [-0.2 * np.ones(n - 7), -np.ones(n - 1), 4.0 * np.ones(n),
+                 0.5 * np.ones(n - 2), 0.1 * np.ones(n - 9)],
+                [-7, -1, 0, 2, 9], format="csc",
+            )
+        )
+        expected = np.random.default_rng(323).normal(size=(n, 3))
+        for label, rows in (("in-order", np.arange(n)),
+                            ("permuted", np.random.default_rng(321).permutation(n))):
+            matrix = csc_array(base[rows, :])
+            saved = matrix.data.copy()
+            factors = []
+            for threads in (1, 4):
+                with self.subTest(rows=label, threads=threads):
+                    factor = splu(matrix, backend="native", permc_spec="NATURAL",
+                                  num_threads=threads)
+                    factors.append(factor)
+                    stats = factor.stats
+                    self.assertEqual(stats["numeric_engine"], "left-looking-csc")
+                    self.assertEqual(stats["ordering_backend"], "builtin")
+                    assert_array_equal(factor.perm_c, np.arange(n))
+                    self.assertFalse(stats["numeric_probe_fallback"])
+                    self.assertEqual(stats["numeric_probe_columns"], n)
+                    self.assertLess(stats["numeric_probe_max_front"], 40)
+                    self.assertGreater(stats["numeric_probe_seconds"], 0.0)
+                    self.assert_factor_identity(matrix, factor)
+                    for trans, operator in (("N", matrix), ("T", matrix.T)):
+                        assert_allclose(
+                            factor.solve(operator @ expected, trans=trans,
+                                         iterative_refinement=False),
+                            expected, rtol=2e-13, atol=2e-13,
+                        )
+            self.assert_same_factors(*factors)
+            assert_array_equal(matrix.data, saved)
+
+    def test_natural_probe_skips_or_restarts_where_the_row_engine_is_faster(self):
+        # NATURAL does not start the probe when the row engine would store a
+        # row dense from its setup (at least 64 entries filling a quarter of
+        # its span) or when an input column is wider than the 192-row reach
+        # limit; it reports a fallback with zero counters. A probe that
+        # starts restarts after a column with more than 64 multipliers, once
+        # its updates so far project beyond 64 * nnz(A), or at the bounds it
+        # shares with COLAMD. Rows of 63 entries, below the dense test, stay
+        # in the CSC engine.
+        rng = np.random.default_rng(97)
+
+        def dense(size):
+            return csc_array(rng.uniform(-1.0, 1.0, (size, size)) + 2.0 * np.eye(size) * size)
+
+        def band(size, half):
+            offsets = list(range(-half, half + 1))
+            values = diags([rng.uniform(-1.0, 1.0, size - abs(offset)) for offset in offsets],
+                           offsets, format="csc")
+            return csc_array(values + diags(np.full(size, float(half)), format="csc"))
+
+        def schur(size, split=96):
+            # Sparse rows (21 entries) whose elimination fills a dense
+            # size-by-size block; the probe restarts in that block.
+            values = 8.0 * np.eye(split + size)
+            for row in range(split):
+                cols = split + rng.choice(size, 20, replace=False)
+                values[row, cols] = rng.uniform(-0.15, 0.15, 20)
+            for row in range(split, split + size):
+                cols = rng.choice(split, 20, replace=False)
+                values[row, cols] = rng.uniform(-0.15, 0.15, 20)
+            return csc_array(values)
+
+        def grid(side):
+            # 2-D convection-diffusion in natural order: five entries per
+            # row, but fill as wide as the grid side.
+            one = diags([-1.5 * np.ones(side - 1), 2.0 * np.ones(side), -0.5 * np.ones(side - 1)],
+                        [-1, 0, 1], format="csc")
+            identity = diags(np.ones(side), format="csc")
+            return csc_array(kron(identity, one) + kron(one, identity))
+
+        # Sparse rows, but one input column wider than the reach limit.
+        bordered = diags([-np.ones(299), 4.0 * np.ones(300), 0.5 * np.ones(299)],
+                         [-1, 0, 1]).toarray()
+        bordered[:, -1] = 0.25
+        bordered[-1, -1] = 4.0
+        cases = (
+            # name, matrix, engine, how the probe ended
+            ("dense-63", dense(63), "left-looking-csc", "completed"),
+            ("dense-64", dense(64), "row-hybrid", "skipped"),
+            ("band-30", band(400, 30), "left-looking-csc", "completed"),
+            ("band-32", band(400, 32), "row-hybrid", "skipped"),
+            ("wide-column", csc_array(bordered), "row-hybrid", "skipped"),
+            ("fill-induced-block", schur(128), "row-hybrid", "restarted"),
+            ("random-fill", general_matrix(320, 0.025, 14), "row-hybrid", "restarted"),
+            ("grid-17", grid(17), "left-looking-csc", "completed"),
+            ("grid-24", grid(24), "row-hybrid", "restarted"),
+        )
+        for name, matrix, engine, probe in cases:
+            n = matrix.shape[0]
+            expected = np.random.default_rng(98).normal(size=(n, 2))
+            factors = []
+            for threads in (1, 4):
+                with self.subTest(case=name, threads=threads):
+                    factor = splu(matrix, backend="native", permc_spec="NATURAL",
+                                  num_threads=threads)
+                    factors.append(factor)
+                    stats = factor.stats
+                    self.assertEqual(stats["numeric_engine"], engine)
+                    self.assertEqual(stats["numeric_probe_fallback"], probe != "completed")
+                    if probe == "skipped":
+                        self.assertEqual(stats["numeric_probe_columns"], 0)
+                        self.assertEqual(stats["numeric_probe_max_front"], 0)
+                        self.assertEqual(stats["numeric_probe_updates"], 0)
+                        # Only the pattern check, which numeric time includes.
+                        self.assertLessEqual(stats["numeric_probe_seconds"],
+                                             stats["numeric_seconds"])
+                    elif probe == "restarted":
+                        self.assertGreater(stats["numeric_probe_columns"], 0)
+                        self.assertLess(stats["numeric_probe_columns"], n)
+                        if name == "fill-induced-block":
+                            # The 96 sparse columns complete; the block's
+                            # first column has over 64 multipliers, and the
+                            # rest of the block would cost far more than the
+                            # few updates done so far.
+                            self.assertEqual(stats["numeric_probe_columns"], 97)
+                            self.assertLessEqual(stats["numeric_probe_max_front"], 192)
+                        if name == "grid-24":
+                            # The work so far projects beyond 64 * nnz(A)
+                            # updates long before the probe would reach it
+                            # (after about 336 of the 576 columns).
+                            self.assertLess(stats["numeric_probe_columns"], 100)
+                            self.assertLess(stats["numeric_probe_updates"], 8 * matrix.nnz)
+                        self.assertGreater(stats["numeric_probe_seconds"], 0.0)
+                        self.assertGreaterEqual(stats["numeric_seconds"],
+                                                stats["numeric_probe_seconds"])
+                    else:
+                        self.assertEqual(stats["numeric_probe_columns"], n)
+                    self.assert_factor_identity(matrix, factor)
+                    for trans, operator in (("N", matrix), ("T", matrix.T)):
+                        assert_allclose(
+                            factor.solve(operator @ expected, trans=trans,
+                                         iterative_refinement=False),
+                            expected, rtol=1e-11, atol=1e-11,
+                        )
+            self.assert_same_factors(*factors)
+
+    def test_natural_probe_rules_hold_at_their_thresholds(self):
+        # Each NATURAL rule on both sides of its threshold:
+        # - the pattern check: one row of 64 entries spanning 256 columns is
+        #   stored dense by the row engine (64 * 4 >= 256), spanning 257 it
+        #   is not;
+        # - the multiplier limit: a fill-induced block of 65 rows gives 64
+        #   multipliers and completes, one of 66 rows restarts after the 96
+        #   sparse columns and the block's first column;
+        # - natural_restart_pays after the multiplier limit: behind a band,
+        #   the 66-row block's first column (65 multipliers) suggests
+        #   65^2 * 65 updates for its 65 remaining columns; the probe
+        #   restarts while that exceeds four times the updates done (band of
+        #   1,000 columns: 62,745 updates) and finishes otherwise (1,100
+        #   columns: 69,045, above 65^3 / 4 = 68,656 but below
+        #   65^2 * 66 / 4 = 69,712, so one more remaining column would
+        #   restart it);
+        # - its horizon cap: with a band of 300 columns after the block, 365
+        #   columns remain but only 192 count, 65^2 * 192 = 811,200, so the
+        #   probe restarts below 202,800 updates done (band of 3,215 columns:
+        #   202,290) and finishes above (3,232 columns: 203,361); horizons of
+        #   191 or 193 columns would move the threshold to 201,744 or
+        #   203,856 and flip one of the two;
+        # - natural_restart_pays after the per-column limit: in `chain`, 129
+        #   columns with at most 64 multipliers each feed one column whose
+        #   updates pass 8,192 (8,253 at its last source); with 16,444
+        #   updates done (the triggering source's 62 included) and 61
+        #   columns remaining the restart pays, 8,253 * 61 = 503,433 >
+        #   4 * 16,444; behind a band of 1,746 columns and a tridiagonal
+        #   block of 37, 125,889 updates are done and the probe finishes,
+        #   503,433 <= 4 * 125,889 = 503,556, a margin smaller than one more
+        #   remaining column (8,253) and than the source's updates (4 * 62);
+        #   behind a band of 8,000 columns a 128-row block also passes the
+        #   per-column limit late in the block without restarting;
+        # - the projected work: the 2-D grid of side 32 (1,024 rows) restarts
+        #   at column 64 = 1024 / 16, the first column checked.
+        def schur(size, seed=11, split=96):
+            rng = np.random.default_rng(seed)
+            values = 8.0 * np.eye(split + size)
+            for row in range(split):
+                cols = split + rng.choice(size, 20, replace=False)
+                values[row, cols] = rng.uniform(-0.15, 0.15, 20)
+            for row in range(split, split + size):
+                cols = rng.choice(split, 20, replace=False)
+                values[row, cols] = rng.uniform(-0.15, 0.15, 20)
+            return csc_array(values)
+
+        def band(n):
+            return csc_array(diags(
+                [-0.2 * np.ones(n - 7), -np.ones(n - 1), 4.0 * np.ones(n),
+                 0.5 * np.ones(n - 2), 0.1 * np.ones(n - 9)],
+                [-7, -1, 0, 2, 9], format="csc"))
+
+        def tridiagonal(n):
+            return csc_array(diags([-np.ones(n - 1), 4.0 * np.ones(n), -np.ones(n - 1)],
+                                   [-1, 0, 1], format="csc"))
+
+        def then(*parts):
+            return csc_array(block_diag(parts, format="csc"))
+
+        def chain(sources=129, shared=62):
+            # Column j < 129 updates column j + 1 (superdiagonal 1.0), so
+            # every source carries the 62 shared rows of column 0 plus two
+            # subdiagonal rows (64 multipliers; 63 and 62 for the last two).
+            # Column 129 couples to all 129 sources; its reach is 191 rows.
+            n = sources + shared
+            values = 4.0 * np.eye(n)
+            values[sources:, 0] = 0.01
+            for j in range(sources):
+                for d in (1, 2):
+                    if j + d < sources:
+                        values[j + d, j] = 0.01
+                if j > 0:
+                    values[j - 1, j] = 1.0
+            values[:sources, sources] = 0.01
+            return csc_array(values)
+
+        def grid(side):
+            one = diags([-1.5 * np.ones(side - 1), 2.0 * np.ones(side),
+                         -0.5 * np.ones(side - 1)], [-1, 0, 1], format="csc")
+            return csc_array(kron(diags(np.ones(side)), one) + kron(one, diags(np.ones(side))))
+
+        def spread_row(span, n=300, row=10, count=64):
+            values = 5.0 * np.eye(n)
+            cols = np.round(np.linspace(row, row + span - 1, count)).astype(int)
+            self.assertEqual(np.unique(cols).size, count)
+            values[row, cols[1:]] = 0.01
+            return csc_array(values)
+
+        cases = (
+            # name, matrix, completed probe columns (None: completes in CSC)
+            ("span-256", spread_row(256), 0),
+            ("span-257", spread_row(257), None),
+            ("block-65", schur(65), None),
+            ("block-66", schur(66), 97),
+            ("band-1000+block-66", then(band(1000), schur(66)), 1097),
+            ("band-1100+block-66", then(band(1100), schur(66)), None),
+            ("band-3215+block-66+band-300", then(band(3215), schur(66), band(300)), 3312),
+            ("band-3232+block-66+band-300", then(band(3232), schur(66), band(300)), None),
+            ("chain", chain(), 129),
+            ("band-1746+tridiagonal-37+chain", then(band(1746), tridiagonal(37), chain()), None),
+            ("band-8000+block-128", then(band(8000), schur(128)), None),
+            ("grid-32", grid(32), 64),
+        )
+        for name, matrix, restart in cases:
+            n = matrix.shape[0]
+            factors = []
+            for threads in (1, 4):
+                with self.subTest(case=name, threads=threads):
+                    factor = splu(matrix, backend="native", permc_spec="NATURAL",
+                                  num_threads=threads)
+                    factors.append(factor)
+                    stats = factor.stats
+                    if restart is None:
+                        self.assertEqual(stats["numeric_engine"], "left-looking-csc")
+                        self.assertEqual(stats["numeric_probe_columns"], n)
+                    else:
+                        self.assertEqual(stats["numeric_engine"], "row-hybrid")
+                        self.assertTrue(stats["numeric_probe_fallback"])
+                        self.assertEqual(stats["numeric_probe_columns"], restart)
+                    scaled = csc_array(matrix.multiply(factor.row_scale[:, None])
+                                       .multiply(factor.col_scale[None, :]))
+                    error = scaled[factor.perm_r, :][:, factor.perm_c] - factor.L @ factor.U
+                    self.assertLess(np.max(abs(error.data), initial=0.0), 1e-13)
+            self.assert_same_factors(*factors)
+
     def test_adaptive_csc_engines_on_random_patterns(self):
         for seed in range(5):
             with self.subTest(kind="spd", seed=seed):
@@ -546,9 +877,14 @@ class SparseLUTests(unittest.TestCase):
                 [[4.0, 1.0, 0.0], [1.0, 3.0, -0.5], [0.0, -0.5, 2.0]]
             )
             near_symmetric[1, 0] = np.nextafter(near_symmetric[0, 1], np.inf)
-            for kind, values in (
-                ("nonsymmetric", nonsymmetric),
-                ("near_symmetric", near_symmetric),
+            for kind, values, row_engine in (
+                ("nonsymmetric", nonsymmetric, False),
+                ("near_symmetric", near_symmetric, False),
+                # The same systems factored by the row engine (see
+                # with_row_engine_block), which NATURAL no longer selects for
+                # them alone.
+                ("nonsymmetric+block", with_row_engine_block(nonsymmetric), True),
+                ("near_symmetric+block", with_row_engine_block(near_symmetric), True),
             ):
                 matrix = csc_array(values)
                 expected = np.column_stack(
@@ -560,6 +896,8 @@ class SparseLUTests(unittest.TestCase):
                         self.assertNotEqual(
                             factor.stats["numeric_engine"], "symmetric-ldlt-csc"
                         )
+                        if row_engine and ordering == "NATURAL":
+                            self.assertEqual(factor.stats["numeric_engine"], "row-hybrid")
                         self.assert_factor_identity(matrix, factor, atol=2e-14)
                         for trans, operator in (("N", matrix), ("T", matrix.T)):
                             assert_allclose(
@@ -600,30 +938,40 @@ class SparseLUTests(unittest.TestCase):
                         )
 
     def test_symmetric_indefinite_falls_back_to_pivoted_lu(self):
-        expected = np.array([2.0, -3.0])
         for scale in (1e-16, 1.0, 1e16):
-            matrix = csc_array(scale * np.array([[0.0, 1.0], [1.0, 0.0]]))
-            for ordering in ("NATURAL", "COLAMD", "MMD_AT_PLUS_A"):
-                with self.subTest(scale=scale, ordering=ordering):
-                    factor = splu(
-                        matrix,
-                        backend="native",
-                        permc_spec=ordering,
-                        num_threads=4,
-                    )
-                    self.assertNotEqual(
-                        factor.stats["numeric_engine"], "symmetric-ldlt-csc"
-                    )
-                    self.assert_factor_identity(matrix, factor)
-                    for trans, operator in (("N", matrix), ("T", matrix.T)):
-                        assert_allclose(
-                            factor.solve(
-                                operator @ expected,
-                                trans=trans,
-                                iterative_refinement=False,
-                            ),
-                            expected,
+            small = scale * np.array([[0.0, 1.0], [1.0, 0.0]])
+            # The second variant stays exactly symmetric (the appended block
+            # is SPD), fails the SPD attempt in the small block, and is
+            # factored by the row engine.
+            for row_engine, values in ((False, small), (True, with_row_engine_block(small))):
+                matrix = csc_array(values)
+                expected = np.arange(matrix.shape[0], dtype=np.float64) + 1.0
+                expected[:2] = (2.0, -3.0)
+                for ordering in ("NATURAL", "COLAMD", "MMD_AT_PLUS_A"):
+                    with self.subTest(scale=scale, ordering=ordering, row_engine=row_engine):
+                        factor = splu(
+                            matrix,
+                            backend="native",
+                            permc_spec=ordering,
+                            num_threads=4,
                         )
+                        self.assertNotEqual(
+                            factor.stats["numeric_engine"], "symmetric-ldlt-csc"
+                        )
+                        if row_engine:
+                            self.assertGreater(factor.stats["failed_spd_seconds"], 0.0)
+                            if ordering == "NATURAL":
+                                self.assertEqual(factor.stats["numeric_engine"], "row-hybrid")
+                        self.assert_factor_identity(matrix, factor)
+                        for trans, operator in (("N", matrix), ("T", matrix.T)):
+                            assert_allclose(
+                                factor.solve(
+                                    operator @ expected,
+                                    trans=trans,
+                                    iterative_refinement=False,
+                                ),
+                                expected,
+                            )
 
     def test_vendored_orderings_accept_both_index_widths(self):
         matrix = general_matrix(45, 0.08, 99)
@@ -655,25 +1003,29 @@ class SparseLUTests(unittest.TestCase):
                 )
 
     def test_factor_identity_and_public_metadata(self):
-        matrix = general_matrix(40, 0.12, 10)
-        for ordering in ("NATURAL", "COLAMD", "MMD_AT_PLUS_A"):
-            with self.subTest(ordering=ordering):
-                factor = splu(
-                    matrix,
-                    backend="native",
-                    permc_spec=ordering,
-                    num_threads=4,
-                )
-                self.assertIsInstance(factor, SparseLU)
-                self.assertEqual(factor.shape, matrix.shape)
-                self.assertEqual(factor.dtype, np.dtype(np.float64))
-                self.assertEqual(factor.nnz, factor.L.nnz + factor.U.nnz)
-                assert_allclose(factor.L.diagonal(), 1.0)
+        small = general_matrix(40, 0.12, 10)
+        for row_engine, matrix in ((False, small),
+                                   (True, csc_array(with_row_engine_block(small.toarray())))):
+            for ordering in ("NATURAL", "COLAMD", "MMD_AT_PLUS_A"):
+                with self.subTest(ordering=ordering, row_engine=row_engine):
+                    factor = splu(
+                        matrix,
+                        backend="native",
+                        permc_spec=ordering,
+                        num_threads=4,
+                    )
+                    self.assertIsInstance(factor, SparseLU)
+                    self.assertEqual(factor.shape, matrix.shape)
+                    self.assertEqual(factor.dtype, np.dtype(np.float64))
+                    self.assertEqual(factor.nnz, factor.L.nnz + factor.U.nnz)
+                    assert_allclose(factor.L.diagonal(), 1.0)
+                    if row_engine and ordering == "NATURAL":
+                        self.assertEqual(factor.stats["numeric_engine"], "row-hybrid")
 
-                self.assert_factor_identity(matrix, factor, atol=2e-14)
-                self.assertEqual(factor.stats["shape"], matrix.shape)
-                self.assertEqual(factor.stats["ordering"], ordering)
-                self.assertGreaterEqual(factor.stats["row_updates"], 0)
+                    self.assert_factor_identity(matrix, factor, atol=2e-14)
+                    self.assertEqual(factor.stats["shape"], matrix.shape)
+                    self.assertEqual(factor.stats["ordering"], ordering)
+                    self.assertGreaterEqual(factor.stats["row_updates"], 0)
 
     def test_normal_transpose_and_hermitian_solves(self):
         matrix = general_matrix(60, 0.08, 11)
@@ -711,16 +1063,24 @@ class SparseLUTests(unittest.TestCase):
         assert_allclose(solve(matrix @ expected), expected, atol=1e-12)
 
     def test_pivoting_with_zero_diagonal_and_zero_threshold(self):
-        matrix = csc_array([[0.0, 1.0], [1.0, 1.0]])
-        expected = np.array([2.0, -3.0])
-        factor = splu(
-            matrix,
-            backend="native",
-            permc_spec="NATURAL",
-            diag_pivot_thresh=0.0,
-        )
-        assert_allclose(factor.solve(matrix @ expected), expected)
-        self.assertGreater(factor.stats["pivot_swaps"], 0)
+        # A zero preferred pivot is never taken, even with threshold zero.
+        # The second variant runs the row engine's preferred-row test.
+        small = np.array([[0.0, 1.0], [1.0, 1.0]])
+        for engine, values in (("left-looking-csc", small),
+                               ("row-hybrid", with_row_engine_block(small))):
+            with self.subTest(engine=engine):
+                matrix = csc_array(values)
+                expected = np.arange(matrix.shape[0], dtype=np.float64) + 1.0
+                expected[:2] = (2.0, -3.0)
+                factor = splu(
+                    matrix,
+                    backend="native",
+                    permc_spec="NATURAL",
+                    diag_pivot_thresh=0.0,
+                )
+                self.assertEqual(factor.stats["numeric_engine"], engine)
+                assert_allclose(factor.solve(matrix @ expected), expected)
+                self.assertGreater(factor.stats["pivot_swaps"], 0)
 
     def test_canonicalization_and_int64_indices(self):
         matrix = csc_array(

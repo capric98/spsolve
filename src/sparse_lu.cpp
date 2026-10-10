@@ -33,6 +33,15 @@
 #include <omp.h>
 #endif
 
+// Keeps a helper out of its caller's code (see natural_probe_starts).
+#if defined(_MSC_VER)
+#define SPSOLVE_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__)
+#define SPSOLVE_NOINLINE [[gnu::noinline]]
+#else
+#define SPSOLVE_NOINLINE
+#endif
+
 namespace {
 
 using index_t = NativeSparseLU::index_t;
@@ -920,9 +929,115 @@ template <typename Int>
     return true;
 }
 
-// Every result field this function writes must be listed in ProbeRestart,
-// which restores them when the COLAMD probe restarts in the row engine.
+// Reach limit of the bounded left-looking probe (COLAMD and NATURAL).
+constexpr index_t left_looking_probe_front_limit = 192;
+
+// A column's reach contains its own rows, so a probe with an input column
+// wider than the reach limit is certain to restart (or to raise an error
+// first) before it finishes.
 template <typename Int>
+[[nodiscard]] bool left_looking_restart_certain(const Int* indptr, index_t n) {
+    for (index_t col = 0; col < n; ++col) {
+        if (static_cast<index_t>(indptr[col + 1]) - static_cast<index_t>(indptr[col]) >
+            left_looking_probe_front_limit) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Multiplier limit of the NATURAL probe: a column whose L part holds more
+// multipliers (nonzeros below the diagonal) than this is a sign of fill that
+// makes the row engine's rows dense, where its dense kernels beat the scalar
+// CSC loop. The COLAMD probe has no such limit.
+constexpr index_t natural_probe_multiplier_limit = 64;
+
+// The NATURAL probe restarts on its multiplier limit, or on the per-column
+// update limit it shares with COLAMD, only when natural_restart_pays: the
+// work the triggering column suggests for the next min(n - k - 1, 192)
+// columns (m * m per column for m multipliers, or the column's updates up to
+// and including the source that passes the limit) exceeds this factor times
+// the updates done so far (that source's included), which a restart
+// discards. Early in the factorization that holds at once; after a long,
+// cheap prefix (a band followed by a block that fills) it does not, and the
+// probe finishes in CSC instead of discarding the prefix. The horizon stops
+// at the reach limit: it assumes the fill is a block no wider than the
+// fronts the probe accepts, so the sparse columns after a block in the
+// middle of the matrix do not inflate the estimate. A fill region that
+// lasts longer (a wide band or a large grid after a long prefix) is left to
+// the projected-work rule and the total budget, which restart later and
+// discard more. For a trailing dense block of b <= 193 rows the estimate is
+// m * m * (b - 1), about b^3, three times the block's remaining work of
+// about b^3 / 3 updates (a 63-row block takes 81,375), so the probe
+// continues while that work stays below about 4 / 3 of the work done (see
+// "Engine selection for NATURAL" in docs/native-lu.md).
+constexpr double natural_probe_continue_factor = 4.0;
+
+[[nodiscard]] bool natural_restart_pays(
+    double work_per_column, index_t remaining_columns, std::uint64_t done) {
+    const index_t horizon = std::min(remaining_columns, left_looking_probe_front_limit);
+    return work_per_column * static_cast<double>(horizon) >
+        natural_probe_continue_factor * static_cast<double>(done);
+}
+
+// The NATURAL probe also restarts once its scalar updates so far, at their
+// average per completed column, project beyond the total update budget over
+// all n columns. It projects only after max(32, n / 16) columns, so a
+// prefix that is heavier than the rest of the matrix must cover at least a
+// sixteenth of it, and do more than 4 * nnz(A) updates there, to stop a
+// probe that would have completed within the budget.
+[[nodiscard]] index_t natural_probe_projection_start(index_t n) {
+    return std::max<index_t>(32, n / 16);
+}
+
+// Whether NATURAL skips the probe: an input column is wider than the reach
+// limit (the probe would certainly restart), or some row would pass the row
+// engine's setup dense test (should_use_dense at the first column, applied
+// in factorize_typed's setup): at least 64 entries, filling at least a
+// quarter of the span from its first to its last column. The row engine
+// keeps such rows in dense storage from the start and updates them with the
+// dense kernels, faster than the scalar CSC loop. This test reads the stored
+// pattern, where the setup counts scaled nonzeros; the two differ where a
+// scaled product underflows to zero, and for explicitly stored zeros, which
+// the public splu removes before calling the extension but a direct call of
+// the private _splu_factorize can pass. One pass over the row indices.
+template <typename Int>
+[[nodiscard]] bool natural_probe_skipped(const Int* indices, const Int* indptr, index_t n) {
+    if (left_looking_restart_certain(indptr, n)) return true;
+    if (static_cast<index_t>(indptr[n]) < 64) return false;
+    struct Extent {
+        index_t count = 0;
+        index_t first = 0;
+        index_t last = 0;
+    };
+    std::vector<Extent> extents(static_cast<std::size_t>(n));
+    for (index_t col = 0; col < n; ++col) {
+        const index_t end = static_cast<index_t>(indptr[col + 1]);
+        for (index_t p = static_cast<index_t>(indptr[col]); p < end; ++p) {
+            Extent& extent = extents[static_cast<std::size_t>(indices[p])];
+            if (extent.count++ == 0) extent.first = col;
+            extent.last = col;
+        }
+    }
+    for (const Extent& extent : extents) {
+        if (extent.count >= 64 && static_cast<std::uint64_t>(extent.count) * 4 >=
+                static_cast<std::uint64_t>(extent.last - extent.first + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Every result field this function writes must be listed in ProbeRestart,
+// which restores them when a probe restarts in the row engine. NaturalProbe
+// adds the NATURAL probe's rules (natural_restart_pays for the multiplier
+// and per-column limits, and the projected-work bound); it is used only with
+// bounded_probe. It is a template parameter so that the COLAMD and
+// MMD_AT_PLUS_A instantiation compiles without them; its per-column loops
+// compile to the same instructions as in earlier builds (MSVC /FAs
+// listings; only the one-time scan for a certain restart is laid out
+// differently).
+template <bool NaturalProbe, typename Int>
 bool factorize_left_looking(
     const std::shared_ptr<NativeSparseLU>& result,
     const double* data,
@@ -932,16 +1047,17 @@ bool factorize_left_looking(
     double diag_pivot_thresh,
     bool bounded_probe = false
 ) {
+    assert(!NaturalProbe || bounded_probe);
     const auto numeric_start = Clock::now();
     result->numeric_engine_ = "left-looking-csc";
     result->column_storage_ = true;
     result->l_col_ptr_.assign(static_cast<std::size_t>(n + 1), 0);
     result->u_col_ptr_.assign(static_cast<std::size_t>(n + 1), 0);
 
-    // Bound discarded COLAMD work by the input size, and leave genuinely wide
+    // Bound discarded probe work by the input size, and leave genuinely wide
     // or expensive columns to the row engine. These limits use this ordering
     // and its actual pivots, rather than an unrelated symmetric graph.
-    constexpr index_t probe_front_limit = 192;
+    constexpr index_t probe_front_limit = left_looking_probe_front_limit;
     constexpr std::uint64_t probe_column_update_limit = 8'192;
     const auto scaled_budget = [&](std::uint64_t multiplier) {
         const auto nnz = static_cast<std::uint64_t>(result->input_nnz_);
@@ -950,18 +1066,13 @@ bool factorize_left_looking(
     };
     const std::uint64_t probe_update_limit = scaled_budget(64);
     const std::uint64_t probe_factor_limit = scaled_budget(20);
+    const index_t projection_start = NaturalProbe ? natural_probe_projection_start(n) : n;
 
-    // A column's reach contains its own rows, so a probe with an input
-    // column wider than the reach limit is certain to restart (or to raise
-    // an error first) before it finishes.
-    bool restart_certain = false;
-    for (index_t col = 0; bounded_probe && col < n; ++col) {
-        if (static_cast<index_t>(indptr[col + 1]) - static_cast<index_t>(indptr[col]) >
-            probe_front_limit) {
-            restart_certain = true;
-            break;
-        }
-    }
+    // A probe that is certain to restart skips the reserve's second stage.
+    // NATURAL does not start such a probe at all (natural_probe_starts), so
+    // its instantiation skips the scan.
+    const bool restart_certain =
+        !NaturalProbe && bounded_probe && left_looking_restart_certain(indptr, n);
 
     // Staged reserve. Each factor array first gets 1.15 * E + n entries, with
     // E the larger of 2n and AMD's estimate of nnz(L) (zero unless
@@ -1139,9 +1250,24 @@ bool factorize_left_looking(
                 result->l_col_ptr_[static_cast<std::size_t>(source_col + 1)];
             if (bounded_probe) {
                 const auto updates = static_cast<std::uint64_t>(last - first);
-                if (updates > probe_column_update_limit - column_updates ||
-                    updates > probe_update_limit - result->numeric_probe_updates_) {
-                    return false;
+                if constexpr (NaturalProbe) {
+                    // The total limit is absolute; past the per-column limit
+                    // the probe restarts only when natural_restart_pays.
+                    if (column_updates + updates > probe_column_update_limit ||
+                        updates > probe_update_limit - result->numeric_probe_updates_) {
+                        if (updates > probe_update_limit - result->numeric_probe_updates_ ||
+                            natural_restart_pays(
+                                static_cast<double>(column_updates + updates),
+                                n - factor_col - 1,
+                                result->numeric_probe_updates_ + updates)) {
+                            return false;
+                        }
+                    }
+                } else {
+                    if (updates > probe_column_update_limit - column_updates ||
+                        updates > probe_update_limit - result->numeric_probe_updates_) {
+                        return false;
+                    }
                 }
                 column_updates += updates;
                 result->numeric_probe_updates_ += updates;
@@ -1257,6 +1383,23 @@ bool factorize_left_looking(
             const auto entries = static_cast<std::uint64_t>(result->l_values_.size()) +
                 static_cast<std::uint64_t>(result->u_values_.size());
             if (entries > probe_factor_limit) return false;
+            if constexpr (NaturalProbe) {
+                const index_t multipliers = static_cast<index_t>(result->l_values_.size()) -
+                    result->l_col_ptr_[static_cast<std::size_t>(factor_col)] - 1;
+                if (multipliers > natural_probe_multiplier_limit &&
+                    natural_restart_pays(
+                        static_cast<double>(multipliers) * static_cast<double>(multipliers),
+                        n - factor_col - 1, result->numeric_probe_updates_)) {
+                    return false;
+                }
+                if (factor_col + 1 >= projection_start &&
+                    static_cast<double>(result->numeric_probe_updates_) *
+                        static_cast<double>(n) >
+                    static_cast<double>(probe_update_limit) *
+                        static_cast<double>(factor_col + 1)) {
+                    return false;
+                }
+            }
         }
         if (factor_col + 1 == reserve_checkpoint && reserve_checkpoint < n) {
             extend_reserve(result->l_row_indices_, result->l_values_);
@@ -1286,13 +1429,49 @@ bool factorize_left_looking(
     return true;
 }
 
-// Restart state of the COLAMD probe. factorize_left_looking reads perm_c_,
-// the scales, input_nnz_ and ordering_estimated_l_nnz_, and writes only the
-// fields below besides numeric_probe_*, which the caller sets after the probe
-// either way. The permutation and scales are kept as the pristine snapshot
-// that the probe's workspace accounting counts. restore() move-assigns every
-// saved field, which also releases the discarded CSC factor buffers. Keep
-// this list in sync with every result field factorize_left_looking writes.
+// NATURAL's decision before the probe: false when natural_probe_skipped
+// holds, which the caller then reports as a fallback with zero counters.
+// Either way the check's time is stored as numeric_probe_seconds_, which the
+// caller adds to the probe's time or, after a skipped probe, the row engine
+// to its own.
+template <typename Int>
+[[nodiscard]] SPSOLVE_NOINLINE bool natural_probe_starts(
+    NativeSparseLU& state, const Int* indices, const Int* indptr, index_t n) {
+    const auto check_start = Clock::now();
+    const bool skipped = natural_probe_skipped(indices, indptr, n);
+    state.numeric_probe_seconds_ = std::chrono::duration<double>(
+        Clock::now() - check_start).count();
+    if (skipped) state.numeric_probe_fallback_ = true;
+    return !skipped;
+}
+
+// The probe: the CSC engine with its bounds, and for NATURAL its own rules
+// (natural_restart_pays and natural_probe_projection_start).
+template <typename Int>
+[[nodiscard]] SPSOLVE_NOINLINE bool run_probe(
+    const std::shared_ptr<NativeSparseLU>& result,
+    const double* data,
+    const Int* indices,
+    const Int* indptr,
+    index_t n,
+    double diag_pivot_thresh,
+    bool natural
+) {
+    return natural
+        ? factorize_left_looking<true>(
+              result, data, indices, indptr, n, diag_pivot_thresh, true)
+        : factorize_left_looking<false>(
+              result, data, indices, indptr, n, diag_pivot_thresh, true);
+}
+
+// Restart state of the left-looking probe (COLAMD and NATURAL).
+// factorize_left_looking reads perm_c_, the scales, input_nnz_ and
+// ordering_estimated_l_nnz_, and writes only the fields below besides
+// numeric_probe_*, which the caller sets after the probe either way. The
+// permutation and scales are kept as the pristine snapshot that the probe's
+// workspace accounting counts. restore() move-assigns every saved field, which
+// also releases the discarded CSC factor buffers. Keep this list in sync with
+// every result field factorize_left_looking writes.
 struct ProbeRestart {
     std::vector<index_t> perm_c;
     std::vector<double> row_scale;
@@ -1475,7 +1654,17 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
             result->peak_workspace_bytes_, spd_workspace);
     };
 
-    if (ordering == "COLAMD") {
+    // COLAMD and NATURAL start in the left-looking CSC engine with a bounded
+    // probe; NATURAL first checks whether to start it (natural_probe_starts)
+    // and applies rules of its own (see run_probe). COLAMD always runs the
+    // probe, without them, as earlier builds did. No decision depends on the
+    // thread count. The NATURAL logic lives in non-inlined helpers: the row
+    // engine is part of this function, and MSVC's code for it moves with any
+    // change here (handing the check's row counts to the row engine instead
+    // of counting again made it 8% slower on NATURAL sparse-dense-border
+    // with one thread, with identical factors).
+    if (ordering == "COLAMD" ||
+        (ordering == "NATURAL" && natural_probe_starts(*result, indices, indptr, n))) {
         // Restart from pristine state if actual CSC work is unsuitable. The
         // snapshot holds the requested permutation and equilibration, which
         // the probe only reads (the workspace counted below), and every field
@@ -1483,10 +1672,12 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
         const auto probe_start = Clock::now();
         ProbeRestart restart_state;
         restart_state.save(*result);
-        const bool completed = factorize_left_looking(
-            result, data, indices, indptr, n, diag_pivot_thresh, true);
+        const bool completed = run_probe(
+            result, data, indices, indptr, n, diag_pivot_thresh, ordering == "NATURAL");
+        // numeric_probe_seconds_ holds the NATURAL check's time (zero for
+        // COLAMD) until it is set below.
         const double probe_seconds = std::chrono::duration<double>(
-            Clock::now() - probe_start).count();
+            Clock::now() - probe_start).count() + result->numeric_probe_seconds_;
         const auto probe_columns = result->numeric_probe_columns_;
         const auto probe_front = result->numeric_probe_max_front_;
         const auto probe_updates = result->numeric_probe_updates_;
@@ -1527,7 +1718,7 @@ std::shared_ptr<NativeSparseLU> factorize_typed(
         result->ordering_estimated_max_front_ <= 192.0 &&
         predicted_fill <= 20.0;
     if (use_left_looking) {
-        factorize_left_looking(
+        factorize_left_looking<false>(
             result, data, indices, indptr, n, diag_pivot_thresh);
         finish_lu();
         return result;

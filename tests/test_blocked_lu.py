@@ -127,11 +127,22 @@ class BlockedLUTests(unittest.TestCase):
                 self.assert_same_factors(serial, parallel)
 
     def test_narrow_sparse_and_small_dense_controls_skip_panels(self):
-        matrix = csc_array(diags([-np.ones(299), 4.0 * np.ones(300),
-                                  0.5 * np.ones(299)], [-1, 0, 1], format="csc"))
-        for matrix in (matrix, dense_pivoted(96)):
+        tridiagonal = diags([-np.ones(299), 4.0 * np.ones(300),
+                             0.5 * np.ones(299)], [-1, 0, 1]).toarray()
+        # NATURAL factors the tridiagonal matrix in the left-looking CSC
+        # engine, as COLAMD does. A full last column, wider than the probe's
+        # 192-row reach limit, keeps every row sparse and the NATURAL factor
+        # in the row engine, so a narrow sparse control still runs there.
+        bordered = tridiagonal.copy()
+        bordered[:, -1] = 0.25
+        bordered[-1, -1] = 4.0
+        natural_engines = ("left-looking-csc", "row-hybrid", "row-hybrid")
+        controls = (csc_array(tridiagonal), csc_array(bordered), dense_pivoted(96))
+        for matrix, natural_engine in zip(controls, natural_engines):
             for order in ("NATURAL", "COLAMD"):
                 factor = splu(matrix, backend="native", permc_spec=order, num_threads=4)
+                if order == "NATURAL":
+                    self.assertEqual(factor.stats["numeric_engine"], natural_engine)
                 self.assertEqual(factor.stats["lu_dense_panels"], 0)
                 self.assertEqual(factor.stats["lu_panel_workspace_bytes"], 0)
                 self.check_factor(matrix, factor)

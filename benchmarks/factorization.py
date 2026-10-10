@@ -438,7 +438,7 @@ def parse_args() -> argparse.Namespace:
         "--extended",
         action="store_true",
         help="include 3-D Poisson, banded, and dense-bordered banded cases; "
-        "COLAMD also tests row-permuted bands",
+        "COLAMD and NATURAL also test row-permuted bands",
     )
     parser.add_argument("--gate", action="store_true", help="exit nonzero when the gate fails")
     parser.add_argument(
@@ -488,7 +488,7 @@ def main() -> int:
                 ),
             ]
         )
-        if args.permc_spec == "COLAMD":
+        if args.permc_spec in ("COLAMD", "NATURAL"):
             matrices.append(
                 ("permuted-band", row_permuted_banded(2500 if args.quick else 20000))
             )

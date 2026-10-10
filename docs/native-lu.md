@@ -64,14 +64,23 @@ systems.
      intermediate falls back to pivoted LU with the original equilibration.
    - A nonsymmetric matrix with `MMD_AT_PLUS_A` uses a Gilbert-Peierls-style
      left-looking CSC LU when AMD estimates a maximum front at most 192 and
-     fill at most 20. `COLAMD` instead starts in CSC with its actual pivots:
-     a column reach above 192, more than 8,192 scalar updates in a column,
-     more than `64 * nnz(A)` total updates, or factor storage above
-     `20 * nnz(A)` triggers a restart in the row engine. The discarded probe
-     is bounded, and restart preserves the requested column permutation and
-     equilibration. Both engines perform threshold partial pivoting. See
-     "Left-looking CSC LU" below for the search order and the storage
-     reserve of the CSC engine.
+     fill at most 20. `COLAMD` and `NATURAL` instead start in CSC with their
+     actual pivots (the probe): a column reach above 192, more than 8,192
+     scalar updates in a column, more than `64 * nnz(A)` total updates, or
+     factor storage above `20 * nnz(A)` triggers a restart in the row
+     engine. The discarded probe is bounded, and restart preserves the
+     requested column permutation and equilibration. `NATURAL` does not
+     start the probe when an input column is wider than 192 rows or a row
+     would be stored dense by the row engine's setup; its probe also
+     restarts after a column with more than 64 multipliers, and its
+     multiplier and per-column limits apply only while the work they
+     predict for the next `min(n - k - 1, 192)` columns exceeds four times
+     the updates done so far; and after `max(32, n/16)` columns it
+     restarts once its updates, extrapolated to all columns, exceed
+     `64 * nnz(A)` (see "Engine selection for `NATURAL`" below). Both
+     engines perform threshold partial
+     pivoting. See "Left-looking CSC LU" below for the search order and the
+     storage reserve of the CSC engine.
    - Wider or fill-heavy patterns use the row-hybrid LU. Sorted sparse rows
      with at least 64 entries convert to dense tails when at least 25% of
      their own remaining span, from first to last remaining nonzero column,
@@ -257,7 +266,8 @@ so far and the current capacity; through the capacity, the standard
 library's growth policy can decide whether the extension happens, which
 affects memory only, never the factors. A probe that is certain to restart
 (an input column alone is wider than the 192-row reach limit) skips the
-second stage, since its arrays are discarded; the ceiling stays below the
+second stage, since its arrays are discarded (with `NATURAL` such a probe
+does not start at all); the ceiling stays below the
 probe's factor limit of `20 * nnz(A)` entries. With `COLAMD` (no estimate)
 earlier builds started each array at `3.3 * n` entries and grew it 1.5-fold,
 three times for each array of the row-permuted band (159,953 and 199,925
@@ -305,6 +315,263 @@ times) and fell on 8 (to 0.86 times), against up to 36 times with the
 ceiling reserved at once; the full band above reports 10.0 MB in both
 builds, against 676 MB with the ceiling reserved at once. The restart
 releases the discarded arrays before the row engine starts, as before.
+
+## Engine selection for `NATURAL`
+
+`NATURAL` runs the bounded probe of `COLAMD` in the identity column order:
+the same reach, per-column, total-update and factor-storage bounds, the same
+restart from the pristine permutation and equilibration, and the same
+pivoting rule (threshold partial pivoting with `diag_pivot_thresh`,
+preferred row `perm_c[k] = k`, ties by current row position). Exactly
+symmetric input still tries the SPD path first, and `MMD_AT_PLUS_A` keeps
+its estimate-based selection. Earlier builds always used the row engine for
+`NATURAL`, which keeps sparse rows in sorted entry lists and pays a merge per
+update: narrow nonsymmetric bands took 2.2-2.4 times SuperLU's time
+(`banded-nonsym` and the row-permuted band of the benchmark, which the CSC
+engine now factors at 0.61-0.63 times; see `docs/benchmarking.md`). The
+measurements in this section were taken with Python 3.15.0, NumPy 2.5.3 and
+SciPy 1.18.1 unless stated otherwise.
+
+The scalar CSC loop is not faster than the row engine everywhere. The row
+engine stores a row densely once it has at least 64 entries filling a
+quarter of its span, and then updates it with the dense kernels and,
+inside panels, on the worker team. Measured with `NATURAL` (one thread; a
+scratch build that runs the CSC engine to completion, without the pattern
+check, the `NATURAL` rules and the update budgets, against the row engine
+of `4f1885e`; medians of three interleaved rounds):
+
+| matrix | CSC engine / row engine |
+|---|---:|
+| full band, half-width 30 (61 entries per row), n=20,000, pivoting | 0.52 |
+| same, half-width 32 (65 entries per row) | 1.24 |
+| same, half-width 64, n=6,000 | 2.74 |
+| diagonally dominant band, half-width 30 / 32 / 40, n=20,000 / 20,000 / 6,000 | 0.48 / 1.16 / 1.65 |
+| dense block of 63 / 64 / 96 / 128 rows | 0.61 / 1.40 / 1.94 / 3.00 |
+| 100 dense blocks of 56 / 60 blocks of 64 / 20 blocks of 128 | 0.55 / 1.59 / 2.89 |
+| 96 sparse rows (21 entries) whose elimination fills a dense block of 64 / 96 / 128 / 160 rows | 0.60 / 0.89 / 1.14 / 1.58 |
+| 2-D convection-diffusion grid, side 20 / 24 / 32 / 45 | 0.46 / 0.45 / 0.64 / 0.71 |
+
+The crossover is the row engine's dense-row threshold, not the size of
+the front: a band whose rows have 61 entries runs at 0.52, one with 65
+entries at 1.24. The grids' rows stay below it up to side 45, and the probe
+bounds stop them anyway (below). `NATURAL` therefore adds rules of its own
+to the probe, none of which applies to `COLAMD` (whose results stay bitwise
+those of earlier builds):
+
+- **Pattern check before the probe.** The probe does not start when an
+  input column has more than 192 entries (its reach would exceed the
+  limit, so the probe would certainly restart; an `O(n)` scan of the
+  column pointers), or when some row has at least 64 stored entries filling
+  at least a quarter of the span from its first to its last column, the
+  row engine's setup dense test (one pass over the row indices, about
+  0.6-0.8 ns per entry: 0.8 ms for the 1.3 million entries of the band of
+  half-width 32). The row engine counts scaled nonzeros where this check
+  counts stored entries; the two differ where a scaled product underflows
+  to zero, and for explicitly stored zeros, which the public `splu`
+  removes but a direct call of the private `_splu_factorize` can pass. The
+  dense LU families and `sparse-dense-border` of the benchmark take the
+  first branch (under 0.01 ms); bands with rows of 64 or more entries and
+  dense blocks of 64 to 192 rows the second. A skipped probe reports
+  `numeric_probe_fallback` with zero columns, front and updates, and the
+  check's time as `numeric_probe_seconds`.
+- **Multiplier limit, and when a restart pays.** A column with more than 64
+  multipliers (entries of `L` below the diagonal) signals fill that makes
+  the row engine's rows dense during the factorization, where its dense
+  kernels win (the filled blocks of 96 rows and more above). Such a column
+  `k`, or one that passes the per-column limit of 8,192 updates shared
+  with `COLAMD`, restarts the probe only when the work it suggests for the
+  next `h = min(n - k - 1, 192)` columns exceeds four times the updates
+  done so far, `D`, which a restart discards: `m^2 * h` for `m`
+  multipliers, or `c * h` for the column's `c` updates up to and including
+  the source that passes the limit (which `D` counts too). At the start of
+  a block that fills, `D` is small and the probe restarts at once: the
+  blocks of 96 to 160 rows above restart at their first column, after 97
+  columns, at 0.94-1.04 times their earlier time (with the shared bounds
+  alone their probe ran almost to the end of the block, 1.35-1.71 times,
+  measured with Python 3.14). Behind a long accepted band, `D` is large
+  and the probe finishes the block in CSC. An absolute limit restarted
+  there and discarded the whole band: the benchmark band of 20,000 rows
+  followed by 96 sparse rows filling a block of 96, 128 or 160 rows, and
+  full bands of half-width 16 and 30 followed by the 96- and 128-row
+  blocks, took 1.25-1.59 times their earlier time in one-process scans
+  (1.27-1.57 in the review's fresh-process runs), and now take 0.28-0.60
+  times (fresh processes, five rounds). The factor 4: for a trailing dense
+  block of `b <= 193` rows the estimate at its first column, `(b - 1)^3`,
+  is about three times the block's remaining work of about `b^3 / 3`
+  updates (a 63-row block takes 81,375; `63^3 / 3` is 83,349), so the probe
+  finishes such a block while its remaining work stays below about 4/3 of
+  `D`. A restart redoes the prefix in the row engine, which takes 2-4 times
+  longer per update on the band's sparse rows than this loop. The factor
+  was chosen by measurement: with factor 1 the benchmark band followed by
+  blocks of 112 to 160 rows still restarted (1.26-1.36 times); factors 4
+  and 16 finish all of them (0.34-0.40).
+
+  The horizon `h` stops at the reach limit: it assumes the fill is a block
+  no wider than the fronts the probe accepts. Counting all `n - k - 1`
+  remaining columns, as the rule first did, treated every column after a
+  block in the middle of the matrix as fill, and those inputs restarted
+  late. A band of half-width 30 (20,000 rows), the 96-row filled block and
+  15,000 tridiagonal rows took 1.53-1.56 times the earlier time; with the
+  benchmark band (20,000 rows) after the block instead, 1.45-1.47; with
+  half-width-30 bands of 10,000 rows on both sides, 1.29; and with the
+  benchmark band on both sides (10,000 or 20,000 rows each), 1.16-1.18.
+  With the horizon they finish in CSC at 0.53-0.60 and 0.28-0.30 times
+  (fresh processes, five rounds, one and eight threads). The cost falls on
+  fill that lasts longer than 192 columns behind a long cheap prefix. The
+  estimate no longer sees it, so the probe continues until the
+  projected-work rule stops it, and discards more. Behind the benchmark
+  band (20,000 rows), each of these took 1.2-1.6 times the earlier time
+  (best of five fresh-process rounds) against 1.1-1.2 with the full count:
+  a band with entries at offsets ±1 and ±66 or ±80 (1,000 to 8,000 rows,
+  more than 64 multipliers per column once it fills); 16 filled blocks of
+  128 rows or 8 of 160 rows (each behind its 96 sparse rows); and 2-D grids
+  of side 66 and 80. In rounds where the row engine ran in its slower
+  allocation mode, the ratio reached 1.7 with either form and 2.0 with the
+  cap (the same row-engine work takes 43 or 60 ms in different processes
+  for some of these; see `docs/benchmarking.md`).
+
+  The per-column part matters behind a band of half-width 16 or 30 and a
+  128-row block, whose late columns pass 8,192 updates after the multiplier
+  test let the block continue. Its restart side decides only where a
+  column passes 8,192 updates while no column before it had more than 64
+  multipliers. The tests construct one (129 columns of 64 multipliers
+  feeding one column). A build in which that side never restarts gave
+  identical factors and probe statistics on the benchmark matrices, the
+  284 stress matrices below and 286 scratch families of this section
+  (bands, blocks, grids, triangular and random patterns); for them, the
+  per-column limit only relaxes the shared bound.
+- **Projected work.** After `max(32, n/16)` columns, the probe restarts once
+  its scalar updates so far, extrapolated to all `n` columns at their
+  average per column, exceed the total budget of `64 * nnz(A)`. A grid's
+  work per column is steady after its first rows, while the budget itself
+  is reached only after most of its columns: the 2-D grid of side 24 with
+  the shared bounds discarded 336 of its 576 columns (178,155 updates,
+  0.4 ms of a 1.9 ms factorization), and now 59 columns (18,435 updates,
+  0.04 ms). To stop a probe that would have completed within the budget,
+  a prefix must cover at least `n/16` columns and do more than
+  `4 * nnz(A)` updates there.
+
+`tests/test_sparse_lu.py` pins each rule at its threshold:
+
+- a row of 64 entries spanning 256 or 257 columns;
+- fill-induced blocks of 65 and 66 rows;
+- the 66-row block behind bands of 1,000 and 1,100 columns, about 0.91 and
+  1.006 times the restart threshold (one more remaining column would
+  restart the second);
+- the same block between a band of 3,215 or 3,232 columns and a band of
+  300 columns, where the horizon is capped (0.9975 and 1.0028 times the
+  threshold; a cap of 191 or 193 columns flips one of them);
+- a column whose updates pass 8,192 after 129 columns of 64 multipliers,
+  alone (restarts) and behind 125,889 updates, where it continues by less
+  than one more remaining column or the passing source's updates would
+  change;
+- a 128-row block behind 8,000 columns;
+- the grid of side 32, which restarts at column 64 = 1024 / 16.
+
+All
+rules depend only on the matrix and the options (the pattern, and for the
+others the values and `diag_pivot_thresh` through the pivots and the
+factor so far), never on the thread count. The check runs in its own,
+non-inlined function, and the row engine counts its rows again. The row
+engine is part of `factorize_typed`, and MSVC's code for it moves with any
+change to that function: a version that handed the check's counts to the
+row engine factored `sparse-dense-border` with `NATURAL` 8% slower with one
+thread (interleaved fresh-process runs, identical factors, Python 3.14).
+The `COLAMD` and `MMD_AT_PLUS_A` paths call an instantiation of the CSC
+engine without the `NATURAL` rules, whose per-column loops compile to the
+same instructions as in earlier builds (MSVC `/FAs` listings; only the
+one-time scan for a certain restart is laid out differently). Even so, the
+timing of unchanged paths moved by a few percent either way. In
+interleaved fresh-process runs (five rounds) the `COLAMD` and
+`MMD_AT_PLUS_A` benchmark cases took 0.96-1.03 times their earlier time;
+`MMD_AT_PLUS_A` `sparse-dense-border` with one thread measured 1.03 here
+and 1.048 in the review's runs, and single gate runs against the review's
+baseline 1.03 here and 1.07 in the review's, with 1.08 under Python 3.14
+(199.2 to 214.9 ms). `NATURAL` inputs that skip the probe and run only the
+row engine took 1.01-1.07 times their earlier time (`sparse-dense-border`
+1.03-1.04 here and 1.065 in the review's runs, a 2-D grid followed by a
+wide column 1.01-1.07, the 20,000-row band with a dense block of 150 or
+180 rows 1.04-1.07). Factors are bitwise identical in all of these. The
+functions that do that work, such as the row engine's sparse row update,
+compile to the same instructions as before but sit at other offsets within
+64-byte lines (the sparse row update at 48 instead of 16, linker map), and
+other variants of this change, with the same source for those functions,
+measured `sparse-dense-border` at 1.00 to 1.09, so these differences follow
+code placement rather than the work done. Moving the row engine out of
+`factorize_typed` (or into its own translation unit) would decouple it from
+such changes; it is a candidate follow-up, not part of this change.
+
+The probe's errors are final, as with `COLAMD`: an exactly singular column
+or a non-finite value found by the probe is reported, not retried in the
+row engine. Over 284 stress matrices with `NATURAL` (narrow random bands
+with uniform, `+-1` and small-integer values, rows permuted or not, some
+with entries outside the band; full bands of half-width 40 to 97;
+random sparse; small dense and half-dense matrices; `+-1` Hadamard blocks;
+singular matrices with a duplicated row or column or a combination of rows
+or columns; planted NaN and infinite entries with `check_finite=False`;
+triangular patterns; small arrows; and wide columns), 135 completed in the
+CSC engine, 39 were skipped, 38 restarted, and the errors matched earlier
+builds except on 4 matrices, all singular to working precision (smallest
+singular value at most 4.8e-17 of the largest): one band reported singular
+that the row engine factored (backward error 3.2e-12), and three singular
+matrices with a duplicated or combined column factored (backward errors
+1.3e-15 to 1.6e-14). The planted NaN and infinite entries gave the same
+outcome as before in all 40 matrices (37 non-finite errors, two singular
+columns reached first, and one NaN that reaches `U` without entering any
+update and is stored by both engines), and all ten duplicated rows were
+reported singular at the same column. The worst unrefined componentwise
+backward error of a completed CSC factorization was 6.4e-9 (a band with
+condition number 2e16), against 4.9e-7 from the row engine on the same
+matrix. Factors were bitwise identical at 1, 2, 3, 4 and 8 threads for
+every matrix. These results were the same under Python 3.14 and 3.15, and
+before and after the cost-aware restart rule and its horizon cap, which
+changed none of them (the cap left every factor and probe statistic of
+the stress matrices, the test fixtures and the benchmark bitwise
+unchanged).
+
+Trade-offs that remain:
+
+- inputs that the pattern check sends to the row engine although the CSC
+  engine would be faster, because a few rows are dense: a band of 20,000
+  rows with a dense 100-row block (0.28 times the row engine's time when
+  the probe ran to completion) and small arrows with dense last rows and
+  columns (0.60-0.66; both measured with Python 3.14). They run as in
+  earlier builds;
+- the pattern pass costs up to 2% of the row engine's time where it sends
+  an input without a column wider than 192 rows to the row engine (bands
+  with rows of 64 or more entries, dense blocks of 64 to 192 rows), which
+  earlier builds started at once;
+- late restarts that the rules cannot avoid, each still discarding an
+  accepted prefix (fresh processes, five rounds, one and eight threads):
+  - fill whose reach, including coupled rows, exceeds 192. Behind the
+    benchmark band, the 96 sparse rows with a 176- or 193-row block took
+    1.24-1.29 times the earlier time (the coupled sparse rows already take
+    the reach to 193 at 176 rows). Behind a band of half-width 30, a band
+    with entries at offsets ±1 and ±96 took 1.50-1.54.
+  - a long fill region that the projected-work rule stops late, because
+    the prefix's average keeps the projection low. The benchmark band
+    followed by a 2-D grid of side 64 restarted at column 21,438 and took
+    1.31-1.36. A band of half-width 30 (20,000 rows) followed by a grid of
+    side 86 or 88 restarted at column 27,178 of 27,396 or 26,489 of 27,744
+    and took 1.83-1.93, the largest ratio measured; it ran to the same
+    columns before the horizon cap.
+  - fill that lasts longer than the 192-column horizon behind a long cheap
+    prefix: 1.2-1.6, up to 2.0 in slow rounds (see the multiplier limit
+    above);
+- grids still fall back after a short probe: 2-D convection-diffusion
+  grids of side 20 to 64 took 1.05-1.10 times their earlier time and 3-D
+  grids of side 6, 8 and 10 1.00-1.08 (fresh processes, five rounds; the
+  review measured up to 1.18 and 1.12; after the horizon cap, which does
+  not change their probe, side 20 measured 1.12-1.13 and sides 32 and 64
+  1.05-1.07), where the probe is 1-8% of the
+  time and the rest is the code-placement effect above, although the CSC
+  engine would factor the 2-D grids up to side 45 in 0.45-0.71 times the
+  row engine's time if their probe were allowed more than `64 * nnz(A)`
+  updates;
+- a factorization in a process that has just run large CSC factorizations
+  can take longer in the row engine than in a fresh process (up to 1.4
+  times in one sequence of benchmark families), as with other allocator
+  effects noted in `docs/benchmarking.md`.
 
 ## Blocked SPD panels
 
@@ -986,16 +1253,26 @@ kernels"), whether or not the selected engine used it.
 
 `ordering_estimated_l_nnz` and `ordering_estimated_max_front` report AMD
 estimates for `MMD_AT_PLUS_A`; zero means unavailable for other orderings.
-COLAMD exposes `numeric_probe_columns`, `numeric_probe_max_front`,
-`numeric_probe_updates`, `numeric_probe_seconds`, and `numeric_probe_fallback`.
-The probe counts completed columns and scalar updates, and records the largest
-observed reach, including the column that triggers a restart. Probe time is
-included in numeric/factor time; on success it is the CSC factorization itself.
-Workspace diagnostics include the temporary restart snapshot (the requested
-permutation and both scale vectors; the probe's counters and empty factor
-buffers are restored alongside) and discarded CSC buffers on fallback, at
-their capacity, which includes the storage reserve described in
-"Left-looking CSC LU".
+COLAMD and NATURAL expose `numeric_probe_columns`, `numeric_probe_max_front`,
+`numeric_probe_updates`, `numeric_probe_seconds`, and `numeric_probe_fallback`
+(all zero or false with `MMD_AT_PLUS_A`, and for any ordering when the SPD
+path succeeds). The probe counts completed columns and scalar updates, and
+records the largest observed reach, including the column that triggers a
+restart. A column that triggers the factor-storage limit, or the `NATURAL`
+multiplier limit or projected-work bound, is factored first and counts as
+completed; one that triggers the reach, per-column or total update limit
+does not. Probe time is included in numeric/factor time; on success it is
+the CSC factorization itself. For `NATURAL` it also covers the pattern check
+that decides whether the probe starts; a probe that check skips reports
+`numeric_probe_fallback` true, zero columns, front and updates, and the
+check's time as `numeric_probe_seconds` (earlier builds reported false and
+zeros for every `NATURAL` factor). Workspace diagnostics include the
+temporary restart snapshot (the requested permutation and both scale
+vectors; the probe's counters and empty factor buffers are restored
+alongside) and discarded CSC buffers on fallback, at their capacity, which
+includes the storage reserve described in "Left-looking CSC LU". The
+`NATURAL` check's per-row extents (24 bytes per row) are released before
+the probe, whose own vectors are larger, and are not counted.
 
 For blocked SPD, `parallel_panels` counts actual parallel phases (a node's
 contributor fan-in or a panel's strip phase that met the threshold in
@@ -1172,15 +1449,35 @@ when their backward residual is small.
   2 * nnz(A)) + n` entries per array, and one whose later columns are denser
   grows 1.5-fold (doubling with libstdc++ and libc++) past it, as in earlier
   builds;
-- `NATURAL` never selects the left-looking engine (only `COLAMD` runs the
-  probe, and `MMD_AT_PLUS_A` selects it from the AMD estimate), so narrow
-  nonsymmetric bands with `NATURAL` run on the row-hybrid engine at 2.1-2.6
-  times SuperLU's time (the row-permuted band, in three runs and an
-  independent review) and 2.4 times (the unpermuted 8,000-row band). The
-  scratch prototype that also ran the probe for `NATURAL` factored them at
-  0.81-0.89 and 0.86-0.87 times the SuperLU time of the same runs; where its
-  probe fell back it cost at most 5.2 ms (`sparse-dense-border`, which takes
-  1.3 s with eight threads and 4.0 s with one under `NATURAL`);
+- `NATURAL` now runs the probe (see "Engine selection for `NATURAL`"), and
+  the narrow bands of the benchmark take 0.61-0.63 times SuperLU's time
+  instead of 2.2-2.4. What remains: inputs with a few dense rows (a band
+  with a dense block of up to 192 rows, small arrows) stay in the row
+  engine although the CSC engine would be faster; the skipped probe's
+  pattern pass costs up to 2% where earlier builds started the row engine
+  at once; fill whose reach exceeds the 192-row limit, a long fill region
+  that the projected-work rule stops late, or fill lasting longer than
+  the 192-column horizon of the cost-aware rule after a long cheap
+  prefix still restarts the probe late and discards an accepted prefix
+  (1.2-1.9 times the earlier time in the cases measured; the worst, a
+  band of half-width 30 followed by a 2-D grid of side 86, restarts 218
+  columns before the end); and 2-D
+  and small 3-D grids restart after a short probe (0.04-1.3 ms) although
+  2-D grids up to side 45 would factor in the CSC engine at 0.45-0.71
+  times the row engine's time with a larger work budget;
+- `COLAMD` does not apply the `NATURAL` rules (the pattern check, the
+  multiplier limit with its cost-aware restart, and the projected work),
+  so its probe still runs until the wide column when an input column is
+  wider than 192 rows, and still accepts inputs whose rows the row engine
+  would hold dense (with `NATURAL`, completing such probes took 1.2-3.0
+  times the row engine's time on wide bands and dense blocks of 64 to 128
+  rows); applying the rules to `COLAMD` needs its own measurements;
+- the row engine is part of `factorize_typed`, so any change to that
+  function, or elsewhere in `sparse_lu.cpp`, can move the row engine's
+  timing by a few percent through code placement alone (1.01-1.08 on
+  unchanged paths with `NATURAL` and `MMD_AT_PLUS_A`; see "Engine selection
+  for `NATURAL`"). Moving the row engine into its own function or
+  translation unit is a candidate follow-up;
 - one-thread efficiency depends on the `avx2-fma` kernel: with
   `SPSOLVE_FORCE_KERNEL=sse2` (the path of x86-64 CPUs without AVX2 and FMA)
   the `COLAMD` gate run failed the 1.5 one-thread criterion on
@@ -1280,5 +1577,6 @@ every case on the same machine (see "Current status" in
 `docs/benchmarking.md`).
 Linux x64 release builds have not been measured since these changes (CI runs
 the tests and the quick benchmark without `--gate`), so `NATIVE_DEFAULT` in
-`src/spsolve/sparse_lu.py` stays `False`. The next targets are engine
-selection for `NATURAL` (above), then a Linux gate run.
+`src/spsolve/sparse_lu.py` stays `False`. `NATURAL` now runs the probe (see
+"Engine selection for `NATURAL`"), which does not change either gate. The
+next target is a Linux gate run.

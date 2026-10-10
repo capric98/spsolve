@@ -38,11 +38,13 @@ This adds a connected dense general matrix (`dense-lu`), its row-pivoted copy
 symmetric, diagonally dominant dense SPD blocks (`dense-spd-blocks`) for the
 LDL.T path. Blocks are 600 rows (200 with `--quick`).
 
-With `--extended --permc-spec COLAMD`, the suite also includes a 20,000-row
-banded matrix whose rows are randomly permuted (`--quick` uses 2,500 rows).
-This checks that row labels do not turn narrow COLAMD factors into a wide-front
-classification. The case is specific to COLAMD: MMD's `A + A.T` graph changes
-under independent row permutations and can produce a very different ordering.
+With `--extended --permc-spec COLAMD` or `--permc-spec NATURAL`, the suite
+also includes a 20,000-row banded matrix whose rows are randomly permuted
+(`--quick` uses 2,500 rows). This checks that row labels do not turn narrow
+factors into a wide-front classification. MMD is excluded: its `A + A.T`
+graph changes under independent row permutations and can produce a very
+different ordering. (Builds before the `NATURAL` probe included the case
+with `COLAMD` only.)
 
 The promotion ordering is `MMD_AT_PLUS_A`. Use `--permc-spec COLAMD` or
 `--permc-spec NATURAL` to compare another public ordering without editing the
@@ -56,10 +58,10 @@ timer noise and garbage-collection jitter do not dominate; override this with
 timed interval, so object-destruction cost is not attributed to the next
 factorization.
 
-JSON results also include COLAMD probe work and restart diagnostics. Numeric
-time includes any discarded probe, while ordering time contains only the
-requested ordering. The promotion criteria also apply to the permuted-band
-case when it is included.
+JSON results also include `COLAMD` and `NATURAL` probe work and restart
+diagnostics. Numeric time includes any discarded probe, while ordering time
+contains only the requested ordering. The promotion criteria also apply to
+the permuted-band case when it is included.
 
 ## Criteria
 
@@ -153,6 +155,185 @@ SuperLU, and in the final roadmap gate runs it factored in 4.6 ms against
 SuperLU's 7.4 ms (`MMD_AT_PLUS_A`, eight threads).
 
 ## Current status
+
+### `NATURAL` after the probe change
+
+`NATURAL` now runs the bounded left-looking probe, with a pattern check
+before it, a cost-aware multiplier limit and a projected-work bound of its
+own (see "Engine selection for `NATURAL`" in
+[the design notes](native-lu.md#engine-selection-for-natural)); `COLAMD` and
+`MMD_AT_PLUS_A` factor bitwise as before. Measured on 2026-10-10 on the
+machine of "State after the roadmap" below with Python 3.15.0, NumPy 2.5.3
+and SciPy 1.18.1 (the repository's virtual environment; the sections below
+used Python 3.14.8, NumPy 2.3.5 and SciPy 1.16.3), otherwise idle: three
+runs of each build, alternating between `4f1885e` and this change
+(`build/review/step6b_r2_natural_head_{1,2,3}.json` and
+`step6b_r2_natural_{1,2,3}.json`; not tracked):
+
+```bash
+python benchmarks/factorization.py --threads 8 --repeats 3 --extended --dense-lu --permc-spec NATURAL
+```
+
+Medians of the three runs in milliseconds, ratios as in the sections below
+(median of the per-run ratios; ranges for this change):
+
+| case | engine | `4f1885e` 1 / 8 threads | this change 1 / 8 threads | SuperLU | N/S before | N/S after | N1/S before | N1/S after |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 2-D Poisson, n=8,100 | simplicial LDL^T | 19.6 / 19.4 | 19.8 / 19.6 | 42.5 | 0.45 | 0.46 | 0.46 | 0.47 (0.46-0.47) |
+| irregular, n=2,500 | row hybrid (probe restarts) | 162 / 93.5 | 163 / 91.5 | 252 | 0.37 | 0.36 (0.36-0.37) | 0.64 | 0.65 (0.63-0.65) |
+| pivot-heavy, n=2,000 | row hybrid (probe restarts) | 117 / 62.0 | 116 / 64.7 | 181 | 0.34 | 0.35 (0.34-0.37) | 0.64 | 0.63 (0.56-0.64) |
+| 3-D Poisson, n=8,000 | simplicial LDL^T | 263 / 260 | 254 / 255 | 502 | 0.52 | 0.51 (0.51-0.52) | 0.52 | 0.51 (0.50-0.52) |
+| nonsymmetric band, n=8,000 | row hybrid → left-looking CSC | 6.40 / 6.39 | 1.62 / 1.65 | 2.61 | **2.38** | 0.63 (0.62-0.63) | **2.38** | 0.62 |
+| `sparse-dense-border`, n=20,600 | row hybrid (probe skipped) | 3,948 / 1,332 | 4,109 / 1,342 | 3,615 | 0.37 | 0.37 | 1.09 | 1.14 (1.13-1.15) |
+| row-permuted band, n=20,000 | row hybrid → left-looking CSC | 19.0 / 19.2 | 5.24 / 5.19 | 8.48 | **2.28** | 0.61 (0.60-0.62) | **2.23** | 0.61 (0.61-0.62) |
+| dense LU, 600 | row hybrid (probe skipped) | 8.76 / 6.51 | 8.89 / 6.52 | 8.79 | 0.75 | 0.74 (0.69-0.76) | 1.01 | 1.01 (1.01-1.03) |
+| row-pivoted dense LU, 600 | row hybrid (probe skipped) | 8.99 / 6.72 | 9.29 / 6.77 | 8.97 | 0.73 | 0.75 (0.75-0.77) | 1.00 | 1.04 (1.03-1.05) |
+| four dense LU blocks of 600 | row hybrid (probe skipped) | 35.2 / 26.3 | 35.8 / 26.3 | 34.7 | 0.76 | 0.76 (0.74-0.77) | 1.02 | 1.04 (1.02-1.04) |
+| five dense LU blocks of 600 | row hybrid (probe skipped) | 44.0 / 32.4 | 44.0 / 32.5 | 43.3 | 0.73 | 0.76 (0.73-0.76) | 1.02 | 1.03 (1.01-1.03) |
+| eight dense LU blocks of 600 | row hybrid (probe skipped) | 71.1 / 52.2 | 72.6 / 52.3 | 68.0 | 0.75 | 0.77 (0.73-0.77) | 1.03 | 1.06 (1.01-1.07) |
+| four dense SPD blocks of 600 | supernodal LDL^T | 24.3 / 16.0 | 24.4 / 15.8 | 34.4 | 0.45 | 0.46 | 0.69 | 0.71 (0.68-0.71) |
+
+The SuperLU column is this change's runs. The two bands now take 0.25-0.28
+times their earlier time and 0.61-0.63 times SuperLU's (2.2-2.4 times
+before; the review measured 2.42 to 0.61 and 2.24 to 0.61); their factors
+happen to be bitwise identical to the row engine's (both bands are
+diagonally dominant). The probe of irregular and pivot-heavy restarts
+after 304 and 216 columns (0.22 and 0.08 ms); the dense LU families and
+`sparse-dense-border` have a column wider than 192 rows and skip it (under
+0.01 ms). Every other case selects the engine it selected before, with
+bitwise identical factors, at 0.96-1.04 times its earlier time;
+`sparse-dense-border` with one thread sits at the top of that range (1.04,
+N1/S 1.09 to 1.14; the review measured 1.09 to 1.18), from the code
+placement of the row engine (see the design notes), not from the skipped
+check. With this
+change all thirteen cases met the promotion criteria in all three
+`NATURAL` runs (at most 0.77 and 1.15; residuals at most 5.9e-16;
+identical one- and eight-thread permutations); with `4f1885e` the two bands
+failed both ratios. Under Python 3.14 the same comparison measured the
+bands at 0.56-0.60 times SuperLU's time (2.1-2.4 before).
+
+The gate itself runs with `MMD_AT_PLUS_A` and `COLAMD`, whose factors this
+change leaves bitwise identical (every benchmark case, the test fixtures
+and 284 stress matrices at one and eight threads, in both environments).
+One run of each gate with this change in the Python 3.15 environment
+(`build/review/step6b_r2_{colamd,mmd}.json`) passed every case: N/S at
+most 0.85 and N1/S at most 1.29 (`COLAMD`), 0.76 and 1.01
+(`MMD_AT_PLUS_A`); residuals at most 5.7e-16 and identical one- and
+eight-thread permutations. After the horizon cap of the cost-aware rule,
+one more run of each (`build/review/step6b_r3_{colamd,mmd}.json`) passed
+as well: 0.84 and 1.30 (`COLAMD`, the 1.30 being the informational
+`sparse-dense-border`), 0.78 and 1.03 (`MMD_AT_PLUS_A`), at 0.97-1.03 and
+0.97-1.09 times the previous runs' times with identical factors. Against
+the review's `4f1885e` baselines of the
+same environment (`env315_head_{colamd,mmd}.json`, single runs) the cases
+took 0.91-1.07 (`COLAMD`) and 0.98-1.04 (`MMD_AT_PLUS_A`) times their
+earlier time. Interleaved fresh-process runs (five rounds) put the
+`COLAMD` and `MMD_AT_PLUS_A` benchmark cases at 0.96-1.03; for
+`MMD_AT_PLUS_A` `sparse-dense-border` with one thread they measured 1.03
+here, 1.048 in the review's runs, and gate pairs 1.03 here and 1.07 in the
+review's (1.08 under Python 3.14, 199.2 against 214.9 ms). Factors are
+bitwise identical in all of these, so the differences are code placement.
+
+Where `NATURAL` stays in the row engine, the probe or the check before it
+is overhead; where a probe used to restart late, the cost-aware rule now
+finishes it. Interleaved runs in fresh processes (one process per case and
+build, the scratch scripts' batched medians of five samples; five rounds;
+medians; ratio of this change over `4f1885e`):
+
+| matrix | probe | 1 thread | 8 threads |
+|---|---|---:|---:|
+| irregular, pivot-heavy (benchmark) | restarts after 304 and 216 columns (0.19 and 0.10 ms) | 1.02, 1.01 | 0.96, 1.05 |
+| `sparse-dense-border` (benchmark) | skipped: a column of 604 rows | 1.03 | 1.07 |
+| dense LU, five dense LU blocks (benchmark) | skipped: columns of 600 rows | 1.04, 1.01 | 1.03, 0.99 |
+| `sparse_to_dense`, `general_matrix(320, 0.025, 14)`, `dense_pivoted(160)` (test fixtures) | restarts after 97 and 42 columns, skipped | 0.96, 1.02, 0.98 | 1.02, 1.01, 1.01 |
+| full band of half-width 32, dense block of 64 rows, 60 blocks of 64 rows | skipped: dense rows (check 0.002-0.8 ms) | 1.05, 1.02, 1.01 | 1.01, 1.04, 1.02 |
+| 96 sparse rows filling a dense block of 96, 128, 160 rows | restarts after 97 columns (0.03-0.04 ms) | 1.04, 0.94, 1.04 | 1.02, 1.02, 1.01 |
+| the benchmark band (20,000 rows) followed by the 96-, 128-, 160-row filled blocks | completes in CSC | 0.29, 0.31, 0.34 | 0.28, 0.31, 0.35 |
+| full bands of half-width 16 and 30 (20,000 rows) followed by the 96- and 128-row blocks | completes in CSC | 0.48, 0.48, 0.57, 0.57 | 0.50, 0.51, 0.60, 0.60 |
+| 2-D convection-diffusion, side 20, 24, 32, 45, 64 | restarts after 97, 59, 64, 126, 256 columns (0.04-1.25 ms) | 1.09, 1.08, 1.08, 1.05, 1.05 | 1.09, 1.10, 1.05, 1.05, 1.06 |
+| 3-D convection-diffusion, side 6, 8, 10 | restarts after 51, 68, 55 columns (0.04-0.11 ms) | 1.07, 1.03, 1.00 | 1.08, 1.04, 1.00 |
+| 2-D grid of side 32 followed by a 300-row arrow | skipped: a column of 300 rows | 1.01 | 1.02 |
+| 20,000-row band with a dense 150- or 180-row block | skipped: dense rows | 1.04, 1.04 | 1.06, 1.07 |
+
+Before the cost-aware rule (an absolute limit of 64 multipliers), the two
+late-block rows completed nothing: the probe discarded the 20,097 columns
+before the block and the cases took 1.25-1.59 times their earlier time in
+one-process scans (the review measured 1.27, 1.27, 1.46 and 1.54 in fresh
+processes for the 96- and 128-row blocks behind the benchmark band and the
+96-row block behind half-widths 16 and 30). The late restarts that remain
+are in the next table. The probe takes
+1-8% of the grids' times; the rest of their ratios, like the row-engine
+rows near 1.05, is the code placement of the row engine (the review
+measured the 2-D grids at 1.18, 1.10, 1.10, 1.09 and 1.07 and the 3-D
+grids at 1.12, 1.06 and 1.03). The `sparse-dense-border` eight-thread
+median includes one slow round in each build (up to 5.3 s). With the shared
+bounds alone (before the pattern check and the `NATURAL` rules), Python
+3.14 runs measured 1.26 and 1.19 for the 2-D grids of side 24 and 32,
+1.35-1.71 for the filled blocks, whose probe ran almost to their end, and
+1.45-2.56 for dense blocks of 144 to 192 rows, whose probe ran about 60
+columns.
+
+The cost-aware rule's horizon stops at 192 columns (see the design notes);
+counting all remaining columns instead made blocks in the middle of the
+matrix restart late. Late restarts with both forms of the rule, in
+interleaved fresh-process runs of `4f1885e`, the full count and the capped
+horizon (five rounds; ratios over `4f1885e` of the best of the five
+batched medians, because the row engine's time on several of these
+matrices is bimodal across processes, for example 43 or 59 ms with
+`4f1885e` for the benchmark band followed by a grid of side 64, so that
+medians of five can compare different modes; the medians are given where
+they differ by more than 0.05):
+
+| matrix | probe with the capped horizon | full count, 1 / 8 threads | capped, 1 / 8 threads |
+|---|---|---:|---:|
+| the benchmark band followed by 96 sparse rows filling a 176- or 193-row block | restarts after 20,098 or 20,096 columns (reach above 192) | 1.24 / 1.27, 1.24 / 1.26 | 1.24 / 1.25, 1.24 / 1.27 |
+| the benchmark band followed by a 2-D grid of side 64 | restarts after 21,438 columns (projected work) | 1.32 / 1.36 (median 1.25 / 1.36) | 1.31 / 1.36 (median 0.99 / 1.36) |
+| the benchmark band (10,000 or 20,000 rows), the 96-row filled block, the same band again | completes in CSC | 1.17 / 1.18, 1.18 / 1.18 | 0.29 / 0.29, 0.28 / 0.29 |
+| a band of half-width 30 (20,000 rows), the 96-row filled block, then 15,000 tridiagonal rows or the benchmark band | completes in CSC | 1.53 / 1.56, 1.46 / 1.47 | 0.57 / 0.60, 0.53 / 0.56 |
+| bands of half-width 30 (10,000 rows) on both sides of the 96-row filled block | completes in CSC | 1.27 / 1.29 | 0.58 / 0.61 |
+| the benchmark band followed by a band with entries at offsets ±1, ±66 (2,000 or 8,000 rows) | restarts after 21,354 columns (projected work) | 1.21 / 1.72 (median 1.19 / 1.64), 1.11 / 1.11 | 1.52 / 1.51 (median 1.49 / 1.43), 1.23 / 1.24 (median 1.21 / 1.48) |
+| the same with offsets ±1, ±80 (1,000 or 2,000 rows) | restarts after 20,942 and 20,941 columns (projected work) | 1.20 / 1.20, 1.17 / 1.18 | 1.53 / 1.55, 1.41 / 1.46 (median 1.41 / 1.98) |
+| the benchmark band followed by 16 filled 128-row blocks or 8 filled 160-row blocks (each behind its 96 sparse rows) | restarts after 23,040 and 21,470 columns (projected work) | 1.16 / 1.16, 1.19 / 1.20 | 1.59 / 1.58, 1.57 / 1.57 |
+| the benchmark band followed by a 2-D grid of side 66 or 80 | restarts after 21,352 and 20,940 columns (projected work) | 1.14 / 1.13, 1.11 / 1.12 | 1.33 / 1.72, 1.22 / 1.25 (median 0.99 / 1.73, 0.97 / 1.52) |
+| a band of half-width 30 (20,000 rows) followed by a band with entries at offsets ±1, ±96 (1,000 rows) | restarts after 20,096 columns (reach above 192) | 1.51 / 1.53 | 1.52 / 1.54 |
+| a band of half-width 30 (20,000 rows) followed by a 2-D grid of side 86 or 88 | restarts after 27,178 and 26,489 columns (projected work) | 1.88 / 1.91, 1.82 / 1.84 | 1.90 / 1.93, 1.84 / 1.86 |
+
+With the full count, the middle blocks and the rows from the ±66 band to
+the grids of side 66 and 80 restarted at the first column with more than
+64 multipliers, after 10,097 or 20,097 columns for the blocks and 20,064
+or 20,073 for the bands and grids. With the capped horizon, the middle
+blocks finish, while the
+sustained fill continues until the projected-work rule stops it. The
+probe of the last row ran for 127 ms. The 176- and 193-row blocks, the
+grid of side 64 and the last two rows restart at the same column in both
+forms. Measured on 2026-10-10 in the Python 3.15 environment above.
+
+The CSC engine also now factors many `NATURAL` inputs outside the
+benchmark. Interleaved fresh-process runs (three rounds; one thread; eight
+threads within a few percent, since the engine is serial and the row
+engine gains little on these):
+
+| matrix | `4f1885e` (row hybrid), ms | this change (left-looking CSC), ms | ratio |
+|---|---:|---:|---:|
+| full band, half-width 1 / 4 / 8 / 16 / 24 / 30, n=20,000, pivoting | 6.42 / 14.0 / 25.0 / 47.2 / 74.5 / 97.5 | 2.12 / 5.64 / 10.7 / 22.8 / 38.7 / 55.5 | 0.33 / 0.40 / 0.43 / 0.48 / 0.52 / 0.57 |
+| same with rows permuted, half-width 2 / 16 / 30 | 10.4 / 55.1 / 110 | 4.05 / 24.1 / 58.9 | 0.39 / 0.44 / 0.54 |
+| band with offsets -12, -5, -1, 0, 3, 8, 15, rows permuted, n=20,000 | 42.9 | 15.9 | 0.37 |
+| nonsymmetric tridiagonal, n=200,000 | 64.3 | 18.5 | 0.29 |
+| dense block of 16 / 32 / 63 rows | 0.032 / 0.072 / 0.253 | 0.024 / 0.041 / 0.155 | 0.75 / 0.57 / 0.61 |
+| 200 dense blocks of 32 rows / 100 of 56 rows | 12.7 / 20.9 | 6.46 / 11.5 | 0.51 / 0.55 |
+| 2-D convection-diffusion, side 8 / 12 / 17 | 0.074 / 0.206 / 0.523 | 0.032 / 0.070 / 0.204 | 0.44 / 0.34 / 0.39 |
+| 96 sparse rows filling a dense block of 48 / 64 rows | 0.381 / 0.454 | 0.154 / 0.241 | 0.41 / 0.53 |
+| random lower triangular, 10 entries per column, n=200,000 | 284 | 39.3 | 0.14 |
+| random upper triangular, 10 entries per column, n=200,000 | 88.3 | 48.0 | 0.54 |
+| random lower / upper triangular, 40 entries per column, n=20,000 | 56.1 / 13.1 | 8.25 / 10.9 | 0.15 / 0.83 |
+
+In single-process sequences, row-engine cases that followed CSC
+factorizations ran up to 1.4 times slower than with `4f1885e` in an
+earlier comparison (for example a diagonally dominant band of half-width
+36, 15.3 against 11.1 ms, Python 3.14), while fresh processes measured
+1.02 for the same case: the allocator state left by the preceding cases
+differs between the builds, as with the fresh-process effects noted in
+"Row-permuted band" below.
 
 ### State after the left-looking search change
 
@@ -499,18 +680,18 @@ ranges.
 Other orderings: with `MMD_AT_PLUS_A` the row permutation destroys the
 structure of `A + A.T`; native uses the row-hybrid engine (175 ms with one
 thread, 147 ms with eight, 1.10 million factor entries) while SuperLU takes
-5.48 seconds (4.77 million entries). With `NATURAL` native never uses the
-left-looking engine, and the row-hybrid engine takes 19-22 ms against
-SuperLU's 8.9-9.1 ms (2.1-2.5 times in three runs here, 2.3-2.6 times in an
-independent review; the unpermuted 8,000-row band also takes 2.4 times
-SuperLU's time with `NATURAL`; measured at `c46bda9`, unaffected by the
-change above). A scratch prototype that also runs the `COLAMD` probe for
-`NATURAL`, with the prototype's reserve and sorted search start, took
-7.1-8.2 ms on the
+5.48 seconds (4.77 million entries). With `NATURAL` native used the
+row-hybrid engine until the `NATURAL` probe change (first section), taking
+19-22 ms against SuperLU's 8.9-9.1 ms (2.1-2.5 times in three runs here,
+2.3-2.6 times in an independent review; the unpermuted 8,000-row band also
+took 2.4 times SuperLU's time with `NATURAL`; measured at `c46bda9`). A
+scratch prototype that also ran the `COLAMD` probe for `NATURAL`, with the
+prototype's reserve and sorted search start, took 7.1-8.2 ms on the
 row-permuted band (0.81-0.89 times the SuperLU time of the same runs,
 8.7-9.2 ms) and 2.4 ms on the unpermuted band (0.86-0.87 times the SuperLU
-time of the same run). See the limitations in
-[the design notes](native-lu.md#current-limitations-and-next-optimization-target).
+time of the same run); with the search change above and the `NATURAL`
+probe, they take 5.2 and 1.6 ms (0.61-0.63 times SuperLU's time; first
+section).
 
 ## History
 

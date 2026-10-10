@@ -156,12 +156,29 @@ order in either direction.
 The search keeps only suspended pivoted rows on its stack: an unpivoted row
 has no outgoing edges, so it finishes as soon as it is reached and is written
 to the reach at once, which is exactly where a search that pushed and popped
-it would write it. The COLAMD "probe" runs this
+it would write it. The "probe" of `COLAMD` and `NATURAL` runs this
 algorithm with budgets (reach above 192 rows, more than $8192$ updates in one
 column, more than $64\,\mathrm{nnz}(A)$ updates in total, or more than
 $20\,\mathrm{nnz}(A)$ factor entries) and restarts in the row engine when a
 budget is exceeded, so the discarded work is bounded by a constant multiple of
-the input size.
+the input size. With `NATURAL` the probe does not start when an input
+column has more than 192 entries (a column's reach contains its own rows) or
+when a row has at least 64 entries filling at least a quarter of the span
+between its first and last column, which the row engine stores densely from
+the start. A `NATURAL` probe also treats a column $k$ with $m > 64$
+multipliers, or with more than $8192$ updates $c$, as a reason to restart
+only when the work it suggests for the next $h = \min(n - k - 1, 192)$
+columns, $m^2 h$ or $c\,h$, exceeds four times the $D$ updates done so far,
+which a restart would discard: a block that fills at the start restarts at
+once, one behind a long accepted band finishes in CSC. The horizon $h$
+assumes that the fill region is a block no wider than the reach limit, so
+the sparse columns after a block in the middle of the matrix do not count
+as fill; a fill region that lasts longer is left to the projected-work rule
+and the total budget. After
+$\max(32, \lfloor n/16 \rfloor)$ columns it restarts as soon as
+$D \cdot n / (k + 1) > 64\,\mathrm{nnz}(A)$, that is when the updates so
+far, at their average per column, project beyond the total budget (see
+"Engine selection for `NATURAL`" in `docs/native-lu.md`).
 
 ## 5. Row-hybrid right-looking LU
 
