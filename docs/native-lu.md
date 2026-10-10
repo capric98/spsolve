@@ -944,13 +944,61 @@ when their backward residual is small.
 - native matrix values are `float64` only;
 - no complex native factors yet (the SciPy backend handles them);
 - ordering and pivot selection are single-threaded;
+- the left-looking CSC engine is a serial, scalar Gilbert-Peierls loop
+  without supernodes or symmetric pruning, and it factors the one benchmark
+  case that fails the gate: the row-permuted 20,000-row band with `COLAMD`
+  took 1.14-1.17 times SuperLU's time with eight threads (1.14-1.15 with one)
+  in the final gate runs, and 1.25-1.28 times the SuperLU time of the same
+  runs when run alone in a fresh process with eight threads. About 8 ms of
+  its 20 ms is COLAMD, which SuperLU pays as well; the gap is the numeric
+  phase (10.8-11.3 ms against 9.5 ms for SuperLU's whole factorization). Two
+  costs dominate. First, the `L` and `U` arrays start with room for
+  `3.3 * n` entries when no AMD estimate exists, as with `COLAMD`, and are
+  reallocated three times on the way to their 160,000 and 200,000 entries,
+  faulting in fresh pages each time (about 5,100 page faults per one-thread
+  factorization in a fresh process, 3,000 after larger factorizations have
+  warmed the heap). Second, the depth-first search starts from a column's
+  entries in their stored order, which follows the random row labels. In an
+  uncommitted scratch prototype, reserving each array for
+  `2.3 * nnz(A) + n` entries and starting the search from a column's entries
+  in increasing pivot position together cut the fresh-process numeric phase
+  from 12.5 to 7.2 ms (the reserve alone to 9.8-10.1 ms, the search order
+  alone to 10.5 ms), while relabeling the rows for locality with an
+  unchanged traversal gained nothing; with both changes the prototype ran
+  the case at 0.90-0.94 times the SuperLU time of the same runs (see
+  "Row-permuted band" in `docs/benchmarking.md`). Sizing the arrays would
+  leave the factors bitwise identical; the search order would change the
+  order in which updates reach an entry, and with it LU factors in the last
+  bits (in the prototype, up to 2.2e-16 of the largest `U` entry on the
+  benchmark bands, with unchanged permutations and patterns), and it could
+  change a pivot choice wherever two candidates, or the preferred row and
+  the threshold, lie within those last bits of each other (in the
+  prototype, row-permuted bands of `+-1` entries changed permutations);
+- `NATURAL` never selects the left-looking engine (only `COLAMD` runs the
+  probe, and `MMD_AT_PLUS_A` selects it from the AMD estimate), so narrow
+  nonsymmetric bands with `NATURAL` run on the row-hybrid engine at 2.1-2.6
+  times SuperLU's time (the row-permuted band, in three runs and an
+  independent review) and 2.4 times (the unpermuted 8,000-row band). The
+  scratch prototype that also ran the probe for `NATURAL` factored them at
+  0.81-0.89 and 0.86-0.87 times the SuperLU time of the same runs; where its
+  probe fell back it cost at most 5.2 ms (`sparse-dense-border`, which takes
+  1.3 s with eight threads and 4.0 s with one under `NATURAL`);
+- one-thread efficiency depends on the `avx2-fma` kernel: with
+  `SPSOLVE_FORCE_KERNEL=sse2` (the path of x86-64 CPUs without AVX2 and FMA)
+  the `COLAMD` gate run failed the 1.5 one-thread criterion on
+  `sparse-dense-border` (1.54) and the four- and eight-block dense LU cases
+  (1.53 and 1.52), and connected and five-block dense LU sat at 1.48, while
+  the `MMD_AT_PLUS_A` run passed with dense LU at 1.37-1.45 (single runs;
+  see "Baseline kernel" in `docs/benchmarking.md`);
 - general LU retains serial per-pivot panel work: the block column scan, the
   right-looking block update (one `axpy_sub` per later panel column; a
   recursively blocked panel would touch the block less often), and
   pivot-tail materialization (one `axpy_sub` per earlier panel pivot);
-  dense rows still keep span-wide tails in separately allocated storage,
-  and on the dense benchmark cases the flush pass runs only about 2x faster
-  with eight threads than with one;
+  dense rows still keep span-wide tails in separately allocated storage.
+  End to end, eight threads take 0.72-0.80 times the one-thread time on the
+  dense LU benchmark cases (connected dense LU of size 600 with
+  `MMD_AT_PLUS_A`: 7.7 instead of 10.0 ms; medians of the final gate runs in
+  `docs/benchmarking.md`);
 - a row that becomes dense during the factorization stays listed in the
   sparse column lists by its earlier sparse entries, which the candidate
   scan still visits (rows dense at setup are no longer listed);
@@ -961,10 +1009,12 @@ when their backward residual is small.
 - the supernodal LDL^T symbolic phase is serial, and its first pass
   (elimination tree and column counts by row-subtree walks, shared with the
   simplicial kernel) still takes one step per entry of `L`: 2.9 of the 5.3 ms
-  symbolic time on 3-D Poisson of side 20 with `COLAMD`, where the node tails
-  and their sorting take 1.6 ms and the contributor lists 0.7 ms. A column
-  count algorithm in nearly `O(nnz(A))` time (Gilbert, Ng and Peyton) would
-  remove most of the first pass;
+  symbolic time on 3-D Poisson of side 20 with `COLAMD` (as measured when the
+  supernodal symbolic phase was introduced; the final gate runs report
+  5.1-5.3 ms in all at eight threads), where the node tails and their sorting
+  take 1.6 ms and the contributor lists 0.7 ms. A column count algorithm in
+  nearly `O(nnz(A))` time (Gilbert, Ng and Peyton) would remove most of the
+  first pass;
 - supernodal LDL^T keeps serial work around its parallel phases in phase B:
   the top nodes are factored one at a time, each panel solves the node's own
   rows `[end, width)` on the calling thread before its strip phase (for a
@@ -975,12 +1025,14 @@ when their backward residual is small.
   a parallel fan-in. A dense top node therefore scales poorly (four dense
   600-wide SPD blocks took 9.3 ms in phase B at eight threads and 11.3 ms on
   one thread, before the forest rule made them subtrees). On 3-D Poisson of
-  side 20 with `COLAMD` at eight threads the numeric phase takes about 23 ms:
-  5.6 ms in phase A (17 subtrees and the CSC allocations) and 17 ms for the 38
-  top nodes, of which 8.0 ms are the strips of 19 parallel fan-ins, 1.7 ms
-  the other 19 fan-ins, 1.9 ms block setup and target positions, and most of
-  the rest panel work. Strips cut each contribution's rows by node position,
-  so a sparse contribution is applied in short parts, and every strip scans
+  side 20 with `COLAMD` at eight threads the numeric phase takes about 22 ms
+  (20.6-23.1 ms in the final gate runs), about 6 ms of it in phase A (17
+  subtrees and the CSC allocations) and the rest for the 38 top nodes; when
+  phase A was introduced (23 ms in all), the top nodes' 17 ms were 8.0 ms for
+  the strips of 19 parallel fan-ins, 1.7 ms for the other 19 fan-ins, 1.9 ms
+  for block setup and target positions, and mostly panel work otherwise.
+  Strips cut each contribution's rows by node position, so a sparse
+  contribution is applied in short parts, and every strip scans
   the node's contribution list; a panel's rank-32 update also reads and writes
   the whole trailing block once per panel, which limits its eight-thread
   scaling on large dense nodes; the workers of the i5-13600K also land on its
@@ -992,18 +1044,23 @@ when their backward residual is small.
   on the benchmark cases), and fresh block memory costs page faults and a
   release on every factorization: four dense 600-wide SPD blocks, whose nodes
   have no contributors to read in place, ran 1-2% slower (1.5% to 2.2% with
-  one thread, 0.6% to 1.4% with eight, in two sets of interleaved runs) than
-  with a single reused node rectangle. A failed SPD attempt on a symmetric
-  indefinite matrix also allocates the whole node block array, and touches
-  its pages up to the failing node (in phase A, up to the failing nodes of
-  every subtree started), and, when phase A ran, may have allocated the CSC
-  arrays too, before falling back to LU (earlier builds held one node
+  one thread, 0.6% to 1.4% with eight, in two sets of interleaved runs when
+  the block storage was introduced) than with a single reused node
+  rectangle. A failed SPD attempt on a symmetric indefinite matrix also
+  allocates the whole node block array, and touches its pages up to the
+  failing node (in phase A, up to the failing nodes of every subtree
+  started), and, when phase A ran, may have allocated the CSC arrays too,
+  before falling back to LU (earlier builds held one node
   rectangle and allocated the CSC arrays before every attempt);
   `peak_workspace_bytes` reports it (with phase A, the count of those CSC
   arrays depends on scheduling). Allocating the CSC arrays and releasing
   the blocks still fault in and free fresh pages on every factorization
-  (about 3.6 and 0.8 ms on 3-D Poisson of side 20 with `COLAMD`, the former
-  hidden in phase A when it runs);
+  (about 3.6 and 0.8 ms on 3-D Poisson of side 20 with `COLAMD` when phase A
+  was introduced, the former hidden in phase A when it runs; the final build
+  reports `assembly_seconds` of about 7 ms with one thread and 3 ms with
+  eight: medians of 21 factorizations of 7.3 and 3.0 ms here and 7.07 and
+  2.89 ms in an independent review, with 2.9-4.0 ms recorded at eight threads
+  by the final gate runs);
 - the `avx2-fma` kernel does not fuse the LU flush (`running` order): the
   scalar U-entry walks of sparse pivot rows (pivot-tail materialization and
   dense-row updates outside panels) apply the same terms outside the kernel
@@ -1014,4 +1071,13 @@ when their backward residual is small.
 
 Default promotion remains contingent on repeated release-build results on both
 Windows and Linux, as described in the benchmark notes. The native backend
-remains opt-in.
+remains opt-in. At the end of the performance roadmap (`105fe2c`, 2026-10-09;
+Windows x64 release build on an i5-13600K with `avx2-fma`), the
+`MMD_AT_PLUS_A` gate with `--extended --dense-lu` passed three consecutive
+runs, and the `COLAMD` runs (the default `permc_spec`) failed only on the
+row-permuted band (above).
+Linux x64 release builds have not been measured since these changes (CI runs
+the tests and the quick benchmark without `--gate`), so `NATIVE_DEFAULT` in
+`src/spsolve/sparse_lu.py` stays `False`. The next targets are the
+left-looking CSC costs above (factor array sizing, search order, and engine
+selection for `NATURAL`), then a Linux gate run.

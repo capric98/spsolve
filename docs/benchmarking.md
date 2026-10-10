@@ -122,10 +122,15 @@ On a Windows x64 release build (i5-13600K, five batched samples,
 `--extended --dense-lu`, `MMD_AT_PLUS_A`), the default `avx2-fma` kernel
 reduced one-thread medians against forced `sse2` in the same build by 14-24%
 for irregular, pivot-heavy, 3-D Poisson, dense LU (connected, pivoted, and
-blocked) and dense SPD cases; eight-thread medians moved within about ±4%,
-because their remaining time is serial pivoting, pivot-tail materialization,
-and setup rather than tile updates. Cases without blocked dense work were
-unchanged.
+blocked) and dense SPD cases when it was introduced; eight-thread medians
+moved within about ±4%, because their remaining time was serial pivoting,
+pivot-tail materialization, and setup rather than tile updates. Cases without
+blocked dense work were unchanged. After the later panel, setup, and LDL^T
+steps more of the time is kernel work: in the final roadmap build the same
+comparison (one forced `sse2` run against the median of three `avx2-fma`
+runs) gave one-thread medians 23-37% lower and eight-thread medians 6-16%
+lower with `avx2-fma` on those cases, and within 2% on the others (see
+"Baseline kernel" under "Current status").
 
 ## Poisson bottleneck and resolution
 
@@ -143,39 +148,246 @@ Adding more worker threads could not remove those serial setup and dependency
 costs. The accepted fix was therefore adaptive: use sparse simplicial LDL.T
 for exactly symmetric positive-definite matrices, left-looking CSC LU for
 narrow nonsymmetric fronts, and reserve threaded row updates for genuinely
-wide fronts. The current 2-D Poisson factor has about 7% more stored entries
-than SuperLU, but its approximately 0.0051-second factorization time is now
-comparable to the measured 0.0077-second SuperLU time.
+wide fronts. The 2-D Poisson factor has about 7% more stored entries than
+SuperLU, and in the final roadmap gate runs it factored in 4.6 ms against
+SuperLU's 7.4 ms (`MMD_AT_PLUS_A`, eight threads).
 
 ## Current status
 
-The tables below were measured before the `avx2-fma` kernel existed, on the
-`sse2` kernel or its predecessor; runs on an AVX2 machine now default to
-`avx2-fma` and are faster on dense-update-heavy cases (see "Dense kernel
-selection" above). Force `SPSOLVE_FORCE_KERNEL=sse2` to compare with them.
+### State after the roadmap
 
-Before the dense LU panel change, the strict gate passed more than three
-consecutive times on checked Windows
-x64 release builds with Python 3.14. The final run produced:
+Measured on 2026-10-09 at `105fe2c`, the last commit of the performance
+roadmap whose Step 0 baseline is `4fce891`: Windows 10 x64 (build 19044),
+Intel Core i5-13600K (6 performance and 8 efficiency cores), MSVC 19.51
+release build from `python -m pip install .`, Python 3.14.8, NumPy 2.3.5,
+SciPy 1.16.3 SuperLU with BLAS pinned to one thread, and the default
+`avx2-fma` kernel. The machine was otherwise idle (under one core of
+background load before and after every run). Each command ran three
+consecutive times, one run at a time:
 
-| case | native 1 thread | native 8 threads | SuperLU | speedup | native/SuperLU | engine |
+```bash
+python benchmarks/factorization.py --threads 8 --repeats 5 --gate --extended --dense-lu
+python benchmarks/factorization.py --threads 8 --repeats 5 --gate --extended --dense-lu --permc-spec COLAMD
+```
+
+All three `MMD_AT_PLUS_A` runs passed every case. All three `COLAMD` runs
+failed one case only, the row-permuted band (`left-looking-csc`): eight
+threads took 1.14-1.17 times SuperLU's time, while its one-thread ratio
+(1.14-1.15) is within the 1.5 limit; see "Row-permuted band" below. In all six
+runs every relative backward residual was at most 5.7e-16, and every case
+produced identical one- and eight-thread permutations. The tables give the
+medians of the three runs, times in milliseconds; each ratio is the median
+of the three per-run ratios (so it can differ in the last digit from the
+quotient of the median times), with the range of the three runs in
+parentheses when the rounded values differ, and bold marks a failed
+criterion.
+
+`MMD_AT_PLUS_A`:
+
+| case | native 1 thread | native 8 threads | SuperLU | N/S | N1/S | engine |
 |---|---:|---:|---:|---:|---:|---|
-| Poisson 2-D, n=8,100 | 0.0050 s | 0.0051 s | 0.0077 s | 0.99x | 0.66x | symmetric LDL.T CSC |
-| irregular, n=2,500 | 0.4200 s | 0.1037 s | 0.3118 s | 4.05x | 0.33x | row hybrid |
-| pivot-heavy, n=2,000 | 1.1724 s | 0.2406 s | 0.3956 s | 4.87x | 0.61x | row hybrid |
+| 2-D Poisson, n=8,100 | 4.58 | 4.59 | 7.43 | 0.61 (0.61-0.62) | 0.62 (0.60-0.63) | simplicial LDL^T |
+| irregular, n=2,500 | 73.0 | 41.0 | 189 | 0.22 | 0.39 (0.38-0.39) | row hybrid |
+| pivot-heavy, n=2,000 | 103 | 65.2 | 244 | 0.27 (0.26-0.27) | 0.42 | row hybrid |
+| 3-D Poisson, n=8,000 | 23.7 | 15.4 | 192 | 0.08 | 0.12 | supernodal LDL^T |
+| nonsymmetric band, n=8,000 | 2.79 | 2.79 | 3.59 | 0.77 (0.77-0.78) | 0.78 (0.77-0.78) | left-looking CSC |
+| `sparse-dense-border`, n=20,600 | 203 | 172 | 296 | 0.58 (0.56-0.58) | 0.68 (0.68-0.69) | row hybrid |
+| dense LU, 600 | 9.96 | 7.67 | 10.2 | 0.76 (0.72-0.78) | 0.97 (0.96-0.99) | row hybrid |
+| row-pivoted dense LU, 600 | 10.3 | 7.47 | 10.4 | 0.71 (0.70-0.73) | 0.99 (0.97-1.00) | row hybrid |
+| four dense LU blocks of 600 | 39.3 | 28.4 | 40.2 | 0.70 (0.70-0.71) | 0.98 (0.97-0.99) | row hybrid |
+| five dense LU blocks of 600 | 48.8 | 35.4 | 51.5 | 0.69 (0.68-0.71) | 0.95 (0.94-0.98) | row hybrid |
+| eight dense LU blocks of 600 | 81.1 | 60.4 | 79.9 | 0.76 (0.74-0.78) | 1.02 (1.01-1.02) | row hybrid |
+| four dense SPD blocks of 600 | 28.5 | 19.5 | 40.5 | 0.49 (0.47-0.50) | 0.70 (0.70-0.73) | supernodal LDL^T |
 
-An extended five-repeat run also passed for a 3-D Poisson matrix (0.34x
-SuperLU time) and a narrow nonsymmetric banded matrix (0.75x SuperLU time).
-These timings are illustrative, not cross-platform guarantees; CPU scheduling,
-compiler, allocator, and SciPy build all matter.
+`COLAMD`:
 
-These results use `MMD_AT_PLUS_A`. An explicitly requested `COLAMD` permutation
-also passed the three representative cases. The blocked SPD kernel improves
-larger fronts. It trailed SuperLU on the `COLAMD` 3-D Poisson case and on
-dense SPD blocks until the contributor and panel steps described under
-"Blocked SPD comparison" below; since then, the only case that still fails
-in the full `--extended --dense-lu` runs is the `COLAMD` row-permuted band,
-a general LU case (1.14-1.18x).
+| case | native 1 thread | native 8 threads | SuperLU | N/S | N1/S | engine |
+|---|---:|---:|---:|---:|---:|---|
+| 2-D Poisson, n=8,100 | 8.10 | 8.11 | 10.6 | 0.77 (0.76-0.77) | 0.77 | simplicial LDL^T |
+| irregular, n=2,500 | 129 | 70.8 | 274 | 0.26 (0.25-0.27) | 0.47 | row hybrid |
+| pivot-heavy, n=2,000 | 84.3 | 53.6 | 202 | 0.27 | 0.42 | row hybrid |
+| 3-D Poisson, n=8,000 | 65.4 | 34.6 | 139 | 0.25 (0.25-0.26) | 0.47 | supernodal LDL^T |
+| nonsymmetric band, n=8,000 | 4.15 | 4.14 | 4.65 | 0.89 (0.89-0.90) | 0.89 (0.89-0.90) | left-looking CSC |
+| `sparse-dense-border`, n=20,600 | 731 | 371 | 565 | 0.66 (0.65-0.66) | 1.29 (1.28-1.30) | row hybrid |
+| row-permuted band, n=20,000 | 19.8 | 20.0 | 17.2 | **1.16 (1.14-1.17)** | 1.15 (1.14-1.15) | left-looking CSC |
+| dense LU, 600 | 10.4 | 8.29 | 9.83 | 0.82 (0.80-0.85) | 1.05 (1.05-1.06) | row hybrid |
+| row-pivoted dense LU, 600 | 10.9 | 8.22 | 10.3 | 0.79 (0.78-0.80) | 1.06 (1.03-1.08) | row hybrid |
+| four dense LU blocks of 600 | 42.0 | 31.9 | 40.0 | 0.80 (0.77-0.85) | 1.05 (1.05-1.07) | row hybrid |
+| five dense LU blocks of 600 | 51.9 | 39.8 | 49.8 | 0.80 (0.77-0.81) | 1.04 (1.04-1.07) | row hybrid |
+| eight dense LU blocks of 600 | 87.9 | 67.6 | 83.9 | 0.81 (0.80-0.82) | 1.03 (1.03-1.06) | row hybrid |
+| four dense SPD blocks of 600 | 30.9 | 22.8 | 39.5 | 0.58 (0.55-0.60) | 0.79 (0.78-0.79) | supernodal LDL^T |
+
+These timings are illustrative, not cross-platform guarantees; CPU
+scheduling, compiler, allocator, and SciPy build all matter. The JSON of each
+run is `build/review/final_{mmd,colamd}_{1,2,3}.json` (not tracked).
+
+The promotion ordering, `MMD_AT_PLUS_A`, thus passed three consecutive runs
+on this Windows build; `COLAMD` did not, because of the row-permuted band
+(`COLAMD` is the default `permc_spec` of `splu` and `spsolve`). No Linux x64
+release-build gate run has been made since these changes (CI runs
+the test suite and the `--quick` smoke benchmark without `--gate`), so the
+promotion rule below is not met and `NATIVE_DEFAULT` stays `False`.
+
+### Effect of the roadmap
+
+The Step 0 baseline (`build/review/baseline_{mmd,colamd}.json`: one run of
+the same commands at `4fce891` on the same machine, before the dense-kernel
+layer) failed six `MMD_AT_PLUS_A` cases (every dense LU and dense SPD family)
+and nine `COLAMD` cases (also 3-D Poisson, `sparse-dense-border` on its
+one-thread ratio, and the row-permuted band). Times in milliseconds, Step 0
+against the medians above; the baseline is a single run, so differences of a
+few percent are noise:
+
+| case | ordering | 1 thread | 8 threads | N/S | N1/S |
+|---|---|---:|---:|---:|---:|
+| 2-D Poisson | MMD_AT_PLUS_A | 4.77 → 4.58 | 4.84 → 4.59 | 0.64 → 0.61 | 0.64 → 0.62 |
+| irregular | MMD_AT_PLUS_A | 146 → 73.0 | 74.6 → 41.0 | 0.39 → 0.22 | 0.77 → 0.39 |
+| pivot-heavy | MMD_AT_PLUS_A | 218 → 103 | 115 → 65.2 | 0.47 → 0.27 | 0.89 → 0.42 |
+| 3-D Poisson | MMD_AT_PLUS_A | 56.8 → 23.7 | 44.9 → 15.4 | 0.23 → 0.08 | 0.29 → 0.12 |
+| nonsymmetric band | MMD_AT_PLUS_A | 2.81 → 2.79 | 2.81 → 2.79 | 0.78 → 0.77 | 0.78 → 0.78 |
+| `sparse-dense-border` | MMD_AT_PLUS_A | 236 → 203 | 194 → 172 | 0.65 → 0.58 | 0.80 → 0.68 |
+| dense LU | MMD_AT_PLUS_A | 24.4 → 9.96 | 18.3 → 7.67 | 1.73 → 0.76 | 2.31 → 0.97 |
+| row-pivoted dense LU | MMD_AT_PLUS_A | 24.8 → 10.3 | 19.2 → 7.47 | 1.81 → 0.71 | 2.34 → 0.99 |
+| four dense LU blocks | MMD_AT_PLUS_A | 125 → 39.3 | 95.1 → 28.4 | 2.38 → 0.70 | 3.13 → 0.98 |
+| five dense LU blocks | MMD_AT_PLUS_A | 305 → 48.8 | 137 → 35.4 | 2.69 → 0.69 | 5.99 → 0.95 |
+| eight dense LU blocks | MMD_AT_PLUS_A | 631 → 81.1 | 259 → 60.4 | 3.22 → 0.76 | 7.85 → 1.02 |
+| four dense SPD blocks | MMD_AT_PLUS_A | 66.1 → 28.5 | 54.2 → 19.5 | 1.35 → 0.49 | 1.65 → 0.70 |
+| 2-D Poisson | COLAMD | 8.53 → 8.10 | 8.31 → 8.11 | 0.79 → 0.77 | 0.81 → 0.77 |
+| irregular | COLAMD | 246 → 129 | 135 → 70.8 | 0.49 → 0.26 | 0.90 → 0.47 |
+| pivot-heavy | COLAMD | 178 → 84.3 | 103 → 53.6 | 0.51 → 0.27 | 0.88 → 0.42 |
+| 3-D Poisson | COLAMD | 177 → 65.4 | 148 → 34.6 | 1.08 → 0.25 | 1.29 → 0.47 |
+| nonsymmetric band | COLAMD | 4.12 → 4.15 | 4.11 → 4.14 | 0.89 → 0.89 | 0.90 → 0.89 |
+| `sparse-dense-border` | COLAMD | 1123 → 731 | 530 → 371 | 0.94 → 0.66 | 2.00 → 1.29 |
+| row-permuted band | COLAMD | 20.0 → 19.8 | 19.9 → 20.0 | 1.16 → 1.16 | 1.17 → 1.15 |
+| dense LU | COLAMD | 24.3 → 10.4 | 17.7 → 8.29 | 1.79 → 0.82 | 2.46 → 1.05 |
+| row-pivoted dense LU | COLAMD | 25.2 → 10.9 | 20.0 → 8.22 | 1.97 → 0.79 | 2.49 → 1.06 |
+| four dense LU blocks | COLAMD | 123 → 42.0 | 95.5 → 31.9 | 2.38 → 0.80 | 3.06 → 1.05 |
+| five dense LU blocks | COLAMD | 308 → 51.9 | 132 → 39.8 | 2.66 → 0.80 | 6.20 → 1.04 |
+| eight dense LU blocks | COLAMD | 635 → 87.9 | 275 → 67.6 | 3.38 → 0.81 | 7.79 → 1.03 |
+| four dense SPD blocks | COLAMD | 68.1 → 30.9 | 57.7 → 22.8 | 1.45 → 0.58 | 1.71 → 0.79 |
+
+The dense general LU families ran 2.3-7.8 times faster with one thread and
+2.1-4.3 times with eight, the dense SPD blocks 2.2-2.3 and 2.5-2.8 times,
+3-D Poisson 2.4 and 2.9 times (`MMD_AT_PLUS_A`) and 2.7 and 4.3 times
+(`COLAMD`), irregular and pivot-heavy 1.9-2.1 and 1.8-1.9 times, and
+`sparse-dense-border` 1.16 and 1.13 times (`MMD_AT_PLUS_A`) and 1.54 and 1.43
+times (`COLAMD`). 2-D Poisson moved by 2-5% and the two bands by at most 1.4%:
+the roadmap did not target the simplicial LDL^T and left-looking CSC engines
+that factor them. Part of the dense gains is the `avx2-fma` kernel, which the
+baseline did not have (see the next section).
+
+### Baseline kernel (`sse2`)
+
+One run of each ordering with `SPSOLVE_FORCE_KERNEL=sse2` in the same build
+(otherwise as above) measures the baseline x86-64 path that CPUs without AVX2
+and FMA take (N/S at eight threads):
+
+| case | `MMD_AT_PLUS_A` N/S | `MMD_AT_PLUS_A` N1/S | `COLAMD` N/S | `COLAMD` N1/S |
+|---|---:|---:|---:|---:|
+| 2-D Poisson | 0.60 | 0.60 | 0.78 | 0.77 |
+| irregular | 0.23 | 0.53 | 0.29 | 0.68 |
+| pivot-heavy | 0.30 | 0.67 | 0.30 | 0.64 |
+| 3-D Poisson | 0.09 | 0.17 | 0.29 | 0.66 |
+| nonsymmetric band | 0.78 | 0.78 | 0.89 | 0.89 |
+| `sparse-dense-border` | 0.59 | 0.70 | 0.70 | **1.54** |
+| row-permuted band | n/a | n/a | **1.16** | 1.14 |
+| dense LU | 0.83 | 1.37 | 0.93 | 1.48 |
+| row-pivoted dense LU | 0.81 | 1.37 | 0.90 | 1.44 |
+| four dense LU blocks | 0.85 | 1.43 | 0.94 | **1.53** |
+| five dense LU blocks | 0.80 | 1.42 | 0.88 | 1.48 |
+| eight dense LU blocks | 0.83 | 1.45 | 0.89 | **1.52** |
+| four dense SPD blocks | 0.54 | 0.90 | 0.61 | 0.98 |
+
+The `MMD_AT_PLUS_A` run passed. The `COLAMD` run failed the one-thread
+criterion on `sparse-dense-border` and the four- and eight-block dense LU
+cases, with the connected and five-block cases at 1.48, besides the
+row-permuted band. Every eight-thread ratio except the row-permuted band's
+stayed at or below 0.94. On a CPU without AVX2 and FMA the one-thread
+criterion is therefore marginal for dense general LU with `COLAMD`; these are
+single runs, and a runner's own CPU decides which kernel it uses.
+
+### Row-permuted band (`COLAMD`)
+
+The case is the nonsymmetric band of `banded-nonsym` at 20,000 rows (99,981
+entries) with randomly permuted rows. Before the roadmap, replacing an
+unrelated AMD analysis (which reported a front of 11,309) with the bounded
+COLAMD probe cut native eight-thread time from 84.6 to 21.8 ms; the probe
+keeps the left-looking CSC engine (maximum column reach 31) with 359,878
+factor entries, the same as SuperLU. The roadmap did not optimize this
+engine's numeric loop (`02ae72b` added a finiteness test of every pivot
+candidate, and `1cc9dd5` reduced the probe's restart snapshot to the fields
+the probe writes and sped up the validation and equilibration shared by all
+engines, both with bitwise identical factors), and the case still fails the
+eight-thread criterion. In the gate runs native spends 8.0-8.2 ms in COLAMD
+(`ordering_seconds`), 10.8-11.3 ms in the left-looking factorization
+(`numeric_seconds`, all of it the successful probe, including the copy of
+its restart snapshot: 20,000 columns, 1,259,452 scalar updates), and under
+1 ms outside both timers (validation, equilibration, the symmetry test,
+releasing the snapshot, and the Python input copy and wrapper: about 0.45
+and 0.23 ms with one thread in a separate fresh-process measurement); it
+reports `symbolic_seconds` and `assembly_seconds` of zero and no parallel
+steps, since the engine is serial. SuperLU takes 17.2 ms; factoring
+SuperLU's own column-permuted matrix with `NATURAL` takes 9.5 ms, so its
+COLAMD ordering takes about 7.7 ms (the `NATURAL` run still computes the
+column elimination tree and postorder). The ordering costs are therefore
+close (on a copy whose rows are relabeled by their first appearance in the
+column order, native COLAMD takes 4.8 ms instead of 8.0-8.3 ms in the same
+runs, and SuperLU's ordering 4.6 instead of 7.7 ms), and the gap is the
+left-looking numeric phase: about 11 ms against SuperLU's 9.5 ms for its
+whole factorization.
+
+The case is sensitive to the allocator state of the process. Run alone in a
+fresh process with eight threads it takes 21.6-22.1 ms (1.25-1.28 times the
+SuperLU time of the same runs), with about 5,100 page faults per one-thread
+factorization; after the larger `sparse-dense-border` factorizations that
+precede it in the benchmark it takes 19.8-20.0 ms (the medians above) and
+about 3,000 page faults. The `L` and `U` arrays start with room for `3.3 * n`
+entries when no AMD estimate exists (as with `COLAMD`) and are reallocated
+three times each on the way to their 159,953 and 199,925 entries, touching
+fresh pages at every step. SuperLU's time does not depend on the process
+state.
+
+Scratch prototypes (not in the repository and not part of `105fe2c`) located
+the remaining cost; their times are with eight threads, and their ratios are
+against the SuperLU time of the same runs (17.2-17.5 ms). Reserving each
+factor array for `2.3 * nnz(A) + n` entries (about 250,000 here; bitwise
+identical factors) took the case to 18.9-19.4 ms (1.09-1.11 times SuperLU)
+in a fresh process and 18.2 ms (1.05 times) in the benchmark order.
+Starting each column's depth-first search from its entries in increasing
+pivot position instead of their stored order (factors changed only in the
+last bits on the benchmark bands) took it to 19.5 ms (1.12 times) in a fresh
+process on its own, and together with the reserve to 16.3 ms (0.94 times) in
+a fresh process and 15.7 ms (0.90 times) in the benchmark order. In the fresh
+process the numeric phase fell from 12.5 ms to 9.8-10.1 ms with the reserve,
+to 10.5 ms with the search order, and to 7.2 ms with both. Relabeling the
+rows for memory locality without changing the traversal order gave nothing,
+so the traversal order, not the locality of the row labels, costs the time.
+
+Other orderings: with `MMD_AT_PLUS_A` the row permutation destroys the
+structure of `A + A.T`; native uses the row-hybrid engine (175 ms with one
+thread, 147 ms with eight, 1.10 million factor entries) while SuperLU takes
+5.48 seconds (4.77 million entries). With `NATURAL` native never uses the
+left-looking engine, and the row-hybrid engine takes 19-22 ms against
+SuperLU's 8.9-9.1 ms (2.1-2.5 times in three runs here, 2.3-2.6 times in an
+independent review; the unpermuted 8,000-row band also takes 2.4 times
+SuperLU's time with `NATURAL`). A scratch prototype that also runs the
+`COLAMD` probe for `NATURAL`, with both changes above, took 7.1-8.2 ms on the
+row-permuted band (0.81-0.89 times the SuperLU time of the same runs,
+8.7-9.2 ms) and 2.4 ms on the unpermuted band (0.86-0.87 times the SuperLU
+time of the same run). See the limitations in
+[the design notes](native-lu.md#current-limitations-and-next-optimization-target).
+
+## History
+
+The sections below record the per-step measurements of earlier changes, each
+against the build before it, so their absolute times predate later steps.
+
+Before the dense LU panel change, the strict gate, which then also required a
+2.0x thread speedup on eligible cases, passed more than three consecutive
+times on Windows x64 release builds with Python 3.14 for 2-D Poisson (0.66x
+SuperLU time with eight threads), irregular (0.33x), and pivot-heavy
+(0.61x), and an extended run for 3-D Poisson (0.34x) and the nonsymmetric
+band (0.75x), all with `MMD_AT_PLUS_A`.
 
 ### Dense LU panel comparison
 
@@ -233,7 +445,7 @@ on the same machine with the `avx2-fma` kernel, with bitwise identical
 factors: connected dense LU of size 600 from about 17.7 to 14.4 ms at eight
 threads (numeric phase 10.0 to 6.3 ms), irregular and pivot-heavy by about
 20% at one thread, and the four-, five-, and eight-block dense cases by about
-20%. The tables above remain historical.
+20%. The comparison table above remains historical.
 
 The panel block that followed (column-major `members x 32` block factored
 in place, gappy dense tails split into column segments, and the flush's L
@@ -491,16 +703,7 @@ on every blocked case (3-D Poisson with `COLAMD` from 66.1 to 53.3 MB at
 eight threads, dense SPD blocks from 29.3 to 24.3 MB), because the row
 incidence is gone and the CSC arrays are allocated later.
 
-The row-permuted 20,000-row COLAMD band exposes a separate classifier problem.
-Using an unrelated AMD analysis previously reported a front of 11,309 despite
-only 359,878 factor entries and narrow actual fronts. Replacing that analysis
-with bounded numeric probing reduced native eight-thread factorization from
-0.0846 seconds to 0.0218 seconds in a three-repeat Windows release comparison.
-The probe observed a maximum column reach of 31 and retained the CSC engine;
-factor fill and residual were unchanged. SuperLU took 0.0167 seconds, so the
-new extended case still fails the unchanged 1.05x gate at about 1.30x. The
-misclassification and extra ordering pass are fixed; the remaining CSC cost
-still needs optimization. Native remains opt-in.
+## Promotion rule
 
 Do not switch `NATIVE_DEFAULT` in `src/spsolve/sparse_lu.py` until the full gate
 passes in at least three consecutive release-build runs on both Windows and
