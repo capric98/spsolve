@@ -12,15 +12,13 @@ jobs:
       matrix:
         include:
           # Default kernel selection (avx2-fma where the runner supports it).
-          - { os: ubuntu-latest, python: "3.10", kernel: auto }
-          - { os: ubuntu-latest, python: "3.13", kernel: auto }
-          - { os: windows-latest, python: "3.10", kernel: auto }
-          - { os: windows-latest, python: "3.13", kernel: auto }
+          - { os: ubuntu-latest, python: "3.14", kernel: auto }
+          - { os: windows-latest, python: "3.14", kernel: auto }
           # The baseline kernel on the same runners.
-          - { os: ubuntu-latest, python: "3.13", kernel: sse2 }
-          - { os: windows-latest, python: "3.13", kernel: sse2 }
+          - { os: ubuntu-latest, python: "3.14", kernel: sse2 }
+          - { os: windows-latest, python: "3.14", kernel: sse2 }
           # A build without the AVX2 translation unit.
-          - { os: ubuntu-latest, python: "3.13", kernel: auto, build_args: "-Ccmake.define.SP_ENABLE_AVX2=OFF" }
+          - { os: ubuntu-latest, python: "3.14", kernel: auto, build_args: "-Ccmake.define.SP_ENABLE_AVX2=OFF" }
     runs-on: ${{ matrix.os }}
     env:
       SPSOLVE_FORCE_KERNEL: ${{ matrix.kernel }}

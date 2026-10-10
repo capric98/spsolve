@@ -14,6 +14,8 @@ native fast path.
 
 ## Install
 
+Python 3.14 or newer is required.
+
 ```bash
 pip install -U git+https://github.com/capric98/spsolve
 ```
@@ -96,6 +98,9 @@ See [the implementation notes](docs/native-lu.md), [API notes](docs/api.md),
 and [benchmark gate](docs/benchmarking.md) for details.
 
 ## Development
+
+CI runs on Python 3.14 on Windows and Linux, covering automatic dense-kernel
+selection, forced SSE2, and a Linux build with AVX2 kernels disabled.
 
 ```bash
 python -m unittest discover -v -s tests -t .

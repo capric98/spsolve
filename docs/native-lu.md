@@ -2,6 +2,9 @@
 
 ## Scope
 
+The package requires Python 3.14 or newer; CI uses Python 3.14 on Windows
+and Linux.
+
 The native backend factors square `float64` SciPy sparse arrays without an
 external factorization or BLAS runtime. Its numerical factorization kernels
 are implemented in this project. A small BSD-licensed subset of SuiteSparse

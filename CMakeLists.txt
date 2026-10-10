@@ -17,7 +17,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     Debug Release MinSizeRel RelWithDebInfo)
 endif()
 
-find_package(Python 3.10 COMPONENTS Interpreter ${DEV_MODULE} REQUIRED)
+find_package(Python 3.14 COMPONENTS Interpreter ${DEV_MODULE} REQUIRED)
 execute_process(
   COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
   OUTPUT_STRIP_TRAILING_WHITESPACE
