@@ -1483,8 +1483,13 @@ when their backward residual is small.
   the `COLAMD` gate run failed the 1.5 one-thread criterion on
   `sparse-dense-border` (1.54) and the four- and eight-block dense LU cases
   (1.53 and 1.52), and connected and five-block dense LU sat at 1.48, while
-  the `MMD_AT_PLUS_A` run passed with dense LU at 1.37-1.45 (single runs;
-  see "Baseline kernel" in `docs/benchmarking.md`);
+  the `MMD_AT_PLUS_A` run passed with dense LU at 1.37-1.45 (single runs
+  under Python 3.14; see "Baseline kernel" in `docs/benchmarking.md`). A
+  `COLAMD` re-run at `4b9b8ef` under Python 3.15 and SciPy 1.18.1 failed it
+  on five cases (`sparse-dense-border` 1.59, row-pivoted dense LU 1.56, the
+  four-, five- and eight-block cases 1.54, 1.53 and 1.52; connected dense LU
+  1.47), every eight-thread ratio staying at or below 0.92 (see "Re-run at
+  `4b9b8ef`" there);
 - general LU retains serial per-pivot panel work: the block column scan, the
   right-looking block update (one `axpy_sub` per later panel column; a
   recursively blocked panel would touch the block less often), and
@@ -1574,7 +1579,9 @@ row-permuted band. With the left-looking search order, search formulation
 and staged storage reserve of "Left-looking CSC LU", three consecutive
 `COLAMD` gate runs and three consecutive `MMD_AT_PLUS_A` gate runs passed
 every case on the same machine (see "Current status" in
-`docs/benchmarking.md`).
+`docs/benchmarking.md`). A re-run at `4b9b8ef` (2026-10-10, Python 3.15.0,
+NumPy 2.5.3, SciPy 1.18.1) repeated that: three consecutive passing runs of
+each gate, every ratio within -0.03 to +0.05 of the Python 3.14 runs.
 Linux x64 release builds have not been measured since these changes (CI runs
 the tests and the quick benchmark without `--gate`), so `NATIVE_DEFAULT` in
 `src/spsolve/sparse_lu.py` stays `False`. `NATURAL` now runs the probe (see

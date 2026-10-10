@@ -156,6 +156,84 @@ SuperLU's 7.4 ms (`MMD_AT_PLUS_A`, eight threads).
 
 ## Current status
 
+### Re-run at `4b9b8ef` (Python 3.15)
+
+Measured on 2026-10-10 at `4b9b8ef` (every change through the `NATURAL`
+probe below) on the machine of "State after the roadmap": Windows 10 x64
+(build 19044), Intel Core i5-13600K, MSVC 19.51 release build from
+`python -m pip install .` in the repository's virtual environment, with
+Python 3.15.0, NumPy 2.5.3 and SciPy 1.18.1 (the newest releases with
+Python 3.15 wheels that day; nanobind 3.1.0 and scikit-build-core 1.1.1 as
+build dependencies), SuperLU with BLAS pinned to one thread, and the
+default `avx2-fma` kernel. The machine was otherwise idle (about 0.3 cores
+of background load). One run at a time: three consecutive `COLAMD` gate
+runs, three consecutive `MMD_AT_PLUS_A` gate runs, one `NATURAL` run with
+`--repeats 3`, and one `COLAMD` gate run with `SPSOLVE_FORCE_KERNEL=sse2`
+(`build/review/latest_{colamd,mmd}_{1,2,3}.json`, `latest_natural.json`
+and `latest_sse2_colamd.json`; not tracked):
+
+```bash
+python benchmarks/factorization.py --threads 8 --repeats 5 --gate --extended --dense-lu --permc-spec COLAMD
+python benchmarks/factorization.py --threads 8 --repeats 5 --gate --extended --dense-lu
+```
+
+All six gate runs passed every case, with every relative backward residual
+at most 5.7e-16 and identical one- and eight-thread permutations in every
+case. Medians of the three runs in milliseconds, ratios as in "State after
+the roadmap" (the median of the per-run ratios, with the range when the
+rounded values differ); `COLAMD`, the default `permc_spec`:
+
+| case | native 1 thread | native 8 threads | SuperLU | N/S | N1/S | engine |
+|---|---:|---:|---:|---:|---:|---|
+| 2-D Poisson, n=8,100 | 8.14 | 8.09 | 10.7 | 0.76 (0.75-0.79) | 0.77 (0.75-0.78) | simplicial LDL^T |
+| irregular, n=2,500 | 130 | 69.6 | 264 | 0.26 (0.26-0.28) | 0.50 (0.48-0.50) | row hybrid |
+| pivot-heavy, n=2,000 | 86.7 | 53.7 | 191 | 0.28 (0.27-0.28) | 0.45 (0.44-0.46) | row hybrid |
+| 3-D Poisson, n=8,000 | 65.9 | 35.3 | 140 | 0.25 (0.25-0.26) | 0.47 | supernodal LDL^T |
+| nonsymmetric band, n=8,000 | 3.47 | 3.42 | 4.66 | 0.73 (0.72-0.76) | 0.75 (0.74-0.76) | left-looking CSC |
+| `sparse-dense-border`, n=20,600 | 747 | 378 | 569 | 0.66 (0.66-0.77) | 1.31 (1.29-1.32) | row hybrid |
+| row-permuted band, n=20,000 | 13.4 | 13.3 | 17.5 | 0.76 (0.74-0.77) | 0.76 (0.75-0.78) | left-looking CSC |
+| dense LU, 600 | 10.5 | 8.32 | 10.0 | 0.82 (0.78-0.85) | 1.05 (1.02-1.10) | row hybrid |
+| row-pivoted dense LU, 600 | 10.9 | 8.23 | 10.2 | 0.80 (0.75-0.81) | 1.05 (1.05-1.09) | row hybrid |
+| four dense LU blocks of 600 | 42.3 | 32.4 | 40.7 | 0.80 (0.80-0.82) | 1.07 (1.03-1.07) | row hybrid |
+| five dense LU blocks of 600 | 52.8 | 40.0 | 50.4 | 0.79 (0.78-0.83) | 1.05 (1.03-1.06) | row hybrid |
+| eight dense LU blocks of 600 | 89.0 | 66.3 | 84.5 | 0.79 (0.78-0.80) | 1.05 (1.03-1.08) | row hybrid |
+| four dense SPD blocks of 600 | 31.2 | 23.1 | 39.8 | 0.57 (0.56-0.59) | 0.76 (0.76-0.79) | supernodal LDL^T |
+
+`MMD_AT_PLUS_A`:
+
+| case | native 1 thread | native 8 threads | SuperLU | N/S | N1/S | engine |
+|---|---:|---:|---:|---:|---:|---|
+| 2-D Poisson, n=8,100 | 4.64 | 4.34 | 7.48 | 0.58 (0.57-0.59) | 0.62 (0.62-0.63) | simplicial LDL^T |
+| irregular, n=2,500 | 75.5 | 41.5 | 187 | 0.22 (0.21-0.23) | 0.40 (0.40-0.41) | row hybrid |
+| pivot-heavy, n=2,000 | 106 | 64.3 | 236 | 0.27 (0.27-0.28) | 0.45 (0.44-0.46) | row hybrid |
+| 3-D Poisson, n=8,000 | 23.8 | 14.6 | 200 | 0.07 | 0.12 | supernodal LDL^T |
+| nonsymmetric band, n=8,000 | 2.44 | 2.45 | 3.64 | 0.67 (0.66-0.68) | 0.67 (0.66-0.69) | left-looking CSC |
+| `sparse-dense-border`, n=20,600 | 209 | 167 | 294 | 0.57 (0.56-0.57) | 0.70 (0.69-0.72) | row hybrid |
+| dense LU, 600 | 10.1 | 7.57 | 10.3 | 0.74 (0.71-0.75) | 1.00 (0.98-1.01) | row hybrid |
+| row-pivoted dense LU, 600 | 10.6 | 7.66 | 10.5 | 0.73 (0.69-0.74) | 1.00 (0.99-1.02) | row hybrid |
+| four dense LU blocks of 600 | 40.2 | 30.2 | 41.2 | 0.73 (0.71-0.75) | 1.00 (0.97-1.00) | row hybrid |
+| five dense LU blocks of 600 | 50.1 | 37.0 | 51.2 | 0.73 (0.71-0.75) | 0.99 (0.95-1.00) | row hybrid |
+| eight dense LU blocks of 600 | 84.3 | 58.9 | 83.8 | 0.71 (0.70-0.72) | 1.00 (0.98-1.02) | row hybrid |
+| four dense SPD blocks of 600 | 28.9 | 20.3 | 41.6 | 0.49 (0.48-0.51) | 0.71 (0.69-0.72) | supernodal LDL^T |
+
+Against the Python 3.14 runs of "State after the left-looking search
+change" (SciPy 1.16.3), SuperLU's median times moved by factors of
+0.95-1.04 and native times by 0.96-1.07 per case (one thread 0.99-1.06),
+so every ratio moved by -0.03 to +0.05; the verdicts are unchanged. The one `NATURAL`
+run (not part of the gate) met both criteria in every case: the two bands
+at 0.65 and 0.61 (eight threads) and `sparse-dense-border` at 1.14 with one
+thread, as in "`NATURAL` after the probe change" below.
+
+The forced `sse2` run (single run, otherwise as above) failed the
+one-thread criterion only, on five cases: `sparse-dense-border` 1.59, the
+row-pivoted dense LU 1.56 and the four-, five- and eight-block dense LU
+cases 1.54, 1.53 and 1.52, with connected dense LU at 1.47 and every
+eight-thread ratio at or below 0.92; the Python 3.14 run of "Baseline
+kernel" below had failed three of these (1.52-1.54), with the row-pivoted
+and five-block cases at 1.44 and 1.48. With single runs and run-to-run
+differences of a few percent, the one-thread criterion stays marginal for
+dense general LU with `COLAMD` on CPUs without AVX2 and FMA.
+
 ### `NATURAL` after the probe change
 
 `NATURAL` now runs the bounded left-looking probe, with a pattern check
