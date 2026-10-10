@@ -125,11 +125,11 @@ def leading_blocks(defect=None, count=8, small=40, wide=330):
         block = np.eye(small) + 0.01 * np.ones((small, small))
         if defect == "all" or (defect == "one" and index == 3):
             block[-1, -1] = -1.0
-        blocks.append(block)
+        blocks.append(csc_array(block))
     block = np.eye(wide) + 0.01 * np.ones((wide, wide))
     if defect == "late":
         block[-1, -1] = -1.0
-    blocks.append(block)
+    blocks.append(csc_array(block))
     return csc_array(block_diag(blocks, format="csc"))
 
 
@@ -144,7 +144,7 @@ def block_forest(first_pivot=None, size=321, count=4):
         if first_pivot is not None and index == 2:
             block[0, 1:] = block[1:, 0] = 1.0
             block[0, 0] = first_pivot
-        blocks.append(block)
+        blocks.append(csc_array(block))
     return csc_array(block_diag(blocks, format="csc"))
 
 
@@ -254,7 +254,7 @@ class SupernodalLDLTTests(unittest.TestCase):
         first = np.eye(320) + 0.01 * np.ones((320, 320))
         last = np.eye(65) + 0.01 * np.ones((65, 65))
         last[-1, -1] = -1.0
-        matrix = csc_array(block_diag((first, last), format="csc"))
+        matrix = csc_array(block_diag((csc_array(first), csc_array(last)), format="csc"))
         for order in ("NATURAL", "COLAMD", "MMD_AT_PLUS_A"):
             with self.subTest(order=order):
                 serial = splu(matrix, backend="native", permc_spec=order, num_threads=1)

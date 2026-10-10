@@ -236,7 +236,9 @@ class SparseLUTests(unittest.TestCase):
                 rng = np.random.default_rng(555)
                 dense = rng.uniform(-0.5, 0.5, size=(dense_size, dense_size))
                 dense += 300.0 * np.eye(dense_size)
-                matrix = csc_array(block_diag((np.eye(40), dense), format="csc"))
+                # block_diag stores every entry of the dense np.eye(40), zeros
+                # included; the sparse second block makes it return an array.
+                matrix = csc_array(block_diag((np.eye(40), csc_array(dense)), format="csc"))
                 matrix = csc_array(matrix[rng.permutation(matrix.shape[0]), :])
                 expected = rng.normal(size=(matrix.shape[0], 3))
                 factors = []
@@ -376,7 +378,7 @@ class SparseLUTests(unittest.TestCase):
         rng = np.random.default_rng(0)
         block = hadamard(8).astype(np.float64)
         matrix = csc_array(block_diag(
-            [block * rng.choice([-1.0, 1.0], size=(8, 1)) for _ in range(16)],
+            [csc_array(block * rng.choice([-1.0, 1.0], size=(8, 1))) for _ in range(16)],
             format="csc",
         ))
         matrix = csc_array(matrix[rng.permutation(matrix.shape[0]), :])
@@ -432,7 +434,9 @@ class SparseLUTests(unittest.TestCase):
                 rng = np.random.default_rng(555)
                 dense = rng.uniform(-0.5, 0.5, size=(dense_size, dense_size))
                 dense += 300.0 * np.eye(dense_size)
-                matrix = csc_array(block_diag((np.eye(40), dense), format="csc"))
+                # block_diag stores every entry of the dense np.eye(40), zeros
+                # included; the sparse second block makes it return an array.
+                matrix = csc_array(block_diag((np.eye(40), csc_array(dense)), format="csc"))
                 n = matrix.shape[0]
                 matrix = csc_array(matrix[rng.permutation(n), :])
                 factor = splu(matrix, backend="native", permc_spec="COLAMD")
