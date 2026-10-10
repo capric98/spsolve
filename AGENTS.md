@@ -106,6 +106,30 @@ python benchmarks/factorization.py --threads 8 --repeats 5 --gate   # promotion 
   (their workspaces are sized on the calling thread); the two CSC allocation
   items swallow an allocation failure, which assembly repeats on the calling
   thread. A failed attempt also reports `spd_subtrees == 0`.
+- **`NATURAL` engine selection.** `NATURAL` runs the bounded left-looking
+  probe with the absolute bounds it shares with `COLAMD` (reach above 192,
+  `64 * nnz(A)` updates, `20 * nnz(A)` factor entries) plus its own rules in
+  `src/sparse_lu.cpp`: no probe when an input column has more than 192
+  entries or a row has at least 64 stored entries filling at least a quarter
+  of its span (`natural_probe_skipped`); a column `k` with `m > 64`
+  multipliers, or whose updates so far `c` exceed the shared per-column limit
+  of 8,192 (checked at each source from the one that passes it), restarts
+  only if `w * min(n - k - 1, 192) > 4 * D`, with `w = m^2` or `c` and `D`
+  the updates done, the current source's included (`natural_restart_pays`);
+  and once `k + 1 >= max(32, n / 16)` it restarts when
+  `D * n > 64 * nnz(A) * (k + 1)`. `COLAMD` and `MMD_AT_PLUS_A` use
+  `factorize_left_looking<false>`, which has none of these rules, and their
+  factors stay bitwise those of earlier builds. The `NATURAL` probe tests in
+  `tests/test_sparse_lu.py` (chiefly
+  `test_natural_probe_rules_hold_at_their_thresholds`) pin both sides of each
+  threshold: changing the span factor, the count 64, the multiplier limit,
+  the factor 4, the remaining-column count, the horizon 192, either side of
+  the per-column rule, or the projection start `n / 16` fails them. Not
+  pinned: the projection floor 32, and the shared constants as the
+  projection uses them. The late-restart cost is documented, not tested:
+  1.2-1.9 times the earlier time on the worst measured inputs (see "Engine
+  selection for `NATURAL`" in `docs/native-lu.md`). Change these rules only
+  together with the tests and the docs.
 - **Public contracts.** `Pr @ Dr @ A @ Dc @ Pc == L @ U`; lazy CSC `L`/`U`
   via `export_l_csr`/`export_u_csr`; `solve_inplace`; every existing `stats`
   key keeps its meaning (new keys may be added); the symmetric LDL^T engines
@@ -165,6 +189,12 @@ python benchmarks/factorization.py --threads 8 --repeats 5 --gate   # promotion 
    section of `docs/native-lu.md` when a limitation appears or disappears.
 6. Prefer an independent review of the diff (different person or agent) that
    re-runs tests and benchmarks before committing.
+7. Any edit to `src/sparse_lu.cpp` can move row-engine timings by a few
+   percent through code placement alone (Step 6b moved `MMD_AT_PLUS_A` and
+   `NATURAL` `sparse-dense-border` by 3-8% with bitwise identical factors).
+   Judge such shifts with interleaved fresh-process A/B runs for every
+   ordering, and check MSVC `/FAs` listings and the linker map before
+   attributing them to the change.
 
 ## Known gaps
 
