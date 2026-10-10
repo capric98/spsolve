@@ -54,12 +54,12 @@ systems.
      common LU contract as `L` and `D @ L.T`; internally it retains only the
      strict lower triangle and diagonal, constructing public `L` and `U`
      lazily. Narrow fronts use the simplicial CSC kernel. Adjacent elimination
-     tree parents and column counts give upper bounds on fundamental-node
-     width and work. An exact pattern pass requires possible nodes at least
-     320 columns wide with sufficient combined work; exact nodes must pass the
-     same guard to enable the blocked path described below. Ten 32-column
-     panels amortize packing, while the work guard prevents a small wide node
-     from routing overwhelmingly narrow matrices through the panel driver.
+     tree parents and column counts give the exact fundamental nodes, their
+     widths and their work, before any row index is formed. The blocked path
+     described below requires nodes at least 320 columns wide with
+     sufficient combined work. Ten 32-column panels amortize packing, while
+     the work guard prevents a small wide node from routing overwhelmingly
+     narrow matrices through the panel driver.
      A non-positive pivot or non-finite
      intermediate falls back to pivoted LU with the original equilibration.
    - A nonsymmetric matrix with `MMD_AT_PLUS_A` uses a Gilbert-Peierls-style
@@ -102,20 +102,54 @@ factor for the same input and options.
 
 ## Blocked SPD panels
 
-The `symmetric-supernodal-ldlt` engine processes one exact fundamental
-supernode at a time, in ascending order. Each node owns a dense row-major
-block of `height x width` entries, its own columns first and then its tail
-rows in ascending order, and all blocks share one array allocated for the
-numeric phase: the symbolic phase computes `block_ptr`, the prefix sums of
-the node rectangles (with overflow checks), which gives each block's offset.
-A node zero-fills its block, scatters original matrix entries into it, then
-subtracts prior node contributions `L[R,Q] @ D[Q] @ L[J,Q].T`. Sparse row
-incidence discovers contributors without scanning all prior nodes.
-Contributors are deduplicated and visited in factor order. The rows of a
-contributor `Q` that fall inside the target are a contiguous suffix of `Q`'s
-rows (elimination-tree containment; the code checks it), so `L[R,Q]` is a run
-of full rows of `Q`'s finished block and is read in place with row stride
-`|Q|`. Only the right operand `D[Q] @ L[J,Q].T`, from those of the rows that
+The symbolic phase works on supernodes. Its first pass (elimination tree and
+column counts, shared with the simplicial kernel) already gives the exact
+fundamental nodes: column `j + 1` joins column `j`'s node when
+`parent(j) = j + 1` and `count(j) = count(j + 1) + 1`, because the strict
+rows of column `j` other than `j + 1` are rows of its parent, so equal counts
+make the two row sets equal. The node widths and heights, the work guard
+below, `supernodes`, `max_supernode_width` and `largest_front` follow
+without any row index. Earlier builds formed every row index of `L` in a
+second row-subtree pass (one step per entry of `L`), compared the strict rows
+of adjacent columns explicitly (which never split a node), and built the row
+incidence of `L` (another `nnz(L)` indices) for contributor discovery at
+numeric time. The supernodal pass instead computes each node's tail, the
+strict rows of its last column, as the union of the original entries of the
+node's columns and of its child nodes' tails, keeping rows below the node, in
+increasing node order with a marker array, and sorts it: `O(nnz(A) + sum of
+tails)` plus the sorts (see `docs/algorithms.md`, Section 7). The first
+pass's counts predict every tail's size, and a mismatch raises
+`logic_error`. One walk over the sorted tails lists every node's contributors
+in increasing node order, with the run of their tail rows that falls in the
+node's columns, and each node's fan-in work. The CSC row indices of `L` are
+written only at assembly: column `first + c` of a node holds the rows
+`first + c + 1, ..., last - 1` and then the node's tail, which is exactly its
+filled pattern (by the node test above), and assembly checks each column's
+count against the first pass. The filled pattern, including entries that
+cancel, is unchanged: `test_symbolic_structure_is_pinned` holds the stored
+`L` pattern and the node statistics of the previous build on the test
+fixtures, for both SPD engines. On 3-D Poisson of
+side 20 with `COLAMD` the symbolic phase fell from 17.5 to 5.2 ms: the
+row-subtree pass, the explicit comparison, the row incidence and the
+allocation of the CSC arrays (now made at assembly or during phase A, below)
+took 3.8, 0.6, 5.9 and 4.1 ms, while the first pass stays at 2.9 ms and the
+tails and contributor lists take 2.2 ms (1.6 ms of it for the tails and
+their sorting).
+
+The `symmetric-supernodal-ldlt` engine factors one exact fundamental
+supernode at a time. Each node owns a dense row-major block of
+`height x width` entries, its own columns first and then its tail rows in
+ascending order, and all blocks share one array allocated for the numeric
+phase: the symbolic phase computes `block_ptr`, the prefix sums of the node
+rectangles (with overflow checks), which gives each block's offset. A node
+zero-fills its block, scatters original matrix entries into it (a per-thread
+map gives the rectangle position of each tail row), then subtracts the
+contributions `L[R,Q] @ D[Q] @ L[J,Q].T` of the nodes the symbolic phase
+listed for it, in increasing node order. The rows of a contributor `Q` that
+fall inside the target are a contiguous suffix of `Q`'s rows
+(elimination-tree containment; the code checks that every one has a target
+position), so `L[R,Q]` is a run of full rows of `Q`'s finished block and is
+read in place with row stride `|Q|`. Only the right operand `D[Q] @ L[J,Q].T`, from those of the rows that
 are target columns, is packed, as a `|Q|`-by-columns block with
 `right[k][j] = d[k] * l[j][k]`. The rows' target positions may be
 noncontiguous and the overlap partial. Each contributor is applied as one
@@ -176,8 +210,9 @@ tiled update per contributor) under all three kernels. A node whose fan-in
 meets the parallel threshold below (counting its strips as items) packs every
 operand into one buffer first and runs its strips on the worker team, claimed
 from the bottom up because lower rows reach more columns. Otherwise the
-calling thread applies one whole contribution after another, as one strip of
-all rows, packing each operand just before it is used, so the buffer only needs
+thread that factors the node (the calling thread, or a phase A worker; see
+below) applies one whole contribution after another, as one strip of all
+rows, packing each operand just before it is used, so the buffer only needs
 room for the largest one. Strips write disjoint rows and only read the
 finished contributor blocks, the operands, and the target positions, so
 neither the thread that runs a strip nor the order of strips can change a
@@ -263,9 +298,10 @@ when it has at least two threads, at least 2 MFLOP (2^21 counted operations,
 as in `dense_update_flops`: a fan-in counts all of its contributions, sparse
 ones included, and a strip phase counts its solves and its update), and at
 least two items per thread (the node's 16-row fan-in strips, or the panel's
-strips), counting at most eight threads. Otherwise the calling thread does
-the work: a panel's strips in order, or a fan-in one whole contribution after
-another (see above). A dispatch costs about 20 microseconds at four to eight
+strips), counting at most eight threads. Otherwise the thread that factors
+the node does the work: a panel's strips in order, or a fan-in one whole
+contribution after another (see above); a node inside a phase A subtree
+always does. A dispatch costs about 20 microseconds at four to eight
 threads and 2 MFLOP is about 35 microseconds of `avx2-fma` tile work, so
 smaller phases ran slower in parallel. Capping the counted threads keeps a
 team larger than eight from running serially an update that eight threads
@@ -276,6 +312,90 @@ arithmetic (the fan-in rule was kept unchanged; its measured strip shape is
 discussed above). Panel strips are 16 rows rather than 32 so that, under this
 rule, panels with 256 to 512 rows below them also run in parallel at eight
 threads; the kernel runs at the same speed on either strip height.
+
+Nodes are scheduled by subtree. A node reads only the blocks and pivots of
+its contributors, which are its descendants in the elimination tree, so
+disjoint subtrees can be factored concurrently. The symbolic phase gives each
+node a work estimate: its fan-in and panel operations as counted in
+`dense_update_flops`, plus 8 per block entry, 256 per contributor and 2,048
+per node for the memory-bound zero-fill, scatter, target positions and
+bookkeeping (allowances measured on small nodes; the estimate only balances
+work). With `W(s)` the estimate summed over node `s` and its descendants and
+`W` the total, a node with `W(s) <= W / (2 * threads)` whose parent exceeds
+that bound, or that is a root, heads a subtree. When at least two threads and
+two subtrees exist:
+
+- phase A runs one `parallel_for` over the subtrees, largest `W(s)` first;
+  each worker factors a whole subtree serially, its nodes in increasing order,
+  with its own row map, operand buffer, fan-in lists and gather block, all
+  sized on the calling thread before the phase from the symbolic lists, so
+  no subtree item allocates. A subtree's nodes never use the worker
+  team themselves (no nested parallelism): their fan-ins and panel strips run
+  on the worker's thread, which `worth_parallel` with one thread selects;
+- phase B then factors the remaining top nodes, whose descendants are all
+  finished, in increasing order on the calling thread, with the parallel
+  fan-ins and panel strip phases described above.
+
+Otherwise (one thread, or fewer than two subtrees) every node is a top node,
+as in earlier builds. The bound follows Graham's list-scheduling argument: a
+greedy schedule finishes within the average load plus its largest item, so
+subtrees of at most half the per-thread share keep the workers within 1.5
+times the ideal time. Alternating runs at four and eight threads of a build
+whose bound was set at run time (before the CSC allocation items below)
+found `W / threads` and `2 * W / threads` slower on 3-D Poisson of side 20
+(`COLAMD`: 40.0-40.6 and 42 ms instead of 39.3 ms at eight threads, and
+`MMD_AT_PLUS_A` 17.0-17.7 instead of 16.5-16.8 ms), because fewer, larger
+subtrees balance worse while their top nodes still run in phase B.
+A forest of comparable trees (disconnected components) is the exception: when
+there are at least two trees, at least half as many as the counted threads
+(`min(threads, 8)`), and no tree holds more than half of the work, every tree
+is a subtree. Phase B's top nodes are often dense and scale poorly (four dense
+600-wide SPD blocks: 9.3 ms in phase B at eight threads, 11.3 ms on one
+thread), while four workers factor the four blocks in about 3.5-5 ms. The
+rule waives the bound above: a tree holding up to half of the work runs on
+one worker, which caps phase A's speedup at about 2x for such a forest
+(adversarial forests of that kind still ran at 0.48-0.85 times the previous
+build's time in an independent review). A
+forest dominated by one tree keeps the default bound (a 20,000-row chain
+beside a 1,000-wide block runs that block in phase B), and so does the
+`spd_forest` test matrix in natural order, whose 12^3 grid becomes a chain of
+nodes with about 140 contributors each that holds most of the work.
+
+Phase A also allocates the CSC arrays of the factor, which assembly fills,
+as two more items ordered with the subtrees by estimated cost (8 per entry):
+zero-filling fresh pages costs about 1.8 ms per array on 3-D Poisson of side
+20 with `COLAMD` (1.86 million entries) and otherwise runs on the calling
+thread at assembly, while the workers that finish their subtrees early absorb
+it here. An allocation failure on a worker is ignored and the allocation is
+repeated at assembly on the calling thread, so it is reported only once
+every pivot has passed. Without phase A the two arrays are allocated
+concurrently at assembly when there are at least two threads. This changes
+one behavior: earlier builds allocated both arrays in the symbolic phase, so
+running out of memory for them raised `MemoryError` even for a matrix that
+then turned out indefinite; such a matrix now falls back to LU (which needs
+its own memory).
+
+A worker checks the team's failure flag (`FactorExecutor::failed`) before
+each node and abandons its subtree once any item has thrown; the executor
+starts no further item, waits for every worker, and rethrows the first
+exception on the calling thread, where a `NonPositiveDefinite` rejects the
+attempt as before. Several subtrees may fail at once; any of their failures
+leads to the same fallback, and the fallback LU does not depend on which one
+was reported.
+
+The partition depends on the thread count (through the bound, the forest rule
+and `worth_parallel`), which cannot change a result: each node's block is a
+function of B's entries in its columns and of its contributors' finished
+blocks and pivots only, and its contributors are in its own subtree,
+finished earlier by the same worker, or are top nodes with smaller numbers
+or subtree nodes, all finished before it in phase B. Each node applies its
+contributions in the fixed increasing order of the symbolic phase, every
+output entry receiving the same operations whether its fan-in runs whole on
+one thread or in strips (the kernel contract, see "Threading behavior"), and
+factors its panels in position-fixed strips. Nodes write only their own
+blocks and pivots, and the maps, operand buffers, fan-in lists and gather
+blocks are per worker. Factors were bitwise identical to the previous build
+under all three kernels and at 1, 2, 3, 4, 8 and 20 threads.
 
 Finiteness is tested where values become final rather than where they are
 produced. Original entries are tested when scattered. Afterwards every
@@ -296,43 +416,50 @@ nonzero `l`; the diagonal block's `l[i][p] * d[p]` updates the future pivot
 packed `d[k] * l[j][k]` enters output entry `(j, j)` with the nonzero
 `l[j][k]` (a zero `l` gives a zero product), a diagonal entry that the
 contribution's part in the strip holding row `j` (or the whole contribution,
-on the calling thread) always includes and a kernel computes. The
+on the thread that factors the node) always includes and a kernel computes. The
 contributor's in-place left operand holds only tested L entries. Every fan-in
-strip runs unless an earlier item has already failed, in which case the
-attempt is rejected anyway. A rejected attempt assembles and
-publishes nothing and falls back to pivoted LU. Matrices whose denormal pivot
+strip, and every node of a phase A subtree, runs unless an earlier item has
+already failed, in which case the attempt is rejected anyway. A rejected
+attempt assembles and publishes nothing and falls back to pivoted LU. Matrices whose denormal pivot
 makes L overflow in the serially solved rows or in strip-solved tail rows are
 rejected by those scans; overflow inside the diagonal block reaches the next
 pivot test first.
 
-After the last node has passed, one assembly pass copies the strict lower
-entries of every block into the CSC values (column `first + c` of a node holds
-block rows `c + 1` to `height - 1` of block column `c`, in order) and then
-releases the blocks; `assembly_seconds` includes it. Entries that cancelled to
-zero are copied as stored zeros. A failed attempt returns before assembly. The
-copy runs in fixed items of eight factor columns, split at node boundaries; it
-uses the worker team when there are at least 2^18 CSC entries and two items
-per thread (counting at most eight threads), and since it only copies, neither
-the partition nor the thread can change a value. A node of width `W` and
+After the last node has passed, one assembly pass writes the CSC row indices
+of `L` (column `first + c` of a node holds the rows `first + c + 1, ...,
+last - 1` and then the node's tail) and copies the strict lower entries of
+every block into the CSC values (block rows `c + 1` to `height - 1` of block
+column `c`, in order), and then releases the blocks; `assembly_seconds`
+includes it, and the allocation of the CSC arrays when phase A did not make
+it. Entries that cancelled to zero are copied as stored zeros. A failed
+attempt returns before assembly. The copy runs in fixed items of eight factor
+columns, split at node boundaries; it uses the worker team when there are at
+least 2^18 CSC entries and two items per thread (counting at most eight
+threads), and since it only copies, neither the partition nor the thread can
+change a value. A node of width `W` and
 height `R` stores `R*W` block entries for its `R*W - W*(W+1)/2` strict L
 entries, so the blocks hold at most `2*nnz(L) + n` entries, with equality only
 for nodes whose height equals their width (dense diagonal blocks). On 3-D
 Poisson of side 20 they hold 2.11 million entries (16.9 MB, 1.14 times the L
 entries) with `COLAMD` and 1.08 million (8.7 MB, 1.30 times) with
 `MMD_AT_PLUS_A`; four dense SPD blocks of size 600 hold 1.44 million (11.5 MB,
-twice the L entries). The CSC value array is allocated before the numeric
-phase, so it and the blocks coexist throughout the numeric phase and
-assembly, including a failed attempt; the blocked path's peak memory is the
-factor plus all node blocks, where earlier builds held the factor plus one
-node rectangle and its packed operands.
+twice the L entries). The CSC arrays (row indices and values) are allocated
+during phase A or at assembly, so they coexist with the blocks from then on
+(and are discarded with a failed attempt only if phase A had allocated them);
+the blocked path's peak memory is the factor plus all node blocks, where
+builds before the block storage held the factor plus one node rectangle and
+its packed operands. Earlier builds allocated both CSC arrays in the
+symbolic phase.
 
 For node width `W` and height `R`, predicted internal update terms are
 `W*(W-1)*(3*R-2*W+1)/6`. Only nodes at least 320 columns wide contribute useful
 work; their total must be at least `3072*n`, where `n` is the whole matrix
-dimension. The cheap parent/count runs bound this work before the extra exact
-pattern pass, and actual fundamental nodes enforce the final decision.
-The measured guard accounts for per-node driver overhead without rejecting
-an expensive large node solely because it covers few matrix columns.
+dimension. The exact fundamental nodes from the parent/count test decide this
+before any row index is formed (earlier builds evaluated the guard on the
+same runs as an upper bound and again after an exact pattern pass, which
+always agreed). The measured guard accounts for per-node driver overhead
+without rejecting an expensive large node solely because it covers few
+matrix columns.
 
 The filled CSC pattern, including entries that cancel numerically to zero,
 remains the public storage contract. No factors, symmetric scales, or blocked
@@ -607,18 +734,24 @@ Statistics expose `numeric_engine`, `parallel_steps`, `row_updates`, and
 `largest_front` so users can tell which path ran and whether a problem supplied
 meaningful parallel work.
 
-Partitions elsewhere depend on sizes and positions only. The one exception is
-the supernodal LDL^T fan-in: through `worth_parallel`, the thread count
-decides whether a node's contributions are applied whole on the calling thread
-(parts cut from each contribution's own rows and columns) or in 16-row strips
-on the worker team (parts cut at node-row positions). Its factors stay bitwise
-identical at every thread count only because of the kernel contract in
+Partitions elsewhere depend on sizes and positions only. The exception is
+the supernodal LDL^T engine, in two places. Through `worth_parallel`, the
+thread count decides whether a node's contributions are applied whole on one
+thread (parts cut from each contribution's own rows and columns) or in 16-row
+strips on the worker team (parts cut at node-row positions). Through the
+subtree bound `W / (2 * threads)` and the forest rule (see "Blocked SPD
+panels"), it decides which nodes a phase A worker factors serially and which
+top nodes run in phase B with the team. Its factors stay bitwise identical at
+every thread count only because of the kernel contract in
 `src/dense_kernels.hpp`: an element's result depends only on its own operands,
 never on the tile shape, its position in a tile, or the call path (exercised
 by `test_kernels_agree_across_threads_and_tile_paths` and the thread-count
-comparisons of the factor tests). Any future kernel must keep that contract;
-for example, blocking the rank (`k`) dimension into shape-dependent partial
-sums would make LDL^T factors depend on the thread count.
+comparisons of the factor tests), and because each node's block depends only
+on its inputs and on its contributors' finished blocks, which are its
+descendants and are finished before it in either phase. Any future kernel
+must keep that contract; for example, blocking the rank (`k`) dimension into
+shape-dependent partial sums would make LDL^T factors depend on the thread
+count.
 
 `lu_dense_panels` counts nonempty dense tail flushes, and
 `lu_parallel_panels` counts flushes that used the worker team; the latter is
@@ -639,7 +772,9 @@ sums per-worker vector capacities, which grow with the items each worker
 happened to run), so it is stable only at one thread; it is a diagnostic,
 not part of the thread-count determinism contract.
 The SPD-specific `parallel_panels`, `dense_update_flops`, and `spd_*` fields
-retain their existing meaning. `dense_kernel` names the dense tile kernel the
+retain their existing meaning; with concurrent subtrees, the `spd_*` timers
+add the slowest phase A worker's time to phase B's, and `spd_subtrees` and
+`spd_subtree_seconds` describe that phase (see below). `dense_kernel` names the dense tile kernel the
 factorization snapshotted (`avx2-fma`, `sse2`, or `scalar`; see "Dense
 kernels"), whether or not the selected engine used it.
 
@@ -656,11 +791,21 @@ buffers are restored alongside) and discarded CSC buffers on fallback.
 
 For blocked SPD, `parallel_panels` counts actual parallel phases (a node's
 contributor fan-in or a panel's strip phase that met the threshold in
-"Blocked SPD panels") and is also included in `parallel_steps`. A fan-in is
-one phase per node; earlier builds counted one phase per contributor update
-that met the threshold, so the count fell, for example from 98 to 55 on 3-D
-Poisson of side 20 with `COLAMD` and from 31 to 25 with `MMD_AT_PLUS_A` at
-eight threads.
+"Blocked SPD panels"); nodes factored in phase A never contribute to it.
+`parallel_steps` is `parallel_panels`, plus one when phase A factored at
+least two subtrees concurrently. `spd_subtrees` is the number of phase A
+subtrees (zero when phase A did not run, including on one thread), and
+`spd_subtree_seconds` is phase A's wall time, which includes the CSC array
+allocation items. `threading_backend` reports `std::thread` for a column
+engine whenever `parallel_steps` is positive (earlier builds tested
+`parallel_panels`, identical before phase A existed). A fan-in is one phase
+per node; earlier builds counted one phase per contributor update that met
+the threshold, so the count fell, for example from 98 to 55 on 3-D Poisson of
+side 20 with `COLAMD` and from 31 to 25 with `MMD_AT_PLUS_A` at eight
+threads. With phase A, the nodes of the subtrees no longer count: at eight
+threads the same cases report 45 and 21 parallel panels plus one subtree
+step (17 and 9 subtrees), and four dense 600-wide SPD blocks 0 instead of 40
+(four subtrees).
 `dense_update_flops` counts two operations per executed multiply/subtract
 term, including the diagonal-block, below-panel solve, and sparse
 intersection work; diagonal weighting (including the panel's `S`, the
@@ -670,12 +815,31 @@ and operand packing are excluded.
 `spd_panel_entries` is the largest allocated dense node rectangle. A rectangle
 uses less than twice its node's lower-triangular CSC entries, and does not
 densify unrelated matrix rows or columns. `peak_workspace_bytes` estimates
-simultaneously live numeric and symbolic vector buffers, including CSC factors,
-row incidence, and packed operands; on the blocked SPD path it counts the
-whole node block array once (every node rectangle, allocated for the numeric
-phase, at most `2*nnz(L) + n` doubles; see "Blocked SPD panels"), which
-coexists with the CSC value array, allocated before the numeric phase,
-throughout the numeric phase and assembly. Earlier builds counted one node
+simultaneously live numeric and symbolic vector buffers, including CSC factors
+and packed operands. On the blocked SPD path it counts the supernodal
+symbolic structure (node bounds, column-to-node map, tails, contributor
+lists, per-node work), the whole node block array once (every node
+rectangle, allocated for the numeric phase, at most `2*nnz(L) + n` doubles;
+see "Blocked SPD panels"), and the CSC arrays from their allocation, during
+phase A or at assembly, on; it is the larger of the numeric phase's peak and
+the assembly's (symbolic structure, blocks and CSC arrays together). Builds
+before the supernodal symbolic phase allocated the CSC arrays before the
+numeric phase and also held the row incidence of `L` (`nnz(L) + n + 1`
+indices), so the estimate fell, for example on 3-D Poisson of side 20 with
+`COLAMD` from 62.9, 66.0, 66.1 and 66.3 MB to 49.2, 53.2, 53.3 and 53.6 MB at
+one, four, eight and twenty threads, with `MMD_AT_PLUS_A` from 30.7 and
+32.4-32.6 MB to 24.1 and 27.1-27.4 MB, on four dense 600-wide SPD blocks from
+29.1-29.5 MB to 23.2-24.5 MB, and on a random SPD matrix (n=3,000, density
+0.004, `COLAMD`) from 105.9 and 115.1-115.3 MB to 82.7 and 99.2-100.5 MB.
+Phase A adds, per worker, a row map of `n` 4-byte entries (8 bytes when
+`n >= 2^31`), one 16-by-128 gather block, and an operand buffer, contribution
+list and target positions sized for the largest subtree node, all released
+after phase A; the team is limited so that these never exceed half the bytes
+of the node block array (at least two workers), which bounds the per-thread
+growth. A million-row matrix at twenty threads would need 80 MB of row maps,
+which the limit allows only next to at least 160 MB of node blocks. On the
+random matrix above the limit holds phase A to fewer workers than threads
+(without it, 118 and 155 MB at eight and twenty threads). Earlier builds counted one node
 rectangle instead, so the estimate rose with the block storage, for example
 from 49.3 to 62.6 MB on 3-D Poisson of side 20 with `COLAMD`, 25.5 to
 30.3 MB with `MMD_AT_PLUS_A`, and 20.5 to 29.1 MB on four dense SPD blocks of
@@ -689,13 +853,15 @@ sum of those contributors' blocks (each operand holds at most `|Q|` times the
 contributor's height); the target positions add one index per output row of
 every contribution. On the calling thread the buffer needs room for the
 largest operand only. On the blocked SPD path the estimate therefore depends
-on the thread count: 3-D Poisson of side 20 with `COLAMD` reports 62.9 MB with
-one thread and 66.0, 66.1, and 66.3 MB with four, eight, and twenty (62.6 MB
-at every thread count before the fan-in), 30.7 and 32.4-32.6 MB with
-`MMD_AT_PLUS_A` (30.3 MB before), and the random SPD matrix of the strip
-measurements above (n=3,000, `COLAMD`) 141.7 MB with one thread and
-152.2-152.5 MB with four to twenty (137.3 MB before). Four dense SPD blocks of
-size 600, which have no contributors, report 29.1-29.3 MB (29.1 MB before).
+on the thread count, through the parallel fan-ins and the phase A workers.
+When the parallel fan-in was introduced (before the supernodal symbolic
+phase), 3-D Poisson of side 20 with `COLAMD` reported 62.9 MB with one thread
+and 66.0, 66.1, and 66.3 MB with four, eight, and twenty (62.6 MB at every
+thread count before the fan-in), 30.7 and 32.4-32.6 MB with `MMD_AT_PLUS_A`
+(30.3 MB before), and the random SPD matrix of the strip measurements above
+(n=3,000, `COLAMD`) 141.7 MB with one thread and 152.2-152.5 MB with four to
+twenty (137.3 MB before); four dense SPD blocks of size 600, which have no
+contributors, reported 29.1-29.3 MB (29.1 MB before).
 Packing a parallel fan-in's operands in batches would bound the buffer
 further; this build does not. Thread runtime storage is excluded, including
 the fixed per-call stack blocks of the panel steps (the 32-by-32 `S`, a
@@ -708,24 +874,38 @@ lowered it on most SPD cases but raised 3-D Poisson with `MMD_AT_PLUS_A` by
 about 53 KB.
 
 `spd_source_seconds` measures prior-node updates: building each node's
-contribution list and target positions, packing, and the fan-in itself, on
-the calling thread or the worker team (contributor discovery and the scatter
-of original entries before it are not included); `spd_panel_seconds` measures
-node factorization, below-panel solves, and trailing updates.
+contribution list and target positions from the symbolic lists, packing, and
+the fan-in itself, on the calling thread or the worker team (the scatter of
+original entries before it is not included); `spd_panel_seconds` measures
+node factorization, below-panel solves, and trailing updates. With phase A,
+each of the three `spd_*` timers is the phase B time plus the largest time of
+any phase A worker for that timer (the maxima may come from different
+workers), so they still overlap and must not be added, and they no longer sum
+the work of all nodes: the sum over phase A workers would exceed the wall
+time.
 `spd_pack_seconds` is the dense-buffer packing portion of those two times, so
 it must not be added to them: it covers each contributor's `D L.T` right
 operand (its left operand is read in place and not packed) and each panel's
-shared right operand, which are packed on the calling thread, all of a node's
-operands before a parallel fan-in or each one just before its update
-otherwise. Each strip forms its own `L D` operand inside its work item,
-possibly on a worker, so that formation is counted only in
-`spd_panel_seconds`.
-`numeric_seconds` of the blocked path ends when the last node is factored;
-`assembly_seconds` then also covers copying the node blocks into the CSC
-values, releasing the blocks, and stopping the worker team.
+shared right operand, which are packed by the thread that factors the node
+(the calling thread, or a phase A worker), all of a node's operands before a
+parallel fan-in or each one just before its update otherwise. Each strip
+forms its own `L D` operand inside its work item, possibly on a worker, so
+that formation is counted only in `spd_panel_seconds`.
+`symbolic_seconds` of the blocked path covers the symmetry test, the first
+pass, the node test and the supernodal pass (tails, contributor lists, block
+offsets); earlier builds also counted the row-subtree pass, the row incidence
+and the allocation of the CSC arrays there. `numeric_seconds` of the blocked
+path ends when the last node is factored and includes phase A, with any CSC
+array allocation it made; `assembly_seconds` then covers allocating the CSC
+arrays phase A did not, writing the CSC row indices, copying the node blocks
+into the CSC values, releasing the blocks, and stopping the worker team.
 `failed_spd_seconds` records a discarded
 SPD attempt, and is included in the subsequent LU numeric/factor time. Peak
-workspace also includes that attempt's maximum live buffers.
+workspace also includes that attempt's maximum live buffers, including CSC
+arrays that a phase A allocation item made before the attempt was rejected.
+Whether that item ran before the failure depends on scheduling, so after a
+rejected attempt with phase A the estimate can vary between runs and thread
+counts (no test compares it).
 
 Good threading candidates have wide, irregular fronts and substantial fill.
 Banded and narrow PDE-like problems usually select a low-overhead serial CSC
@@ -778,30 +958,35 @@ when their backward residual is small.
   span, so a row that is dense in a prefix but has one far column (for
   example, a bordered system ordered border-last) has a wide span: it stays
   sparse, or its dense tail covers that whole span;
-- supernodal LDL^T keeps serial work around its parallel phases: each panel
-  solves the node's own rows `[end, width)` on the calling thread before its
-  strip phase (for a dense node, that is the whole below-panel solve), in
-  baseline (SSE2) arithmetic outside the kernel table; nodes are processed one
-  at a time in ascending order, so a node whose fan-in falls below the
+- the supernodal LDL^T symbolic phase is serial, and its first pass
+  (elimination tree and column counts by row-subtree walks, shared with the
+  simplicial kernel) still takes one step per entry of `L`: 2.9 of the 5.3 ms
+  symbolic time on 3-D Poisson of side 20 with `COLAMD`, where the node tails
+  and their sorting take 1.6 ms and the contributor lists 0.7 ms. A column
+  count algorithm in nearly `O(nnz(A))` time (Gilbert, Ng and Peyton) would
+  remove most of the first pass;
+- supernodal LDL^T keeps serial work around its parallel phases in phase B:
+  the top nodes are factored one at a time, each panel solves the node's own
+  rows `[end, width)` on the calling thread before its strip phase (for a
+  dense node, that is the whole below-panel solve), in baseline (SSE2)
+  arithmetic outside the kernel table, a node whose fan-in falls below the
   parallel threshold applies its contributions on the calling thread, and
-  independent subtrees are not yet factored concurrently (finished node blocks
-  are read-only, which would allow it); contributor discovery, target
-  positions, and operand packing run on the calling thread even before a
-  parallel fan-in. On 3-D Poisson of side 20 with `COLAMD` at eight threads
-  the prior-node phase takes about 20 of the 32 ms numeric time: about 2.9 ms
-  of contribution lists and target positions, 1.3 ms of packing for the 29
-  parallel fan-ins and 8 ms for their strips, and 8 ms in the fan-ins of the
-  other 2,552 nodes with contributors on the calling thread (2,581 fan-ins in
-  all; 51 of 64 ms with one update per contributor, 69 of 83 ms before
-  contributors were read in place). Strips cut
-  each contribution's rows by node position, so a sparse contribution is
-  applied in short parts, and every strip scans the node's contribution list:
-  the 29 parallel fan-ins cost about 23 ms on the whole-node path at one
-  thread but 32 ms as strips on one thread, 33 ms in total on two, 36 ms on
-  four, and 53 ms on eight threads of the i5-13600K, whose workers then also
-  land on its efficiency cores; a panel's rank-32 update also reads and writes
+  target positions and operand packing run on the calling thread even before
+  a parallel fan-in. A dense top node therefore scales poorly (four dense
+  600-wide SPD blocks took 9.3 ms in phase B at eight threads and 11.3 ms on
+  one thread, before the forest rule made them subtrees). On 3-D Poisson of
+  side 20 with `COLAMD` at eight threads the numeric phase takes about 23 ms:
+  5.6 ms in phase A (17 subtrees and the CSC allocations) and 17 ms for the 38
+  top nodes, of which 8.0 ms are the strips of 19 parallel fan-ins, 1.7 ms
+  the other 19 fan-ins, 1.9 ms block setup and target positions, and most of
+  the rest panel work. Strips cut each contribution's rows by node position,
+  so a sparse contribution is applied in short parts, and every strip scans
+  the node's contribution list; a panel's rank-32 update also reads and writes
   the whole trailing block once per panel, which limits its eight-thread
-  scaling on large dense nodes;
+  scaling on large dense nodes; the workers of the i5-13600K also land on its
+  efficiency cores. Phase A balances subtrees by an estimate and starts them
+  largest first, but a subtree is never split between workers, and the forest
+  rule is a heuristic for this code's phase B efficiency;
 - the blocked LDL^T path keeps every node block until assembly, up to
   `2*nnz(L) + n` doubles beside the CSC factor (1.14 to 2 times the L entries
   on the benchmark cases), and fresh block memory costs page faults and a
@@ -810,8 +995,15 @@ when their backward residual is small.
   one thread, 0.6% to 1.4% with eight, in two sets of interleaved runs) than
   with a single reused node rectangle. A failed SPD attempt on a symmetric
   indefinite matrix also allocates the whole node block array, and touches
-  its pages up to the failing node, before falling back to LU (earlier builds
-  held one node rectangle); `peak_workspace_bytes` reports it;
+  its pages up to the failing node (in phase A, up to the failing nodes of
+  every subtree started), and, when phase A ran, may have allocated the CSC
+  arrays too, before falling back to LU (earlier builds held one node
+  rectangle and allocated the CSC arrays before every attempt);
+  `peak_workspace_bytes` reports it (with phase A, the count of those CSC
+  arrays depends on scheduling). Allocating the CSC arrays and releasing
+  the blocks still fault in and free fresh pages on every factorization
+  (about 3.6 and 0.8 ms on 3-D Poisson of side 20 with `COLAMD`, the former
+  hidden in phase A when it runs);
 - the `avx2-fma` kernel does not fuse the LU flush (`running` order): the
   scalar U-entry walks of sparse pivot rows (pivot-tail materialization and
   dense-row updates outside panels) apply the same terms outside the kernel

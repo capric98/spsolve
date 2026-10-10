@@ -264,9 +264,11 @@ accepted. For a node of width $W$ and height $H$ the block holds
 $HW = \mathrm{nnz} + W(W+1)/2$ entries for its
 $\mathrm{nnz} = HW - W(W+1)/2$ strict entries of $L$, and
 $HW \le 2\,\mathrm{nnz} + W$ because $H \ge W$; summed over the nodes, the
-blocks hold at most $2\,\mathrm{nnz}(L) + n$ entries. Contributors are
-visited in increasing node order, and each output entry accumulates its terms
-in that order regardless of threading. Each contributor is one rank-$|Q|$
+blocks hold at most $2\,\mathrm{nnz}(L) + n$ entries. The contributors of
+each node, with the run of their rows that falls in the node's columns, are
+listed by the symbolic phase (Section 7). They are visited in increasing
+node order, and each output entry accumulates its terms in that order
+regardless of threading. Each contributor is one rank-$|Q|$
 update: an entry forms $s = \sum_{q \in Q} l_{iq}\, (d_q\, l_{jq})$ from zero
 in ascending $q$ and subtracts $s$ once (Section 11). All contributions to a
 node are applied in one pass (the fan-in): the rows of $F$ are split into
@@ -296,6 +298,38 @@ depends only on that row, so rows are processed in independent strips; the
 rows of $J'$ are solved first because $L_{J',P}$ is the shared operand of
 the update.
 
+### Tree-level parallelism
+
+A node reads only the finished blocks of its contributors, which are its
+descendants in the elimination tree (a node contributes to the nodes that
+hold its tail rows, its ancestors). Disjoint subtrees therefore share no data
+and can be factored concurrently, the idea behind subtree-to-subcube mapping
+(George, Liu and Ng) and its refinements by work, proportional mapping
+(Pothen and Sun) and the work-balanced subtree partitions of Geist and Ng.
+The engine uses a two-phase form. With $\omega(s)$ the estimated work of node
+$s$ and all its descendants (multiply-subtracts plus allowances for
+memory-bound work, accumulated bottom-up) and $\Omega$ the total, the
+subtrees are the maximal ones with $\omega(s) \le \Omega / (2p)$ for $p$
+threads. Graham's list-scheduling
+bound (a greedy schedule finishes within the average load plus the largest
+item) then gives phase A a makespan of at most
+$\Omega_A / p + \Omega / (2p) \le 1.5\,\Omega / p$, where $\Omega_A$ is the
+subtrees' work: at most 1.5 times the ideal time of the whole factorization
+(relative to phase A alone the factor is $1 + \Omega / (2\,\Omega_A)$);
+taking the subtrees largest first (LPT) usually does better.
+In phase A each worker takes the next unclaimed subtree, largest first, and
+factors its nodes serially in increasing order; in phase B the remaining top
+nodes, whose descendants are all finished, are factored in increasing order
+with the parallel fan-in and panel strips above. A forest of comparable
+trees (disconnected components; at least $\min(p, 8)/2$ trees, none above
+$\Omega/2$) makes each tree a subtree instead, because phase B's dense top nodes
+scale poorly; this waives the bound above, since a tree holding up to
+$\Omega/2$ runs on one worker (phase A's speedup is then about 2 at most).
+Since every node's block is a function of its inputs and its
+contributors' blocks only, and each output entry receives the same
+operations on every path, the partition (which depends on $p$) cannot change
+any result.
+
 ### Work estimate used for engine selection
 
 For a node of width $W$ and height $R$, counting one multiply-subtract per
@@ -323,14 +357,38 @@ computes `parent` and the strict column counts $c_j = |\mathrm{Struct}(l_{:,j})|
 in one pass over the input: for each column $k$ and each $b_{ik} \ne 0$ with
 $i < k$, walk from $i$ towards the root until a node already marked with $k$
 is met, setting the parent of unparented nodes to $k$ and incrementing the
-count of every node passed. This is Liu's $O(\mathrm{nnz}(L))$ algorithm; the
-same traversal, repeated, fills the exact row indices when the blocked kernel
-needs them.
+count of every node passed. This is Liu's $O(\mathrm{nnz}(L))$ algorithm.
 
 Consecutive columns with $\mathrm{parent}(j) = j+1$ and $c_j = c_{j+1} + 1$
 form a fundamental supernode: the parent relation gives
 $\mathrm{Struct}(l_{:,j}) \setminus \{j+1\} \subseteq \mathrm{Struct}(l_{:,j+1})$
-and the count equality makes the inclusion an equality.
+and the count equality makes the inclusion an equality. The test is exact, so
+the node partition, its widths and heights, and the engine's work guard
+(Section 6) follow from the parents and counts alone, before any row index
+is formed.
+
+The blocked kernel then needs only each node's tail
+$T(s) = \mathrm{Struct}(l_{:,l-1})$ for its columns $J = [f, l)$; the row
+indices of column $f + c$ are $f + c + 1, \dots, l - 1$ followed by $T(s)$.
+Writing $\mathrm{Struct}(l_{:,j}) = (\mathrm{Struct}(b_{:,j}) \cap \{i > j\})
+\cup \bigcup_{\mathrm{parent}(c) = j} \mathrm{Struct}(l_{:,c}) \setminus \{j\}$
+and observing that a child of a column of $J$ is either the previous column
+of $J$ or the last column of an earlier node whose parent lies in $J$ (a
+child node $c$, with strict rows $T(c)$), gives the supernodal symbolic
+factorization
+
+$$T(s) = \Big(\bigcup_{j \in J} \mathrm{Struct}(b_{:,j})
+  \;\cup \bigcup_{\text{child nodes } c} T(c)\Big) \cap \{i \ge l\},$$
+
+computed in increasing node order with a marker array in
+$O(\mathrm{nnz}(B) + \sum_s |T(s)|)$ plus sorting each tail (George and Liu
+describe this compressed form). The first pass's counts give every $|T(s)|$
+in advance and are checked. Node $q$ contributes to every node $t$ that holds
+one of its tail rows; in the sorted $T(q)$ the rows inside $t$'s columns form
+one run and all later rows lie in $t$, so a single walk over all tails lists
+each node's contributors in increasing order, with the run, in
+$O(\sum_s |T(s)|)$. This replaces a second row-subtree pass, which costs one
+step per entry of $L$.
 
 For nonsymmetric LU the AMD estimates of $\mathrm{nnz}(L)$ (`AMD_LNZ`) and of
 the largest column count (`AMD_DMAX`) on the pattern of $A + A^T$ are used as
@@ -466,6 +524,7 @@ one while both are tiny. No condition estimate is computed.
 | Row-hybrid setup (count, then fill) | $O(\mathrm{nnz}(A) + n)$ plus the initial dense tails |
 | AMD / COLAMD ordering | near-linear in $\mathrm{nnz}(A)$ for typical graphs |
 | Elimination tree and column counts | $O(\mathrm{nnz}(L))$ |
+| Supernodal symbolic (node tails, contributor lists) | $O(\mathrm{nnz}(A) + \sum_s \lvert T(s) \rvert \log \lvert T(s) \rvert)$ |
 | Left-looking CSC LU | $O(\mathrm{flops}(LU) + \mathrm{nnz}(A))$ |
 | Row-hybrid LU | $O(\mathrm{flops}(LU))$ for the updates plus $O(\mathrm{nnz}(\text{rows}))$ per sparse merge |
 | Supernodal LDL^T | $O(\sum_{\text{nodes}} W(W-1)(3R-2W+1)/6)$ multiply-subtracts, dense-kernel rate |
@@ -480,6 +539,19 @@ one while both are tiny. No condition estimate is computed.
   SIAM J. Matrix Anal. Appl. 11 (1990).
 - E. G. Ng and B. W. Peyton, "Block sparse Cholesky algorithms on advanced
   uniprocessor computers," SIAM J. Sci. Comput. 14 (1993).
+- J. W. H. Liu, E. G. Ng and B. W. Peyton, "On finding supernodes for sparse
+  matrix computations," SIAM J. Matrix Anal. Appl. 14 (1993).
+- A. George and J. W. H. Liu, *Computer Solution of Large Sparse Positive
+  Definite Systems*, Prentice-Hall (1981), chapter 5 (compressed subscripts).
+- A. George, J. W. H. Liu and E. Ng, "Communication results for parallel
+  sparse Cholesky factorization on a hypercube," Parallel Comput. 10 (1989)
+  (subtree-to-subcube mapping).
+- G. A. Geist and E. Ng, "Task scheduling for parallel sparse Cholesky
+  factorization," Int. J. Parallel Program. 18 (1989).
+- A. Pothen and C. Sun, "A mapping algorithm for parallel sparse Cholesky
+  factorization," SIAM J. Sci. Comput. 14 (1993) (proportional mapping).
+- R. L. Graham, "Bounds on multiprocessing timing anomalies," SIAM J. Appl.
+  Math. 17 (1969).
 - P. R. Amestoy, T. A. Davis and I. S. Duff, "An approximate minimum degree
   ordering algorithm," SIAM J. Matrix Anal. Appl. 17 (1996); and
   "Algorithm 837: AMD," ACM TOMS 30 (2004).

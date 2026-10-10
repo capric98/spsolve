@@ -175,7 +175,7 @@ larger fronts. It trailed SuperLU on the `COLAMD` 3-D Poisson case and on
 dense SPD blocks until the contributor and panel steps described under
 "Blocked SPD comparison" below; since then, the only case that still fails
 in the full `--extended --dense-lu` runs is the `COLAMD` row-permuted band,
-a general LU case (1.14x).
+a general LU case (1.14-1.18x).
 
 ### Dense LU panel comparison
 
@@ -438,6 +438,58 @@ benchmark 3-D Poisson took 0.40-0.43x (`COLAMD`, 0.65x before) and 0.13x
 with one thread; the `MMD_AT_PLUS_A` runs passed the gate for every case, and
 the `COLAMD` runs failed only on the row-permuted band (1.14x and 1.19x).
 One run on one platform does not meet the promotion rule below.
+
+The supernodal symbolic phase and subtree scheduling that followed (node
+tails and contributor lists computed from the exact parent/count node test
+instead of a second row-subtree pass, an explicit tail comparison and a row
+incidence; subtrees of at most `W / (2 * threads)` estimated work, or the
+trees of a forest of comparable trees, factored concurrently before the top
+nodes, with the CSC arrays allocated during that phase; see
+[the design notes](native-lu.md#blocked-spd-panels)) kept every factor,
+permutation, and scale, the stored `L` pattern, `supernodes`,
+`max_supernode_width`, `largest_front`, and `dense_update_flops` bitwise
+identical to the previous build under all three kernels and at 1, 2, 3, 4, 8,
+and 20 threads. Interleaved runs against the previous build (`avx2-fma`,
+medians of five rounds, times in ms) measured:
+
+| case | ordering | 1 thread before | after | 8 threads before | after | symbolic before | after |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 3-D Poisson, side 20 | COLAMD | 76.8 | 65.9 | 57.1 | 35.5 | 17.1 | 5.3 |
+| 3-D Poisson, side 20 | MMD_AT_PLUS_A | 29.4 | 25.4 | 26.2 | 16.5 | 8.1 | 3.2 |
+| four dense SPD blocks, size 600 | MMD_AT_PLUS_A | 33.4 | 29.8 | 31.3 | 20.4 | 9.1 | 4.2 |
+| four dense SPD blocks, size 600 | COLAMD | 35.8 | 32.4 | 33.8 | 23.6 | 9.3 | 4.3 |
+| 1,000-wide block beside a 20,000-row chain | NATURAL | 28.6 | 25.7 | 24.7 | 21.7 | 8.8 | 5.6 |
+| SPD blocks 330, 400, 450 and a 12^3 grid | MMD_AT_PLUS_A | 13.6 | 11.6 | 13.5 | 8.3 | 3.5 | 1.8 |
+| random SPD, n=3,000, density 0.004 | MMD_AT_PLUS_A | 72.0 | 65.6 | 43.1 | 32.0 | 14.2 | 3.4 |
+
+With eight threads the numeric phase of 3-D Poisson took 22.0 instead of
+32.2 ms with `COLAMD` (17 subtrees in about 5.7 ms) and 8.7 instead of
+13.4 ms with `MMD_AT_PLUS_A` (9 subtrees), and the dense SPD blocks 4.5
+instead of 10.1 ms (each block on its own worker). With one thread
+`assembly_seconds` rose (3-D Poisson with `COLAMD` 2.3 to 7.5 ms) because the
+CSC arrays are now allocated there rather than in the symbolic phase. The
+one-thread numeric phase of the blocked cases moved by 3-5% between two
+builds whose blocked-path machine code was identical (MSVC `/FAs` listings;
+they differed only in the simplicial loop below), a code-placement effect;
+the table uses the final build. The simplicial kernel's loop now reads
+through local base pointers: with the restructured driver function, MSVC
+reloaded the data pointers of the factor vectors after every store of its
+innermost loop, which made simplicial factors 3-7% slower (2-D Poisson with
+`COLAMD`, 3-D Poisson of side 16 with `COLAMD`, a 320-wide block beside a
+100,000-row chain); with the hoisted pointers they ran at 0.97-1.00x of the
+previous build. The LU controls (dense LU of size 600, `sparse-dense-border`,
+irregular and pivot-heavy with both orderings) moved by -9% to +5% with
+overlapping per-round ranges; their machine code differs only in member
+offsets and the executor's worker-limit test. In the full benchmark 3-D
+Poisson took 0.08x (`MMD_AT_PLUS_A`, 15-16 ms) and 0.26x (`COLAMD`, 36 ms)
+SuperLU time with eight threads and 0.12x and 0.47-0.48x with one, and the
+dense SPD blocks 0.48-0.49x and 0.55-0.56x (0.73-0.74x and 0.75-0.81x with
+one thread); the `MMD_AT_PLUS_A` runs passed the gate for every case, and the
+`COLAMD` runs failed only on the row-permuted band (1.15x and 1.18x).
+Estimated peak workspace fell
+on every blocked case (3-D Poisson with `COLAMD` from 66.1 to 53.3 MB at
+eight threads, dense SPD blocks from 29.3 to 24.3 MB), because the row
+incidence is gone and the CSC arrays are allocated later.
 
 The row-permuted 20,000-row COLAMD band exposes a separate classifier problem.
 Using an unrelated AMD analysis previously reported a front of 11,309 despite

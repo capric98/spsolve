@@ -89,6 +89,8 @@ public:
     double spd_source_seconds_ = 0.0;
     double spd_panel_seconds_ = 0.0;
     double spd_pack_seconds_ = 0.0;
+    index_t spd_subtrees_ = 0;
+    double spd_subtree_seconds_ = 0.0;
     double ordering_estimated_l_nnz_ = 0.0;
     double ordering_estimated_max_front_ = 0.0;
     index_t numeric_probe_columns_ = 0;

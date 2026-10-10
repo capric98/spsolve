@@ -109,8 +109,12 @@ public:
         for (auto& worker : workers_) worker.join();
     }
 
+    // Runs function(index, worker) for every index below count; worker is in
+    // [0, max_workers) (all threads when max_workers is zero), 0 being the
+    // calling thread. After an item throws, no further item starts and the
+    // first exception is rethrown here once every worker has stopped.
     template <typename Function>
-    void parallel_for(std::size_t count, Function&& function) {
+    void parallel_for(std::size_t count, Function&& function, int max_workers = 0) {
         if (count == 0) return;
         if (thread_count_ == 1) {
             for (std::size_t index = 0; index < count; ++index) function(index, 0);
@@ -120,6 +124,7 @@ public:
         {
             std::lock_guard lock(job_mutex_);
             count_ = count;
+            worker_limit_ = max_workers > 0 ? max_workers : thread_count_;
             next_.store(0, std::memory_order_relaxed);
             failed_.store(false, std::memory_order_relaxed);
             worker_error_ = nullptr;
@@ -138,6 +143,12 @@ public:
             job_ = {};
         }
         if (worker_error_ != nullptr) std::rethrow_exception(worker_error_);
+    }
+
+    // True once an item of the current parallel_for has thrown. A long item
+    // polls it to stop early; the error is already captured and rethrown.
+    [[nodiscard]] bool failed() const noexcept {
+        return failed_.load(std::memory_order_relaxed);
     }
 
 private:
@@ -167,6 +178,7 @@ private:
     }
 
     void execute(int worker_id) noexcept {
+        if (worker_id >= worker_limit_) return;
         while (!failed_.load(std::memory_order_relaxed)) {
             const std::size_t index = next_.fetch_add(1, std::memory_order_relaxed);
             if (index >= count_) break;
@@ -190,6 +202,7 @@ private:
     std::atomic<std::size_t> next_{0};
     std::atomic<bool> failed_{false};
     std::size_t count_ = 0;
+    int worker_limit_ = 1;
     std::size_t generation_ = 0;
     std::size_t completed_workers_ = 0;
     bool stopping_ = false;
@@ -698,16 +711,13 @@ template <typename Int>
         strict_col_ptr[static_cast<std::size_t>(k + 1)] = current + count;
     }
     const index_t strict_nnz = strict_col_ptr.back();
-    std::vector<index_t> strict_rows(static_cast<std::size_t>(strict_nnz));
-    std::vector<double> strict_values(static_cast<std::size_t>(strict_nnz));
     std::vector<double> diagonal(static_cast<std::size_t>(n), 0.0);
-    sparse_ldlt::Pattern nodes;
-    bool blocked = false;
     // Narrow fronts retain the single symbolic count pass and simplicial
-    // numeric path. Parent/count adjacency bounds fundamental-node width and
-    // internal update work without constructing its pattern; exact tail
-    // equality can only split these runs. Wide work must also amortize driver
-    // overhead across the whole matrix, including disconnected narrow nodes.
+    // numeric path. The parent/count run test gives the exact fundamental
+    // nodes (sparse_ldlt::for_each_node), so their width and internal update
+    // work are known before any row index is formed. Wide work must also
+    // amortize driver overhead across the whole matrix, including
+    // disconnected narrow nodes.
     constexpr index_t minimum_blocked_width = 320;
     constexpr double minimum_work_per_column = 3072.0;
     const auto node_work = [](index_t width, index_t height) {
@@ -719,57 +729,31 @@ template <typename Int>
         return w * (w - 1.0) * (3.0 * r - 2.0 * w + 1.0) / 6.0;
     };
     const double required_work = minimum_work_per_column * static_cast<double>(n);
-    double possible_work = 0.0;
-    for (index_t first = 0; first < n;) {
-        index_t last = first + 1;
-        while (last < n && parent[static_cast<std::size_t>(last - 1)] == last &&
-               column_counts[static_cast<std::size_t>(last - 1)] ==
-                   column_counts[static_cast<std::size_t>(last)] + 1) {
-            ++last;
-        }
-        if (last - first >= minimum_blocked_width) {
-            possible_work += node_work(last - first,
-                1 + column_counts[static_cast<std::size_t>(first)]);
-        }
-        first = last;
-    }
-    if (possible_work > 0.0 && possible_work >= required_work) {
-        std::fill(flags.begin(), flags.end(), -1);
-        std::fill(column_counts.begin(), column_counts.end(), 0);
-        for (index_t k = 0; k < n; ++k) {
-            flags[static_cast<std::size_t>(k)] = k;
-            const index_t original_col = result->perm_c_[static_cast<std::size_t>(k)];
-            for (index_t p = static_cast<index_t>(indptr[original_col]);
-                 p < static_cast<index_t>(indptr[original_col + 1]); ++p) {
-                index_t node = inverse_permutation[static_cast<std::size_t>(indices[p])];
-                if (node >= k) continue;
-                while (flags[static_cast<std::size_t>(node)] != k) {
-                    const index_t destination = strict_col_ptr[static_cast<std::size_t>(node)] +
-                        column_counts[static_cast<std::size_t>(node)]++;
-                    if (destination >= strict_col_ptr[static_cast<std::size_t>(node + 1)]) {
-                        throw std::logic_error("inconsistent symmetric symbolic counts");
-                    }
-                    strict_rows[static_cast<std::size_t>(destination)] = k;
-                    flags[static_cast<std::size_t>(node)] = k;
-                    node = parent[static_cast<std::size_t>(node)];
-                }
-            }
-        }
-        nodes = sparse_ldlt::find_nodes(parent, strict_col_ptr, strict_rows);
-        double useful_work = 0.0;
-        for (std::size_t node = 0; node + 1 < nodes.nodes.size(); ++node) {
-            const index_t first = nodes.nodes[node];
-            const index_t width = nodes.nodes[node + 1] - first;
-            if (width >= minimum_blocked_width) {
-                useful_work += node_work(width, 1 + strict_col_ptr[static_cast<std::size_t>(first + 1)] -
-                    strict_col_ptr[static_cast<std::size_t>(first)]);
-            }
-        }
-        blocked = useful_work >= required_work;
-        if (blocked) {
-            sparse_ldlt::build_row_incidence(nodes, strict_col_ptr, strict_rows);
-            sparse_ldlt::build_block_offsets(nodes, strict_col_ptr);
-        }
+    double useful_work = 0.0;
+    index_t node_count = 0;
+    index_t maximum_width = 1;
+    index_t maximum_front = 0;
+    sparse_ldlt::for_each_node(parent, column_counts, [&](index_t first, index_t last) {
+        const index_t height = 1 + column_counts[static_cast<std::size_t>(first)];
+        ++node_count;
+        maximum_width = std::max(maximum_width, last - first);
+        maximum_front = std::max(maximum_front, height);
+        if (last - first >= minimum_blocked_width) useful_work += node_work(last - first, height);
+    });
+    const bool blocked = useful_work > 0.0 && useful_work >= required_work;
+    // The simplicial kernel fills the CSC factor column by column; the
+    // blocked engine writes it at assembly, from the node blocks and tails.
+    std::vector<index_t> strict_rows(blocked ? 0 : static_cast<std::size_t>(strict_nnz));
+    std::vector<double> strict_values(blocked ? 0 : static_cast<std::size_t>(strict_nnz));
+    sparse_ldlt::Pattern nodes;
+    if (blocked) {
+        nodes.nodes.reserve(static_cast<std::size_t>(node_count + 1));
+        nodes.nodes.push_back(0);
+        sparse_ldlt::for_each_node(parent, column_counts, [&](index_t, index_t last) {
+            nodes.nodes.push_back(last);
+        });
+        sparse_ldlt::build_pattern(nodes, indices, indptr, result->perm_c_,
+            inverse_permutation, parent, strict_col_ptr, flags);
     }
     result->symbolic_seconds_ = std::chrono::duration<double>(
         Clock::now() - symbolic_start).count();
@@ -796,83 +780,99 @@ template <typename Int>
     result->peak_workspace_bytes_ = base_workspace;
     std::uint64_t numeric_updates = 0;
     // The blocked engine factors into contiguous node blocks; they become the
-    // CSC values only at assembly, after every pivot has passed. Its worker
+    // CSC factor only at assembly, after every pivot has passed. Its worker
     // team (started on first use) serves both phases.
     std::unique_ptr<double[]> blocks;
     std::optional<FactorExecutor> executor;
+    sparse_ldlt::CscFactor csc{strict_rows, strict_values, static_cast<std::size_t>(strict_nnz)};
     if (blocked) {
         executor.emplace(result->factor_threads_);
         const bool succeeded = sparse_ldlt::factorize(
             data, indices, indptr, result->perm_c_, inverse_permutation,
-            symmetric_scale, strict_col_ptr, strict_rows, nodes, blocks,
-            diagonal, kernels, *executor, result->factor_threads_, blocked_info, base_workspace);
+            symmetric_scale, nodes, blocks, csc, diagonal, kernels, *executor,
+            result->factor_threads_, blocked_info, base_workspace);
         result->peak_workspace_bytes_ = blocked_info.workspace_bytes;
         if (!succeeded) return false;
         numeric_updates = blocked_info.update_flops / 2;
-    } else for (index_t k = 0; k < n; ++k) {
-        index_t top = n;
-        flags[static_cast<std::size_t>(k)] = k;
-        accumulator[static_cast<std::size_t>(k)] = 0.0;
-        const index_t original_col = result->perm_c_[static_cast<std::size_t>(k)];
-        for (index_t p = static_cast<index_t>(indptr[original_col]);
-             p < static_cast<index_t>(indptr[original_col + 1]); ++p) {
-            const index_t original_row = static_cast<index_t>(indices[p]);
-            index_t node = inverse_permutation[static_cast<std::size_t>(original_row)];
-            if (node > k) continue;
-            accumulator[static_cast<std::size_t>(node)] += data[p] *
-                symmetric_scale[static_cast<std::size_t>(original_row)] *
-                symmetric_scale[static_cast<std::size_t>(original_col)];
+    } else {
+        // The simplicial kernel reads and writes through local base
+        // pointers: MSVC does not use type-based alias analysis, so with
+        // vector subscripts it reloaded the data pointers of the escaped
+        // factor vectors after every store of the innermost loop.
+        double* const accumulated = accumulator.data();
+        index_t* const reach = pattern.data();
+        index_t* const stack = path.data();
+        index_t* const marks = flags.data();
+        index_t* const counts = column_counts.data();
+        index_t* const rows = strict_rows.data();
+        double* const values = strict_values.data();
+        double* const pivots = diagonal.data();
+        const index_t* const order = result->perm_c_.data();
+        const index_t* const inverse = inverse_permutation.data();
+        const index_t* const parents = parent.data();
+        const index_t* const starts = strict_col_ptr.data();
+        const double* const scales = symmetric_scale.data();
+        for (index_t k = 0; k < n; ++k) {
+            index_t top = n;
+            marks[k] = k;
+            accumulated[k] = 0.0;
+            const index_t original_col = order[k];
+            for (index_t p = static_cast<index_t>(indptr[original_col]);
+                 p < static_cast<index_t>(indptr[original_col + 1]); ++p) {
+                const index_t original_row = static_cast<index_t>(indices[p]);
+                index_t node = inverse[original_row];
+                if (node > k) continue;
+                accumulated[node] += data[p] * scales[original_row] * scales[original_col];
 
-            index_t length = 0;
-            while (flags[static_cast<std::size_t>(node)] != k) {
-                path[static_cast<std::size_t>(length++)] = node;
-                flags[static_cast<std::size_t>(node)] = k;
-                node = parent[static_cast<std::size_t>(node)];
+                index_t length = 0;
+                while (marks[node] != k) {
+                    stack[length++] = node;
+                    marks[node] = k;
+                    node = parents[node];
+                }
+                while (length > 0) {
+                    reach[--top] = stack[--length];
+                }
             }
-            while (length > 0) {
-                pattern[static_cast<std::size_t>(--top)] =
-                    path[static_cast<std::size_t>(--length)];
-            }
-        }
 
-        double pivot = accumulator[static_cast<std::size_t>(k)];
-        accumulator[static_cast<std::size_t>(k)] = 0.0;
-        for (index_t position = top; position < n; ++position) {
-            const index_t source = pattern[static_cast<std::size_t>(position)];
-            const double source_value = accumulator[static_cast<std::size_t>(source)];
-            accumulator[static_cast<std::size_t>(source)] = 0.0;
-            const index_t first = strict_col_ptr[static_cast<std::size_t>(source)];
-            const index_t last = first + column_counts[static_cast<std::size_t>(source)];
-            numeric_updates += static_cast<std::uint64_t>(last - first);
-            for (index_t q = first; q < last; ++q) {
-                accumulator[static_cast<std::size_t>(
-                    strict_rows[static_cast<std::size_t>(q)])] -=
-                    strict_values[static_cast<std::size_t>(q)] * source_value;
+            double pivot = accumulated[k];
+            accumulated[k] = 0.0;
+            for (index_t position = top; position < n; ++position) {
+                const index_t source = reach[position];
+                const double source_value = accumulated[source];
+                accumulated[source] = 0.0;
+                const index_t first = starts[source];
+                const index_t last = first + counts[source];
+                numeric_updates += static_cast<std::uint64_t>(last - first);
+                for (index_t q = first; q < last; ++q) {
+                    accumulated[rows[q]] -= values[q] * source_value;
+                }
+                const double denominator = pivots[source];
+                if (!(denominator > 0.0) || !std::isfinite(denominator)) return false;
+                const double multiplier = source_value / denominator;
+                if (!std::isfinite(multiplier)) return false;
+                pivot -= multiplier * source_value;
+                const index_t destination = last;
+                rows[destination] = k;
+                values[destination] = multiplier;
+                ++counts[source];
             }
-            const double denominator = diagonal[static_cast<std::size_t>(source)];
-            if (!(denominator > 0.0) || !std::isfinite(denominator)) return false;
-            const double multiplier = source_value / denominator;
-            if (!std::isfinite(multiplier)) return false;
-            pivot -= multiplier * source_value;
-            const index_t destination = last;
-            strict_rows[static_cast<std::size_t>(destination)] = k;
-            strict_values[static_cast<std::size_t>(destination)] = multiplier;
-            ++column_counts[static_cast<std::size_t>(source)];
+            if (!(pivot > 0.0) || !std::isfinite(pivot)) return false;
+            pivots[k] = pivot;
         }
-        if (!(pivot > 0.0) || !std::isfinite(pivot)) return false;
-        diagonal[static_cast<std::size_t>(k)] = pivot;
     }
     result->numeric_seconds_ = std::chrono::duration<double>(
         Clock::now() - numeric_start).count();
 
-    if (nodes.nodes.empty()) {
-        // Simplicial factors only need diagnostics, not an O(n) node list.
-        nodes = sparse_ldlt::find_nodes(parent, strict_col_ptr, strict_rows, false);
-    }
-
     const auto assembly_start = Clock::now();
     if (blocked) {
-        sparse_ldlt::assemble(nodes, strict_col_ptr, blocks.get(), strict_values,
+        // The CSC factor, unless phase A has allocated it, is allocated only
+        // now; it coexists with the blocks until they are released.
+        sparse_ldlt::allocate_factor(csc, *executor, result->factor_threads_);
+        result->peak_workspace_bytes_ = std::max(result->peak_workspace_bytes_,
+            base_workspace + nodes.bytes() + sizeof(double) * nodes.block_ptr.back() +
+            sizeof(index_t) * strict_rows.capacity() + sizeof(double) * strict_values.capacity());
+        sparse_ldlt::assemble(nodes, strict_col_ptr, blocks.get(), strict_rows, strict_values,
             *executor, result->factor_threads_);
         blocks.reset();
         executor.reset();
@@ -900,17 +900,19 @@ template <typename Int>
             static_cast<double>(result->input_nnz_);
     result->row_updates_ = static_cast<index_t>(std::min<std::uint64_t>(
         numeric_updates, static_cast<std::uint64_t>(std::numeric_limits<index_t>::max())));
-    result->supernodes_ = nodes.node_count;
-    result->max_supernode_width_ = nodes.maximum_width;
-    result->largest_front_ = nodes.maximum_front;
+    result->supernodes_ = node_count;
+    result->max_supernode_width_ = maximum_width;
+    result->largest_front_ = maximum_front;
     result->parallel_panels_ = blocked_info.parallel_panels;
-    result->parallel_steps_ = blocked_info.parallel_panels;
+    // Concurrent subtrees count as one more parallel step.
+    result->parallel_steps_ = blocked_info.parallel_panels + (blocked_info.subtrees > 1 ? 1 : 0);
+    result->spd_subtrees_ = blocked_info.subtrees;
+    result->spd_subtree_seconds_ = blocked_info.subtree_seconds;
     result->dense_update_flops_ = blocked_info.update_flops;
     result->spd_panel_entries_ = blocked_info.maximum_panel_entries;
     result->spd_source_seconds_ = blocked_info.source_seconds;
     result->spd_panel_seconds_ = blocked_info.panel_seconds;
     result->spd_pack_seconds_ = blocked_info.pack_seconds;
-    if (!blocked) result->peak_workspace_bytes_ += nodes.nodes.capacity() * sizeof(index_t);
     result->assembly_seconds_ = std::chrono::duration<double>(
         Clock::now() - assembly_start).count();
     result->factor_seconds_ = result->symbolic_seconds_ +
@@ -2320,7 +2322,7 @@ nb::dict NativeSparseLU::stats() const {
     output["assembly_seconds"] = assembly_seconds_;
     output["num_threads"] = factor_threads_;
     output["threading_backend"] =
-        ((!column_storage_ && factor_threads_ > 1) || parallel_panels_ > 0)
+        ((!column_storage_ && factor_threads_ > 1) || parallel_steps_ > 0)
             ? "std::thread" : "serial";
     output["parallel_steps"] = parallel_steps_;
     output["pivot_swaps"] = pivot_swaps_;
@@ -2342,6 +2344,8 @@ nb::dict NativeSparseLU::stats() const {
     output["spd_source_seconds"] = spd_source_seconds_;
     output["spd_panel_seconds"] = spd_panel_seconds_;
     output["spd_pack_seconds"] = spd_pack_seconds_;
+    output["spd_subtrees"] = spd_subtrees_;
+    output["spd_subtree_seconds"] = spd_subtree_seconds_;
     output["ordering_estimated_l_nnz"] = ordering_estimated_l_nnz_;
     output["ordering_estimated_max_front"] = ordering_estimated_max_front_;
     output["numeric_probe_columns"] = numeric_probe_columns_;
