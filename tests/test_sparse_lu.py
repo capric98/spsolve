@@ -1,7 +1,9 @@
 import unittest
+from fractions import Fraction
 
 import numpy as np
 from numpy.testing import assert_allclose, assert_array_equal
+from scipy.linalg import hadamard
 from scipy.sparse import block_diag, csc_array, diags, random_array, tril
 
 from spsolve import SparseLU, factorized, splu
@@ -20,7 +22,70 @@ def general_matrix(n: int, density: float, seed: int) -> csc_array:
     return csc_array(matrix + diags(diagonal, format="csc"), dtype=np.float64)
 
 
+def exact_partial_pivoting(matrix, factor, diag_pivot_thresh=1.0):
+    """Row order of threshold partial pivoting in exact arithmetic.
+
+    Eliminates the scaled matrix in the factor's column order with the
+    documented rule: the largest magnitude, replaced by the preferred row
+    perm_c[k] when it reaches the threshold, with exact ties among the largest
+    broken by the smallest current row position (rows start at their labels,
+    and each pivot swaps positions with the row at position k). Returns the
+    row order, the number of columns a position tie decided, and whether every
+    value was dyadic, in which case floating-point elimination is exact too.
+    """
+    dense = matrix.toarray()
+    n = dense.shape[0]
+    position = list(range(n))
+    row_at = list(range(n))
+    pivoted = set()
+    columns = []
+    ties = 0
+    dyadic = True
+    for k in range(n):
+        col = int(factor.perm_c[k])
+        values = {
+            int(row): Fraction(float(
+                dense[row, col] * factor.row_scale[row] * factor.col_scale[col]))
+            for row in np.flatnonzero(dense[:, col])
+        }
+        for pivot_row, multipliers in columns:
+            coefficient = values.get(pivot_row, 0)
+            if coefficient:
+                for row, multiplier in multipliers.items():
+                    values[row] = values.get(row, Fraction(0)) - multiplier * coefficient
+        dyadic = dyadic and all(
+            value.denominator & (value.denominator - 1) == 0 for value in values.values()
+        )
+        candidates = {row: value for row, value in values.items() if row not in pivoted}
+        maximum = max(abs(value) for value in candidates.values())
+        largest = [row for row, value in candidates.items() if abs(value) == maximum]
+        pivot = min(largest, key=position.__getitem__)
+        preferred = candidates.get(col, 0)
+        if preferred != 0 and abs(preferred) >= diag_pivot_thresh * maximum:
+            pivot = col
+        elif len(largest) > 1:
+            ties += 1
+        old, displaced = position[pivot], row_at[k]
+        row_at[k], row_at[old] = pivot, displaced
+        position[pivot], position[displaced] = k, old
+        pivoted.add(pivot)
+        value = candidates[pivot]
+        columns.append((pivot, {
+            row: entry / value for row, entry in candidates.items()
+            if row != pivot and entry != 0
+        }))
+    return row_at, ties, dyadic
+
+
 class SparseLUTests(unittest.TestCase):
+    def assert_same_factors(self, first, second):
+        for name in ("perm_r", "perm_c", "row_scale", "col_scale"):
+            assert_array_equal(getattr(first, name), getattr(second, name))
+        for name in ("L", "U"):
+            for field in ("indptr", "indices", "data"):
+                assert_array_equal(getattr(getattr(first, name), field),
+                                   getattr(getattr(second, name), field))
+
     def assert_factor_identity(self, matrix, factor, *, atol=2e-13):
         self.assertEqual(factor.nnz, factor.L.nnz + factor.U.nnz)
         scaled = csc_array(
@@ -252,6 +317,163 @@ class SparseLUTests(unittest.TestCase):
                     with self.assertRaisesRegex(np.linalg.LinAlgError, "singular"):
                         splu(csc_array(duplicated), backend="native",
                              permc_spec=ordering, num_threads=threads)
+
+    def test_left_looking_random_bands_are_accurate_and_thread_invariant(self):
+        # Narrow bands with uniform, +-1 and small-integer values (the last
+        # two full of ties), half of them row-permuted and some with entries
+        # outside the band. A column's search order depends only on the
+        # matrix and the pivots so far, so every thread count gives the same
+        # factors, and threshold 1 keeps every multiplier at most 1.
+        rng = np.random.default_rng(6061)
+        samplers = (
+            lambda size: rng.uniform(-1.0, 1.0, size),
+            lambda size: rng.choice([-1.0, 1.0], size=size),
+            lambda size: rng.choice([-3.0, -2.0, -1.0, 1.0, 2.0, 3.0], size=size),
+        )
+        n = 300
+        expected = rng.normal(size=n)
+        for case in range(6):
+            values = samplers[case % 3]
+            # Draw until the matrix is well conditioned (deterministic).
+            while True:
+                offsets = sorted({0, *rng.integers(-6, 7, size=4).tolist()})
+                matrix = diags([values(n - abs(offset)) for offset in offsets], offsets,
+                               shape=(n, n), format="csc")
+                if case >= 3:
+                    rows = rng.integers(0, n, size=12)
+                    cols = np.clip(rows + rng.integers(-40, 41, size=12), 0, n - 1)
+                    matrix = matrix + csc_array((values(12), (rows, cols)), shape=(n, n))
+                matrix = csc_array(matrix)
+                matrix.eliminate_zeros()
+                if np.linalg.cond(matrix.toarray()) < 1e8:
+                    break
+            permuted = case % 2 == 0
+            if permuted:
+                matrix = csc_array(matrix[rng.permutation(n), :])
+            for ordering in ("COLAMD",) if permuted else ("COLAMD", "MMD_AT_PLUS_A"):
+                with self.subTest(case=case, ordering=ordering):
+                    factors = [
+                        splu(matrix, backend="native", permc_spec=ordering, num_threads=threads)
+                        for threads in (1, 2, 3, 8)
+                    ]
+                    reference = factors[0]
+                    self.assertEqual(reference.stats["numeric_engine"], "left-looking-csc")
+                    self.assertLessEqual(abs(reference.L).max(), 1.0)
+                    self.assert_factor_identity(matrix, reference)
+                    assert_allclose(
+                        reference.solve(matrix @ expected, iterative_refinement=False),
+                        expected, rtol=1e-9, atol=1e-9,
+                    )
+                    for factor in factors[1:]:
+                        self.assert_same_factors(reference, factor)
+
+    def test_left_looking_breaks_exact_ties_by_row_position(self):
+        # Sign-flipped 8x8 Hadamard blocks under a random row permutation:
+        # every elimination value is dyadic, so floating-point elimination is
+        # exact in whatever order updates reach an entry, and most columns
+        # hold several largest candidates of equal magnitude. The pivots must
+        # be those of the documented rule.
+        rng = np.random.default_rng(0)
+        block = hadamard(8).astype(np.float64)
+        matrix = csc_array(block_diag(
+            [block * rng.choice([-1.0, 1.0], size=(8, 1)) for _ in range(16)],
+            format="csc",
+        ))
+        matrix = csc_array(matrix[rng.permutation(matrix.shape[0]), :])
+        for ordering in ("COLAMD", "MMD_AT_PLUS_A"):
+            factors = []
+            for threads in (1, 4):
+                with self.subTest(ordering=ordering, threads=threads):
+                    factor = splu(matrix, backend="native", permc_spec=ordering,
+                                  num_threads=threads)
+                    factors.append(factor)
+                    self.assertEqual(factor.stats["numeric_engine"], "left-looking-csc")
+                    order, ties, dyadic = exact_partial_pivoting(matrix, factor)
+                    self.assertTrue(dyadic)
+                    self.assertGreater(ties, 64)
+                    assert_array_equal(factor.perm_r, order)
+                    self.assert_factor_identity(matrix, factor, atol=0.0)
+            self.assert_same_factors(*factors)
+
+    def test_left_looking_duplicated_row_of_permuted_band_is_singular(self):
+        # Two equal rows receive the same updates in the same order: each
+        # update comes from a column that both rows depend on, and the search
+        # places such columns before the one that pivots the first copy. The
+        # second copy therefore cancels exactly in any search order.
+        rng = np.random.default_rng(7171)
+        n = 400
+        offsets = [-7, -1, 0, 2, 9]
+        band = diags(
+            [rng.choice([-3.0, -2.0, -1.0, 1.0, 2.0, 3.0], size=n - abs(offset))
+             for offset in offsets],
+            offsets, shape=(n, n), format="csc",
+        ).toarray()
+        band[211, :] = band[173, :]
+        perturbed = band.copy()
+        perturbed[211, 173] += 0.5
+        for ordering, rows in (("COLAMD", rng.permutation(n)),
+                               ("MMD_AT_PLUS_A", np.arange(n))):
+            factor = splu(csc_array(perturbed[rows, :]), backend="native",
+                          permc_spec=ordering)
+            self.assertEqual(factor.stats["numeric_engine"], "left-looking-csc")
+            for threads in (1, 4):
+                with self.subTest(ordering=ordering, threads=threads):
+                    with self.assertRaisesRegex(np.linalg.LinAlgError, "singular"):
+                        splu(csc_array(band[rows, :]), backend="native",
+                             permc_spec=ordering, num_threads=threads)
+
+    def test_colamd_probe_restart_bounds_discarded_reservations(self):
+        # A restarted probe's discarded CSC arrays count as workspace at their
+        # capacity. Each of the four arrays reserves at most a dense triangle,
+        # and a probe that must restart (an input column wider than the
+        # 192-row reach limit) reserves only O(n) entries.
+        for dense_size in (140, 260):
+            with self.subTest(dense_size=dense_size):
+                rng = np.random.default_rng(555)
+                dense = rng.uniform(-0.5, 0.5, size=(dense_size, dense_size))
+                dense += 300.0 * np.eye(dense_size)
+                matrix = csc_array(block_diag((np.eye(40), dense), format="csc"))
+                n = matrix.shape[0]
+                matrix = csc_array(matrix[rng.permutation(n), :])
+                factor = splu(matrix, backend="native", permc_spec="COLAMD")
+                self.assertTrue(factor.stats["numeric_probe_fallback"])
+                workspace = factor.stats["peak_workspace_bytes"]
+                if dense_size > 192:
+                    self.assertLess(workspace, 256 * n)
+                else:
+                    # Probe vectors, restart snapshot and column pointers,
+                    # then four arrays of 8-byte entries.
+                    fixed = 8 * (11 * n + 2 * (n + 1))
+                    self.assertLessEqual(workspace, fixed + 32 * (n * (n + 1) // 2))
+                    self.assertGreater(workspace, 256 * n)
+
+    def test_colamd_probe_restart_after_staged_reserve_reports_its_arrays(self):
+        # A narrow band (7 entries per column) beside a full band of
+        # half-width 95 (191 entries per column, so the restart is not certain
+        # from the input): the probe passes the reserve's second stage after
+        # max(256, n / 16) columns, then restarts in the wide part. The
+        # discarded arrays it reports are sized from the factor so far, a few
+        # entries per row, not from nnz(A), which the wide part dominates.
+        rng = np.random.default_rng(91)
+
+        def band(size, half):
+            offsets = list(range(-half, half + 1))
+            return diags([rng.uniform(-1.0, 1.0, size - abs(offset)) for offset in offsets],
+                         offsets, shape=(size, size), format="csc")
+
+        matrix = csc_array(block_diag((band(3000, 3), band(600, 95)), format="csc"))
+        n = matrix.shape[0]
+        matrix = csc_array(matrix[rng.permutation(n), :])
+        factor = splu(matrix, backend="native", permc_spec="COLAMD")
+        stats = factor.stats
+        self.assertEqual(stats["numeric_engine"], "row-hybrid")
+        self.assertTrue(stats["numeric_probe_fallback"])
+        self.assertGreater(stats["numeric_probe_columns"], max(256, n // 16))
+        fixed = 8 * (11 * n + 2 * (n + 1))
+        self.assertLess(stats["peak_workspace_bytes"], fixed + 32 * 16 * n)
+        # The bound is well below a reserve of 2 * nnz(A) entries per array.
+        self.assertLess(16 * n, matrix.nnz // 4 * 2)
+        self.assert_factor_identity(matrix, factor)
 
     def test_adaptive_csc_engines_on_random_patterns(self):
         for seed in range(5):

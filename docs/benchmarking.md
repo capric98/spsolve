@@ -154,7 +154,77 @@ SuperLU's 7.4 ms (`MMD_AT_PLUS_A`, eight threads).
 
 ## Current status
 
+### State after the left-looking search change
+
+Measured on 2026-10-09 with this change applied to `c46bda9` (the
+left-looking search start order, search formulation and staged storage
+reserve; see "Left-looking CSC LU" in
+[the design notes](native-lu.md#left-looking-csc-lu)), on the machine and
+software of the next section, otherwise idle. Three consecutive `COLAMD`
+gate runs, then three consecutive `MMD_AT_PLUS_A` gate runs, one at a time
+(`build/review/step6a_r2_gate_{colamd,mmd}_{1,2,3}.json`; not tracked):
+
+```bash
+python benchmarks/factorization.py --threads 8 --repeats 5 --gate --extended --dense-lu --permc-spec COLAMD
+python benchmarks/factorization.py --threads 8 --repeats 5 --gate --extended --dense-lu
+```
+
+All six runs passed every case. Every relative backward residual was at most
+5.7e-16, and every case produced identical one- and eight-thread
+permutations. Medians of the three runs in milliseconds, ratios as in the
+next section (the median of the per-run ratios, with the range); `COLAMD`:
+
+| case | native 1 thread | native 8 threads | SuperLU | N/S | N1/S | engine |
+|---|---:|---:|---:|---:|---:|---|
+| 2-D Poisson, n=8,100 | 8.04 | 7.97 | 10.4 | 0.76 (0.76-0.79) | 0.77 (0.77-0.82) | simplicial LDL^T |
+| irregular, n=2,500 | 125 | 69.2 | 270 | 0.25 (0.25-0.26) | 0.46 (0.46-0.47) | row hybrid |
+| pivot-heavy, n=2,000 | 85.6 | 53.8 | 201 | 0.27 | 0.43 (0.42-0.45) | row hybrid |
+| 3-D Poisson, n=8,000 | 64.5 | 34.8 | 137 | 0.25 (0.25-0.26) | 0.47 (0.46-0.47) | supernodal LDL^T |
+| nonsymmetric band, n=8,000 | 3.33 | 3.32 | 4.61 | 0.72 (0.71-0.73) | 0.72 (0.72-0.74) | left-looking CSC |
+| `sparse-dense-border`, n=20,600 | 722 | 368 | 562 | 0.65 (0.65-0.66) | 1.29 (1.28-1.31) | row hybrid |
+| row-permuted band, n=20,000 | 12.9 | 12.9 | 17.3 | 0.75 (0.71-0.76) | 0.75 (0.74-0.76) | left-looking CSC |
+| dense LU, 600 | 10.3 | 7.78 | 9.88 | 0.77 (0.76-0.83) | 1.04 (1.01-1.06) | row hybrid |
+| row-pivoted dense LU, 600 | 10.7 | 8.15 | 10.3 | 0.79 (0.77-0.82) | 1.05 (1.04-1.06) | row hybrid |
+| four dense LU blocks of 600 | 41.2 | 31.2 | 39.8 | 0.78 (0.76-0.80) | 1.04 (1.01-1.05) | row hybrid |
+| five dense LU blocks of 600 | 51.3 | 39.7 | 49.7 | 0.80 (0.75-0.81) | 1.03 (1.01-1.04) | row hybrid |
+| eight dense LU blocks of 600 | 87.4 | 67.8 | 83.7 | 0.81 (0.81-0.83) | 1.05 (1.04-1.05) | row hybrid |
+| four dense SPD blocks of 600 | 31.4 | 22.3 | 39.8 | 0.56 (0.56-0.58) | 0.78 (0.78-0.81) | supernodal LDL^T |
+
+`MMD_AT_PLUS_A`:
+
+| case | native 1 thread | native 8 threads | SuperLU | N/S | N1/S | engine |
+|---|---:|---:|---:|---:|---:|---|
+| 2-D Poisson, n=8,100 | 4.55 | 4.51 | 7.47 | 0.61 (0.59-0.61) | 0.61 (0.59-0.62) | simplicial LDL^T |
+| irregular, n=2,500 | 71.4 | 40.6 | 190 | 0.21 (0.21-0.23) | 0.37 (0.37-0.39) | row hybrid |
+| pivot-heavy, n=2,000 | 101 | 64.4 | 243 | 0.26 (0.26-0.28) | 0.41 (0.41-0.45) | row hybrid |
+| 3-D Poisson, n=8,000 | 23.4 | 14.2 | 191 | 0.07 | 0.12 | supernodal LDL^T |
+| nonsymmetric band, n=8,000 | 2.37 | 2.38 | 3.56 | 0.66 (0.65-0.67) | 0.66 (0.64-0.67) | left-looking CSC |
+| `sparse-dense-border`, n=20,600 | 199 | 163 | 292 | 0.56 (0.55-0.57) | 0.68 (0.68-0.69) | row hybrid |
+| dense LU, 600 | 9.72 | 7.47 | 10.5 | 0.70 (0.68-0.74) | 0.96 (0.91-0.98) | row hybrid |
+| row-pivoted dense LU, 600 | 10.4 | 7.52 | 10.5 | 0.72 (0.71-0.72) | 1.00 (0.98-1.00) | row hybrid |
+| four dense LU blocks of 600 | 39.6 | 28.4 | 40.9 | 0.69 (0.68-0.75) | 0.97 (0.96-0.97) | row hybrid |
+| five dense LU blocks of 600 | 49.3 | 36.7 | 51.1 | 0.72 (0.71-0.73) | 0.96 (0.96-0.97) | row hybrid |
+| eight dense LU blocks of 600 | 81.3 | 56.6 | 81.0 | 0.71 (0.69-0.72) | 1.00 (0.98-1.05) | row hybrid |
+| four dense SPD blocks of 600 | 28.7 | 20.4 | 40.2 | 0.51 (0.50-0.52) | 0.72 (0.71-0.72) | supernodal LDL^T |
+
+Only the two left-looking cases changed: the row-permuted band from 1.16
+(1.14-1.17) to 0.75 times SuperLU's time with eight threads, and the
+nonsymmetric band from 0.89 to 0.72 (`COLAMD`) and from 0.77 to 0.66
+(`MMD_AT_PLUS_A`); see "Row-permuted band" below. Every other case gave
+bitwise identical permutations, scales, `L` and `U` to `c46bda9` at one and
+eight threads, with the same engines and probe decisions. Their median times
+moved by -8% to +4% against the final roadmap runs below, without a
+consistent sign (every function outside `factorize_left_looking` compiles
+to identical machine code; MSVC `/FAs` listings). The probe of a restart
+takes the same time as before (0.1 ms on pivot-heavy and irregular); its
+`peak_workspace_bytes` is unchanged except for pivot-heavy with `COLAMD`,
+0.50 instead of 0.42 MB, whose probe passed the second stage of the storage
+reserve before restarting (see the design notes).
+
 ### State after the roadmap
+
+These tables are superseded for the two left-looking cases by the section
+above; the other cases factor identically.
 
 Measured on 2026-10-09 at `105fe2c`, the last commit of the performance
 roadmap whose Step 0 baseline is `4fce891`: Windows 10 x64 (build 19044),
@@ -223,7 +293,8 @@ run is `build/review/final_{mmd,colamd}_{1,2,3}.json` (not tracked).
 
 The promotion ordering, `MMD_AT_PLUS_A`, thus passed three consecutive runs
 on this Windows build; `COLAMD` did not, because of the row-permuted band
-(`COLAMD` is the default `permc_spec` of `splu` and `spsolve`). No Linux x64
+(`COLAMD` is the default `permc_spec` of `splu` and `spsolve`), until the
+left-looking search change above. No Linux x64
 release-build gate run has been made since these changes (CI runs
 the test suite and the `--quick` smoke benchmark without `--gate`), so the
 promotion rule below is not met and `NATIVE_DEFAULT` stays `False`.
@@ -304,7 +375,9 @@ cases, with the connected and five-block cases at 1.48, besides the
 row-permuted band. Every eight-thread ratio except the row-permuted band's
 stayed at or below 0.94. On a CPU without AVX2 and FMA the one-thread
 criterion is therefore marginal for dense general LU with `COLAMD`; these are
-single runs, and a runner's own CPU decides which kernel it uses.
+single runs, and a runner's own CPU decides which kernel it uses. The
+left-looking cases do not use the dense kernel; for their current ratios see
+the first section.
 
 ### Row-permuted band (`COLAMD`)
 
@@ -317,8 +390,9 @@ factor entries, the same as SuperLU. The roadmap did not optimize this
 engine's numeric loop (`02ae72b` added a finiteness test of every pivot
 candidate, and `1cc9dd5` reduced the probe's restart snapshot to the fields
 the probe writes and sped up the validation and equilibration shared by all
-engines, both with bitwise identical factors), and the case still fails the
-eight-thread criterion. In the gate runs native spends 8.0-8.2 ms in COLAMD
+engines, both with bitwise identical factors), and at its end (`105fe2c` and
+`c46bda9`) the case failed the eight-thread criterion. In those gate runs
+native spent 8.0-8.2 ms in COLAMD
 (`ordering_seconds`), 10.8-11.3 ms in the left-looking factorization
 (`numeric_seconds`, all of it the successful probe, including the copy of
 its restart snapshot: 20,000 columns, 1,259,452 scalar updates), and under
@@ -332,36 +406,95 @@ COLAMD ordering takes about 7.7 ms (the `NATURAL` run still computes the
 column elimination tree and postorder). The ordering costs are therefore
 close (on a copy whose rows are relabeled by their first appearance in the
 column order, native COLAMD takes 4.8 ms instead of 8.0-8.3 ms in the same
-runs, and SuperLU's ordering 4.6 instead of 7.7 ms), and the gap is the
+runs, and SuperLU's ordering 4.6 instead of 7.7 ms), and the gap was the
 left-looking numeric phase: about 11 ms against SuperLU's 9.5 ms for its
 whole factorization.
 
-The case is sensitive to the allocator state of the process. Run alone in a
-fresh process with eight threads it takes 21.6-22.1 ms (1.25-1.28 times the
-SuperLU time of the same runs), with about 5,100 page faults per one-thread
-factorization; after the larger `sparse-dense-border` factorizations that
-precede it in the benchmark it takes 19.8-20.0 ms (the medians above) and
-about 3,000 page faults. The `L` and `U` arrays start with room for `3.3 * n`
-entries when no AMD estimate exists (as with `COLAMD`) and are reallocated
-three times each on the way to their 159,953 and 199,925 entries, touching
-fresh pages at every step. SuperLU's time does not depend on the process
-state.
+At `c46bda9` the case was sensitive to the allocator state of the process.
+Run alone in a fresh process with eight threads it took 21.6-22.1 ms
+(1.25-1.28 times the SuperLU time of the same runs), with about 5,100 page
+faults per one-thread factorization; after the larger `sparse-dense-border`
+factorizations that precede it in the benchmark it took 19.8-20.0 ms and
+about 3,000 page faults. The `L` and `U` arrays started with room for
+`3.3 * n` entries when no AMD estimate exists (as with `COLAMD`) and were
+reallocated three times each on the way to their 159,953 and 199,925
+entries, touching fresh pages at every step. SuperLU's time does not depend
+on the process state.
 
-Scratch prototypes (not in the repository and not part of `105fe2c`) located
-the remaining cost; their times are with eight threads, and their ratios are
-against the SuperLU time of the same runs (17.2-17.5 ms). Reserving each
-factor array for `2.3 * nnz(A) + n` entries (about 250,000 here; bitwise
-identical factors) took the case to 18.9-19.4 ms (1.09-1.11 times SuperLU)
-in a fresh process and 18.2 ms (1.05 times) in the benchmark order.
-Starting each column's depth-first search from its entries in increasing
-pivot position instead of their stored order (factors changed only in the
-last bits on the benchmark bands) took it to 19.5 ms (1.12 times) in a fresh
-process on its own, and together with the reserve to 16.3 ms (0.94 times) in
-a fresh process and 15.7 ms (0.90 times) in the benchmark order. In the fresh
-process the numeric phase fell from 12.5 ms to 9.8-10.1 ms with the reserve,
-to 10.5 ms with the search order, and to 7.2 ms with both. Relabeling the
-rows for memory locality without changing the traversal order gave nothing,
-so the traversal order, not the locality of the row labels, costs the time.
+Scratch prototypes (not part of `c46bda9`) located the remaining cost:
+reserving each factor array for `2.3 * nnz(A) + n` entries, and starting
+each column's depth-first search from its entries in increasing pivot
+position. Relabeling the rows for memory locality without changing the
+traversal order gave nothing, so the traversal order, not the locality of
+the row labels, cost the time. This change (see "Left-looking CSC LU" in
+[the design notes](native-lu.md#left-looking-csc-lu)) reserves the factor
+arrays in two stages, extrapolating each one's size after the first
+`max(256, n / 16)` columns (bitwise identical factors; here `L` and `U`
+reach 159,953 and 199,925 entries without further growth), starts each
+search from the column's pivoted row of smallest pivot position and then
+from its rows in stored order (cheaper than the prototype's sort on bands
+with pivoting), scatters the column in the pass that finds that row, and
+runs the search without pushing unpivoted rows (bitwise identical to the
+earlier search for the same start order). The start order changes the
+factors in the last bits: on this band by at most 2.2e-16 of the largest `U`
+entry, with identical permutations and pattern.
+
+Interleaved runs against `c46bda9` (`avx2-fma`, eight threads, medians of
+five rounds, six for the fresh-process band; ratios against the SuperLU time
+of the same runs; times in ms):
+
+| case | process | `c46bda9` | this change | N/S before | N/S after | numeric before | numeric after | page faults per one-thread factorization |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| row-permuted band | fresh | 21.6 | 14.0 | 1.26 (1.23-1.28) | 0.81 (0.80-0.82) | 12.4 | 5.0 | 5,093 to 2,770 |
+| row-permuted band | after `sparse-dense-border` | 19.7 | 13.2 | 1.15 (1.13-1.16) | 0.76 (0.68-0.78) | 10.9 | 4.6 | 3,038 to 1,874 |
+| nonsymmetric band, `COLAMD` | fresh | 5.34 | 4.17 | 1.16 (1.12-1.18) | 0.89 (0.88-0.92) | 3.12 | 1.95 | 1,425 to 1,045 |
+| nonsymmetric band, `MMD_AT_PLUS_A` | fresh | 3.10 | 2.66 | 0.85 (0.83-0.92) | 0.76 (0.74-0.79) | 1.86 | 1.44 | 272 to 273 |
+
+With one thread (the engine is serial) the row-permuted band took 13.9
+instead of 21.7 ms in a fresh process (N1/S 1.27 to 0.80) and 12.9 instead
+of 19.7 ms after `sparse-dense-border` (1.14 to 0.75). The fresh-process
+nonsymmetric band with `COLAMD` also exceeded 1.05 before (1.16; 0.89 in the
+benchmark order). Row-engine controls with `COLAMD` in the same kind of runs
+stayed within 1% (connected dense LU of size 600: 11.2 instead of 11.3 ms
+with one thread, 8.02 ms with eight in both; pivot-heavy: 95.1 instead of
+94.5 ms and 55.5 instead of 55.7 ms).
+
+A scratch build with a switch for each part of the first version of this
+change (which reserved the ceiling at once) measured the fresh-process
+eight-thread numeric phase of the row-permuted band at 13.1 ms with none of
+them, 10.3 ms with the reserve alone, 10.0 ms with the start order alone,
+11.0 ms with the search formulation alone and 5.4 ms with all three (five
+rounds). On other left-looking families the one-thread numeric phase
+(medians of five interleaved rounds of 13 factorizations each, or six of 21
+for the last four rows, where the end-to-end time is given as well) changed
+as follows:
+
+| matrix | ordering | n | `c46bda9` | this change |
+|---|---|---:|---:|---:|
+| nonsymmetric band, rows in order | `COLAMD` | 20,000 | 6.47 | 3.87 |
+| band of the benchmark offsets, random values, rows permuted | `COLAMD` | 20,000 | 11.3 | 7.23 |
+| same, diagonally dominant | `COLAMD` | 20,000 | 10.5 | 4.52 |
+| band with offsets -12, -5, -1, 0, 3, 8, 15, rows permuted | `COLAMD` | 20,000 | 22.0 | 13.8 |
+| full band of half-width 3, rows permuted | `COLAMD` | 50,000 | 12.5 | 8.81 |
+| same, rows in order | `COLAMD` | 50,000 | 10.0 | 6.93 |
+| full band of half-width 8, rows permuted | `COLAMD` | 20,000 | 14.3 | 9.03 |
+| half-width-2 band with 400 entries within 30 of the diagonal, rows permuted | `COLAMD` | 20,000 | 2.80 | 2.23 |
+| 2-D convection-diffusion, 60 by 60 | `MMD_AT_PLUS_A` | 3,600 | 6.65 | 4.01 |
+| `banded-nonsym` | `MMD_AT_PLUS_A` | 8,000 | 1.62 | 1.24 |
+| upper triangular, 10 entries per column (end to end) | `COLAMD` | 200,000 | 29.8 (84.5) | 21.0 (72.8) |
+| nonsymmetric tridiagonal (end to end) | `COLAMD` | 200,000 | 10.9 (29.1) | 10.9 (29.1) |
+| same (end to end) | `MMD_AT_PLUS_A` | 200,000 | 8.71 (23.0) | 9.32 (23.6) |
+
+The full bands have uniform random values in (-1, 1), so they pivot. The
+tridiagonal matrix with `MMD_AT_PLUS_A`, which that ordering eliminates in
+reverse, is the one regression: 6-7% in the numeric phase and 1.5-3% end
+to end in interleaved runs, including an independent review's (see the
+design notes). Where the
+probe restarts, its discarded work got cheaper as well: the 2-D
+convection-diffusion matrix with `COLAMD` took 16.5 instead of 17.7 ms in
+its numeric phase, and a random sparse matrix (n=4,000, about three
+entries per column) 52.5 instead of 54.7 ms, with overlapping per-round
+ranges.
 
 Other orderings: with `MMD_AT_PLUS_A` the row permutation destroys the
 structure of `A + A.T`; native uses the row-hybrid engine (175 ms with one
@@ -370,8 +503,10 @@ thread, 147 ms with eight, 1.10 million factor entries) while SuperLU takes
 left-looking engine, and the row-hybrid engine takes 19-22 ms against
 SuperLU's 8.9-9.1 ms (2.1-2.5 times in three runs here, 2.3-2.6 times in an
 independent review; the unpermuted 8,000-row band also takes 2.4 times
-SuperLU's time with `NATURAL`). A scratch prototype that also runs the
-`COLAMD` probe for `NATURAL`, with both changes above, took 7.1-8.2 ms on the
+SuperLU's time with `NATURAL`; measured at `c46bda9`, unaffected by the
+change above). A scratch prototype that also runs the `COLAMD` probe for
+`NATURAL`, with the prototype's reserve and sorted search start, took
+7.1-8.2 ms on the
 row-permuted band (0.81-0.89 times the SuperLU time of the same runs,
 8.7-9.2 ms) and 2.4 ms on the unpermuted band (0.86-0.87 times the SuperLU
 time of the same run). See the limitations in

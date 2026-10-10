@@ -55,7 +55,8 @@ python benchmarks/factorization.py --threads 8 --repeats 5 --gate   # promotion 
   otherwise idle machine; medians of batched samples are still noisy at a few
   percent, so re-run before calling a change a regression.
 - Small allocation-heavy cases depend on what ran earlier in the process (the
-  row-permuted band is about 10% faster after `sparse-dense-border`); compare
+  row-permuted band is about 6-7% faster after `sparse-dense-border`; about
+  10% at `c46bda9`); compare
   runs with the same case order.
 - Keep a JSON of the state before your change and compare `native_1_seconds`,
   `native_n_seconds`, `numeric_seconds`, `dense_rows`, `lu_*`, `parallel_*`,
@@ -166,9 +167,10 @@ python benchmarks/factorization.py --threads 8 --repeats 5 --gate   # promotion 
 ## Known gaps
 
 The native backend stays opt-in (`backend="native"`) until the gate passes on
-Windows and Linux release builds. As of `105fe2c` the `MMD_AT_PLUS_A` gate
-(`--extended --dense-lu`) passes three consecutive Windows runs; the `COLAMD`
-runs fail only on `permuted-band` (left-looking CSC), and no Linux gate run
-exists. Current performance gaps and the planned
+Windows and Linux release builds. Since the left-looking start-order and
+staged-reserve change that followed `c46bda9`, the `--extended --dense-lu`
+gate has passed three consecutive Windows runs with both `MMD_AT_PLUS_A` and
+`COLAMD` (`MMD_AT_PLUS_A` also at `105fe2c`); no Linux gate run exists.
+Current performance gaps and the planned
 fixes are summarized at the end of `docs/native-lu.md` and in the status tables
 of `docs/benchmarking.md`.

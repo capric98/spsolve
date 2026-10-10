@@ -127,7 +127,36 @@ $$x_i \leftarrow x_i - l_{ij}\, x_j \quad \text{for } i \in \mathrm{Struct}(l_{:
 
 Gilbert and Peierls showed that with this organisation the total time is
 $O(\mathrm{flops}(LU))$ plus the input size, independent of fill, which is
-why the engine is used for narrow fronts. The COLAMD "probe" runs this
+why the engine is used for narrow fronts.
+
+Any topological order of the reach is correct: an entry $x_i$ receives one
+update from each reached column $j$ with $l_{ij} \ne 0$, and every such $j$
+is finished (its $x_j$ final) before it is applied. In exact arithmetic the
+result does not depend on the order; in floating point the order in which
+the updates reach $x_i$ decides the rounding, so changing the search changes
+the factors in the last bits, and can change a pivot wherever two candidates
+are equal or within rounding error of each other, including the preferred
+row against the threshold. Which order the
+search produces depends on the order of its start rows and of each column's
+edges. The engine starts with the column's pivoted row of smallest pivot
+position, then takes the column's rows in stored order. In a band the first
+search then typically reaches every other pivoted row of the column, so the
+traversal is the same for every column whatever the row labels are; it
+examines the same edges as any other start order, and the gain is in how
+regularly the work is executed (see "Left-looking CSC LU" in
+`docs/native-lu.md`). Two equal rows remain exactly equal until one of them
+is pivoted, and the other then cancels exactly, in any topological order:
+both receive their updates from the same columns, all of which precede the
+pivoting column. Other exact cancellations (a column equal to another, a row
+equal to an integer combination of rows) are exact only if the rounding
+happens to agree, so for such a matrix, singular to working precision,
+whether a computed pivot is exactly zero (Section 3) can change with the
+order in either direction.
+
+The search keeps only suspended pivoted rows on its stack: an unpivoted row
+has no outgoing edges, so it finishes as soon as it is reached and is written
+to the reach at once, which is exactly where a search that pushed and popped
+it would write it. The COLAMD "probe" runs this
 algorithm with budgets (reach above 192 rows, more than $8192$ updates in one
 column, more than $64\,\mathrm{nnz}(A)$ updates in total, or more than
 $20\,\mathrm{nnz}(A)$ factor entries) and restarts in the row engine when a

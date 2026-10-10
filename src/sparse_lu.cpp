@@ -938,15 +938,78 @@ bool factorize_left_looking(
     result->l_col_ptr_.assign(static_cast<std::size_t>(n + 1), 0);
     result->u_col_ptr_.assign(static_cast<std::size_t>(n + 1), 0);
 
+    // Bound discarded COLAMD work by the input size, and leave genuinely wide
+    // or expensive columns to the row engine. These limits use this ordering
+    // and its actual pivots, rather than an unrelated symmetric graph.
+    constexpr index_t probe_front_limit = 192;
+    constexpr std::uint64_t probe_column_update_limit = 8'192;
+    const auto scaled_budget = [&](std::uint64_t multiplier) {
+        const auto nnz = static_cast<std::uint64_t>(result->input_nnz_);
+        const auto maximum = std::numeric_limits<std::uint64_t>::max();
+        return nnz > maximum / multiplier ? maximum : nnz * multiplier;
+    };
+    const std::uint64_t probe_update_limit = scaled_budget(64);
+    const std::uint64_t probe_factor_limit = scaled_budget(20);
+
+    // A column's reach contains its own rows, so a probe with an input
+    // column wider than the reach limit is certain to restart (or to raise
+    // an error first) before it finishes.
+    bool restart_certain = false;
+    for (index_t col = 0; bounded_probe && col < n; ++col) {
+        if (static_cast<index_t>(indptr[col + 1]) - static_cast<index_t>(indptr[col]) >
+            probe_front_limit) {
+            restart_certain = true;
+            break;
+        }
+    }
+
+    // Staged reserve. Each factor array first gets 1.15 * E + n entries, with
+    // E the larger of 2n and AMD's estimate of nnz(L) (zero unless
+    // MMD_AT_PLUS_A). After the first max(256, n / 16) columns, L's and U's
+    // sizes are extrapolated to n columns; an array whose extrapolated size
+    // exceeds its capacity is reserved for 1.15 times that size plus n, but
+    // never more than the ceiling 1.15 * max(E, 2 * nnz(A)) + n. Without the
+    // step COLAMD factors (no estimate) grew each array several times, while
+    // reserving the ceiling up front left factors without fill most of it
+    // unused. The step depends only on n, the factor so far and the current
+    // capacity; the capacity (the standard library's growth policy) can
+    // decide whether it happens, which affects memory only, never the
+    // factors. A probe that must restart skips it, since its arrays are
+    // discarded. No array of L or U exceeds a dense triangle, so no reserve
+    // does either.
+    const double dense_triangle =
+        0.5 * static_cast<double>(n) * (static_cast<double>(n) + 1.0);
+    const auto bounded_reserve = [&](double entries) {
+        return static_cast<std::size_t>(std::min({
+            entries,
+            dense_triangle,
+            static_cast<double>(std::numeric_limits<std::size_t>::max() / 4)}));
+    };
     const double estimate = std::max<double>(
         static_cast<double>(2 * n), result->ordering_estimated_l_nnz_);
-    const std::size_t reserve = static_cast<std::size_t>(std::min<double>(
-        estimate * 1.15 + static_cast<double>(n),
-        static_cast<double>(std::numeric_limits<std::size_t>::max() / 4)));
+    const std::size_t reserve =
+        bounded_reserve(estimate * 1.15 + static_cast<double>(n));
+    const std::size_t reserve_ceiling = bounded_reserve(
+        std::max(estimate, 2.0 * static_cast<double>(result->input_nnz_)) * 1.15 +
+        static_cast<double>(n));
+    const index_t reserve_checkpoint =
+        restart_certain ? n : std::max<index_t>(256, n / 16);
     result->l_row_indices_.reserve(reserve);
     result->l_values_.reserve(reserve);
     result->u_row_indices_.reserve(reserve);
     result->u_values_.reserve(reserve);
+    const auto extend_reserve = [&](std::vector<index_t>& rows,
+                                    std::vector<double>& entries) {
+        const double projected = static_cast<double>(entries.size()) *
+            (static_cast<double>(n) / static_cast<double>(reserve_checkpoint));
+        if (projected <= static_cast<double>(entries.capacity())) return;
+        const std::size_t wanted = std::min(
+            reserve_ceiling, bounded_reserve(projected * 1.15 + static_cast<double>(n)));
+        if (wanted > entries.capacity()) {
+            rows.reserve(wanted);
+            entries.reserve(wanted);
+        }
+    };
 
     std::vector<double> values(static_cast<std::size_t>(n), 0.0);
     std::vector<index_t> inverse_row_permutation(static_cast<std::size_t>(n), -1);
@@ -962,51 +1025,53 @@ bool factorize_left_looking(
     result->peak_workspace_bytes_ = static_cast<std::uint64_t>(n) *
         (sizeof(double) + 7 * sizeof(index_t));
 
-    // Bound discarded COLAMD work by the input size, and leave genuinely wide
-    // or expensive columns to the row engine. These limits use this ordering
-    // and its actual pivots, rather than an unrelated symmetric graph.
-    constexpr index_t probe_front_limit = 192;
-    constexpr std::uint64_t probe_column_update_limit = 8'192;
-    const auto scaled_budget = [&](std::uint64_t multiplier) {
-        const auto nnz = static_cast<std::uint64_t>(result->input_nnz_);
-        const auto maximum = std::numeric_limits<std::uint64_t>::max();
-        return nnz > maximum / multiplier ? maximum : nnz * multiplier;
-    };
-    const std::uint64_t probe_update_limit = scaled_budget(64);
-    const std::uint64_t probe_factor_limit = scaled_budget(20);
-
+    // Depth-first search from an unmarked root through the columns of L
+    // factored so far. Each row is written to reach[--top] when it finishes,
+    // so reach[top, n) is a topological order. An unpivoted row has no
+    // edges and finishes as soon as it is found, so it is written then
+    // without being pushed. The current node's factor column and edge range
+    // stay in locals; the stacks hold each suspended node's factor column
+    // and next edge. This visits and writes rows exactly as a search that
+    // pushes every row and reloads a resumed node's state from its row.
     auto depth_first_reach = [&](index_t root, index_t top, index_t generation) {
-        index_t head = 0;
-        node_stack[0] = root;
-        while (head >= 0) {
-            const index_t row = node_stack[static_cast<std::size_t>(head)];
-            const index_t factor_col =
-                inverse_row_permutation[static_cast<std::size_t>(row)];
-            if (mark[static_cast<std::size_t>(row)] != generation) {
-                mark[static_cast<std::size_t>(row)] = generation;
-                edge_stack[static_cast<std::size_t>(head)] = factor_col < 0
-                    ? 0
-                    : result->l_col_ptr_[static_cast<std::size_t>(factor_col)] + 1;
-            }
-
-            const index_t edge_end = factor_col < 0
-                ? 0
-                : result->l_col_ptr_[static_cast<std::size_t>(factor_col + 1)];
-            bool descended = false;
-            auto& edge = edge_stack[static_cast<std::size_t>(head)];
-            while (edge < edge_end) {
-                const index_t next = result->l_row_indices_[static_cast<std::size_t>(edge++)];
-                if (mark[static_cast<std::size_t>(next)] == generation) continue;
-                node_stack[static_cast<std::size_t>(++head)] = next;
-                descended = true;
-                break;
-            }
-            if (!descended) {
-                reach[static_cast<std::size_t>(--top)] = row;
-                --head;
-            }
+        mark[static_cast<std::size_t>(root)] = generation;
+        index_t col = inverse_row_permutation[static_cast<std::size_t>(root)];
+        if (col < 0) {
+            reach[static_cast<std::size_t>(--top)] = root;
+            return top;
         }
-        return top;
+        const index_t* const l_rows = result->l_row_indices_.data();
+        const index_t* const l_ptr = result->l_col_ptr_.data();
+        index_t head = 0;
+        index_t edge = l_ptr[col] + 1;
+        index_t edge_end = l_ptr[col + 1];
+        for (;;) {
+            if (edge < edge_end) {
+                const index_t next = l_rows[edge++];
+                if (mark[static_cast<std::size_t>(next)] == generation) continue;
+                mark[static_cast<std::size_t>(next)] = generation;
+                const index_t next_col =
+                    inverse_row_permutation[static_cast<std::size_t>(next)];
+                if (next_col < 0) {
+                    reach[static_cast<std::size_t>(--top)] = next;
+                    continue;
+                }
+                node_stack[static_cast<std::size_t>(head)] = col;
+                edge_stack[static_cast<std::size_t>(head)] = edge;
+                ++head;
+                col = next_col;
+                edge = l_ptr[col] + 1;
+                edge_end = l_ptr[col + 1];
+                continue;
+            }
+            reach[static_cast<std::size_t>(--top)] =
+                row_at_position[static_cast<std::size_t>(col)];
+            if (head == 0) return top;
+            --head;
+            col = node_stack[static_cast<std::size_t>(head)];
+            edge = edge_stack[static_cast<std::size_t>(head)];
+            edge_end = l_ptr[col + 1];
+        }
     };
 
     for (index_t factor_col = 0; factor_col < n; ++factor_col) {
@@ -1017,10 +1082,40 @@ bool factorize_left_looking(
 
         const index_t original_col =
             result->perm_c_[static_cast<std::size_t>(factor_col)];
-        index_t top = n;
-        for (index_t p = static_cast<index_t>(indptr[original_col]);
-             p < static_cast<index_t>(indptr[original_col + 1]); ++p) {
+        const index_t column_begin = static_cast<index_t>(indptr[original_col]);
+        const index_t column_end = static_cast<index_t>(indptr[original_col + 1]);
+        // values is zero on entry: only rows of a column's reach are written,
+        // and the end of every column resets its whole reach. So one pass
+        // scatters the scaled column before the search and finds the search
+        // start: the column's pivoted row of smallest pivot position. An
+        // unpivoted row's position, -1, is the largest value as unsigned, so
+        // the minimum skips unpivoted rows without a branch.
+        const double column_scale =
+            result->col_scale_[static_cast<std::size_t>(original_col)];
+        std::uint64_t first_position = std::numeric_limits<std::uint64_t>::max();
+        for (index_t p = column_begin; p < column_end; ++p) {
             const index_t row = static_cast<index_t>(indices[p]);
+            first_position = std::min(first_position, static_cast<std::uint64_t>(
+                inverse_row_permutation[static_cast<std::size_t>(row)]));
+            values[static_cast<std::size_t>(row)] += data[p] *
+                result->row_scale_[static_cast<std::size_t>(row)] * column_scale;
+        }
+        // Search first from that row, then from the column's rows in stored
+        // order. In a band the first search typically reaches every other
+        // pivoted row of the column, so the traversal repeats from column to
+        // column instead of following the row labels. One loop covers both
+        // (index column_begin - 1 stands for the first root), which keeps a
+        // single call site of the search.
+        const bool has_first =
+            first_position != std::numeric_limits<std::uint64_t>::max();
+        const index_t first_root = has_first
+            ? row_at_position[static_cast<std::size_t>(first_position)]
+            : index_t{0};
+        index_t top = n;
+        for (index_t p = column_begin - (has_first ? 1 : 0); p < column_end; ++p) {
+            const index_t row = p < column_begin
+                ? first_root
+                : static_cast<index_t>(indices[p]);
             if (mark[static_cast<std::size_t>(row)] != factor_col) {
                 top = depth_first_reach(row, top, factor_col);
             }
@@ -1032,17 +1127,6 @@ bool factorize_left_looking(
         }
 
         std::uint64_t column_updates = 0;
-        for (index_t p = top; p < n; ++p) {
-            values[static_cast<std::size_t>(reach[static_cast<std::size_t>(p)])] = 0.0;
-        }
-        for (index_t p = static_cast<index_t>(indptr[original_col]);
-             p < static_cast<index_t>(indptr[original_col + 1]); ++p) {
-            const index_t row = static_cast<index_t>(indices[p]);
-            values[static_cast<std::size_t>(row)] += data[p] *
-                result->row_scale_[static_cast<std::size_t>(row)] *
-                result->col_scale_[static_cast<std::size_t>(original_col)];
-        }
-
         for (index_t p = top; p < n; ++p) {
             const index_t row = reach[static_cast<std::size_t>(p)];
             const index_t source_col =
@@ -1173,6 +1257,10 @@ bool factorize_left_looking(
             const auto entries = static_cast<std::uint64_t>(result->l_values_.size()) +
                 static_cast<std::uint64_t>(result->u_values_.size());
             if (entries > probe_factor_limit) return false;
+        }
+        if (factor_col + 1 == reserve_checkpoint && reserve_checkpoint < n) {
+            extend_reserve(result->l_row_indices_, result->l_values_);
+            extend_reserve(result->u_row_indices_, result->u_values_);
         }
     }
 

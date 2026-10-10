@@ -69,7 +69,9 @@ systems.
      more than `64 * nnz(A)` total updates, or factor storage above
      `20 * nnz(A)` triggers a restart in the row engine. The discarded probe
      is bounded, and restart preserves the requested column permutation and
-     equilibration. Both engines perform threshold partial pivoting.
+     equilibration. Both engines perform threshold partial pivoting. See
+     "Left-looking CSC LU" below for the search order and the storage
+     reserve of the CSC engine.
    - Wider or fill-heavy patterns use the row-hybrid LU. Sorted sparse rows
      with at least 64 entries convert to dense tails when at least 25% of
      their own remaining span, from first to last remaining nonzero column,
@@ -99,6 +101,210 @@ systems.
 All arithmetic within a row follows a deterministic order. A threaded factor
 therefore produces the same permutations and factor entries as a one-thread
 factor for the same input and options.
+
+## Left-looking CSC LU
+
+The `left-looking-csc` engine is serial and factors one column at a time
+(Section 4 of `docs/algorithms.md`). For factor column `k` it scatters the
+scaled input column; finds the reach of the column's input rows through the
+columns of `L` factored so far by a depth-first search, which writes the
+reached rows in topological order; applies the update of each reached
+pivoted row in that order; picks the pivot among the reached unpivoted rows;
+and appends `U`'s column (the reached pivoted rows with nonzero values, in
+reach order, then the pivot) and `L`'s column (the pivot row with 1, then
+the nonzero multipliers, in reach order). Exact zeros are not stored in
+either. The scatter can precede the search because the dense work vector is
+zero between columns: only rows of a column's reach are written, and the end
+of every column resets its whole reach (earlier builds also cleared the
+reach before scattering).
+
+**Search order.** Each column's search starts from the column's pivoted row
+of smallest pivot position, then from the column's rows in stored order,
+skipping rows already reached (an unpivoted row is a leaf). Unpivoted rows
+hold position -1, so the start is the minimum of the positions as unsigned
+values, found without a branch in the pass that scatters the column, before
+any search. Both kinds of start go through one loop with a single call of
+the search (an extra first iteration stands for the first root). A first
+version of this change called the search separately for the first root, and
+that build was 14-28% slower in the numeric phase on a nonsymmetric
+tridiagonal matrix of 200,000 rows than earlier builds; with one loop (and
+the scatter moved into the same pass) the difference is 0-7% (below). The
+work is the same in both versions, so most of that cost came from the
+generated code.
+In a band that first search typically reaches every other pivoted row of the
+column, so the traversal is the same from column to column whatever the row
+labels are. Earlier builds started from the rows in stored order, which follows the
+row labels: on the row-permuted 20,000-row band of the benchmark, an
+instrumented one-thread build spent 5.9 ms in the search against 2.8 ms for
+the same band with its rows in order, with the same reach and the same
+1,259,452 edges examined (one per update). Starting from the smallest
+position took the search to 3.4 ms, with the same edges and 4% more search
+steps, so the gain is in how regularly the work runs, not in its amount.
+The order depends only on the matrix (its stored row order) and the pivots
+so far.
+
+The scratch prototype that preceded this change started from every pivoted
+row in increasing position (a sort of the column's pivoted positions) and
+then from the unpivoted rows. In a scratch build that switches between the
+orders (one thread, medians of three interleaved rounds), that was as fast
+as the smallest-position start on the row-permuted band (numeric phase 7.0
+against 6.8 ms, both with the earlier search formulation), but on random
+full bands with pivoting (half-width 3, 8 and 12; 50,000, 20,000 and 10,000
+rows; rows permuted) it was 16-18% slower than the stored order: the sort
+and the second pass cost more there than the order saves. With the search
+formulation below the sorted start was 14-23% slower than the stored order
+on the full bands of half-width 3 and 8 (permuted or not) and 11% slower on
+`banded-nonsym` with `MMD_AT_PLUS_A`, whose stored order already follows the
+pivots. How the smallest-position start compares with the stored order on
+such inputs is within the code-generation variation between builds (5-10%
+either way in this and an independent set of measurements). The start order
+does cost on columns with a single pivoted row in a pattern that the
+smallest-position start rearranges: a nonsymmetric tridiagonal matrix of
+200,000 rows, which `MMD_AT_PLUS_A` orders in reverse, takes 6-7% longer in
+its numeric phase than in earlier builds and 1.5-3% longer end to end
+(interleaved runs, including an independent review's), while with `COLAMD`
+it is unchanged. In a scratch build
+with switches the start order alone cost 3-5% on that matrix with either
+ordering, and arranging the first root's search, the minimum and the
+scatter differently (separate passes, a separate call, scattering after the
+search) moved it by at most 3%. Every other left-looking family measured is
+faster than in earlier builds (see "Row-permuted band" in
+`docs/benchmarking.md`).
+
+**Search formulation.** The search keeps the current row's factor column and
+edge range in locals and pushes only suspended pivoted rows (their factor
+column and next edge). An unpivoted row reached by an edge has no edges of
+its own, so it is written to the reach at once instead of being pushed,
+reloaded and popped. This writes every row exactly where the earlier
+formulation (one stack entry per reached row, whose state was reloaded from
+the row on every resume) wrote it: on 130 stress matrices with both
+orderings the factors were bitwise identical to those of the earlier
+formulation with the same start order (both the stored and the
+smallest-position start). It cut the one-thread numeric phase
+by 11-24% across the families measured with the stored start order (for
+example 10.2 to 8.3 ms on the row-permuted band, 6.0 to 4.6 ms on the same
+band with rows in order, and 13.1 to 10.8 ms on the full band of half-width
+8).
+
+**Effect on the factors.** The search order decides the order in which
+updates reach an entry, so `L` and `U` differ from earlier builds in the
+last bits (on the benchmark bands by at most 2.2e-16 of the largest `U`
+entry, with identical permutations and patterns), and a pivot can change
+where two candidates are equal or within rounding error of each other,
+including the preferred row against the threshold: ties are still broken by
+current row position, but rounding may now separate the candidates the
+other way. Exact singularity is still an exactly zero computed pivot (see
+Section 3 of `docs/algorithms.md`), so for a matrix that is singular to
+working precision, whether the factorization meets an exact zero can change
+in either direction. Two equal rows still cancel exactly in any order
+(Section 4 of `docs/algorithms.md`), so duplicated rows are always reported
+singular; duplicated columns and other integer combinations of rows or
+columns are not covered by that argument. Non-finite detection is unchanged:
+every candidate and update is still tested. Since the probe's pivots can
+change, so can its decision and its counters.
+
+Two stress sets measured these effects against `c46bda9`, with both
+orderings at several thread counts: the comparisons ran at one and four
+threads, and this change was also run at 1, 2, 3, 4 and 8 threads on 65
+matrices of the first set and at 1, 2, 3 and 8 threads on the whole second
+set, with identical factors at every thread count. Their counts describe
+those sets, not bounds. The first has 260 matrices (narrow random bands with uniform,
+`+-1` and small-integer values, near-bands, near-singular matrices and
+matrices with a duplicated row or column or a row equal to a sum of two
+rows; 356 left-looking factorizations). In it 7 row permutations changed,
+all in `+-1` or `+-1, +-2` bands, each at a column whose largest candidates
+are exactly equal in exact rational arithmetic; 21 factors kept their
+permutations but stored a different set of entries, because a value
+cancelled to exactly zero in one order and not in the other (exact zeros are
+not stored, and a dropped entry can also remove later fill), with factor
+sizes within 0.5%; one duplicated-column matrix with `MMD_AT_PLUS_A` that was
+reported singular now factors (the componentwise backward error of an
+unrefined solve is 1.6e-10), and none became singular; the probe decision
+was the same on every matrix, and 1 of 14 restarts reported different probe
+counters (`numeric_probe_max_front` 318 instead of 304,
+`numeric_probe_updates` 18,547 instead of 18,668). The second, an
+independent set of 355 matrices (similar bands, convection-diffusion grids,
+duplicated rows and columns, integer combinations of rows or columns,
+planted NaN or infinite entries with `check_finite=False`, and columns and
+full bands around the probe's limits; 383 left-looking factorizations), had
+25 permutation changes and 54 pattern changes (factor sizes within 1.1%). An
+independent review recomputed its permutation changes in 120-digit
+arithmetic: they were at exact ties (one of them between the preferred row
+and the threshold), at a near tie (relative gap 2.6e-17), and in numerically
+singular matrices among candidates of size about 1e-32. Ten factorizations
+that completed before now
+report singular (six with a duplicated column, three with a row combination,
+and a random band with `MMD_AT_PLUS_A` whose earlier factors had a backward
+error of 0.21), and five reported singular before now complete; all fifteen
+matrices are singular to working precision (smallest singular value at most
+6.2e-17 of the largest). Duplicated rows were reported singular in all 64
+cases. Probe decisions were the same, 2 of 40 restarts reported different
+probe counters, and the planted NaN and infinite entries raised the same
+errors and messages as before.
+
+**Storage reserve.** The four factor arrays (`L` and `U` row indices and
+values) are reserved in two stages. Each first gets `1.15 * E + n` entries,
+where `E` is the larger of `2n` and AMD's estimate of `nnz(L)`
+(`MMD_AT_PLUS_A` only), as in earlier builds. After the first
+`max(256, n / 16)` columns, the sizes of `L` and `U` so far are extrapolated
+to `n` columns, and an array whose extrapolated size exceeds its capacity is
+reserved for 1.15 times that size plus `n`, but never beyond the ceiling
+`1.15 * max(E, 2 * nnz(A)) + n` entries. No reserve exceeds a dense triangle,
+`n * (n + 1) / 2` entries, which no array of `L` or `U` can exceed. Past its
+reserve an array grows geometrically as before (1.5-fold with MSVC, doubling
+with libstdc++ and libc++). The second stage depends only on `n`, the factor
+so far and the current capacity; through the capacity, the standard
+library's growth policy can decide whether the extension happens, which
+affects memory only, never the factors. A probe that is certain to restart
+(an input column alone is wider than the 192-row reach limit) skips the
+second stage, since its arrays are discarded; the ceiling stays below the
+probe's factor limit of `20 * nnz(A)` entries. With `COLAMD` (no estimate)
+earlier builds started each array at `3.3 * n` entries and grew it 1.5-fold,
+three times for each array of the row-permuted band (159,953 and 199,925
+entries in `L` and `U`), touching fresh pages at every step. A first
+version of this change reserved the ceiling at once, which avoided that but
+left factors that need less with most of it unused, and inflated the
+discarded arrays of probes that restart.
+
+Bound: since `n <= nnz(A)` and no reserve exceeds the ceiling, an array
+that ends within its reserve holds, without an AMD estimate, at most
+`3.3 * nnz(A)` unused entries: at most `4 * 8 * 3.3`, about 106 bytes per
+input entry, for the four arrays of 8-byte entries. That is the same bound
+as for the `3.3 * n` initial reserve of earlier builds. An array that
+outgrows its reserve holds instead the slack of its last geometric step, at
+most half its entries with MSVC's 1.5-fold growth (all of them with the
+doubling of libstdc++ and libc++), as before. With `MMD_AT_PLUS_A` the
+initial reserve from AMD's estimate dominates as before (the engine is
+selected only for an estimate of at most `10 * nnz(A)`). Unused capacity is
+never touched, so it is committed on Windows but not resident (address
+space only on Linux).
+
+Measured with `COLAMD`, one thread, each case in a fresh process (committed
+memory held by the factor after the call, the peak of committed memory
+during it, page faults):
+
+| matrix | earlier builds | ceiling reserved at once | this change |
+|---|---|---|---|
+| nonsymmetric tridiagonal, n=1,000,000 (`L`, `U` 2,000,000 entries each) | 185 MB held, 262 MB peak | 326 MB, 402 MB | 185 MB, 262 MB |
+| upper triangular with 10 entries per column, n=1,000,000 (`L` the unit diagonal) | 385 MB, 519 MB | 898 MB, 975 MB | 406 MB, 508 MB |
+| full band of half-width 95, n=50,000 (the probe restarts; row engine) | 336 MB, 342 MB | 336 MB, 789 MB | 336 MB, 342 MB |
+| row-permuted band, n=1,000,000 | 448 MB, 581 MB, 267,000 faults | 489 MB, 566 MB, 144,000 faults | 455 MB, 557 MB, 149,000 faults |
+
+The upper triangular factor holds 21 MB more than in earlier builds because
+`U` is reserved for 1.15 times its extrapolated size instead of ending after
+1.5-fold growth slightly above it; its numeric phase took 105 instead of
+143-181 ms. `peak_workspace_bytes` does not count the factor arrays of a
+completed left-looking factorization (they are the result) and is unchanged
+there. On a probe restart it counts the discarded arrays at their capacity,
+as before. Their capacity now differs from earlier builds only when the
+probe passed the second stage, where it follows the extrapolation rather
+than 1.5-fold growth from `3.3 * n`: on the benchmark cases only pivot-heavy
+with `COLAMD` changed (0.50 instead of 0.42 MB), and over the 54 restarts of
+the two stress sets above it stayed the same on 24, rose on 22 (at most 1.54
+times) and fell on 8 (to 0.86 times), against up to 36 times with the
+ceiling reserved at once; the full band above reports 10.0 MB in both
+builds, against 676 MB with the ceiling reserved at once. The restart
+releases the discarded arrays before the row engine starts, as before.
 
 ## Blocked SPD panels
 
@@ -787,7 +993,9 @@ observed reach, including the column that triggers a restart. Probe time is
 included in numeric/factor time; on success it is the CSC factorization itself.
 Workspace diagnostics include the temporary restart snapshot (the requested
 permutation and both scale vectors; the probe's counters and empty factor
-buffers are restored alongside) and discarded CSC buffers on fallback.
+buffers are restored alongside) and discarded CSC buffers on fallback, at
+their capacity, which includes the storage reserve described in
+"Left-looking CSC LU".
 
 For blocked SPD, `parallel_panels` counts actual parallel phases (a node's
 contributor fan-in or a panel's strip phase that met the threshold in
@@ -945,35 +1153,25 @@ when their backward residual is small.
 - no complex native factors yet (the SciPy backend handles them);
 - ordering and pivot selection are single-threaded;
 - the left-looking CSC engine is a serial, scalar Gilbert-Peierls loop
-  without supernodes or symmetric pruning, and it factors the one benchmark
-  case that fails the gate: the row-permuted 20,000-row band with `COLAMD`
-  took 1.14-1.17 times SuperLU's time with eight threads (1.14-1.15 with one)
-  in the final gate runs, and 1.25-1.28 times the SuperLU time of the same
-  runs when run alone in a fresh process with eight threads. About 8 ms of
-  its 20 ms is COLAMD, which SuperLU pays as well; the gap is the numeric
-  phase (10.8-11.3 ms against 9.5 ms for SuperLU's whole factorization). Two
-  costs dominate. First, the `L` and `U` arrays start with room for
-  `3.3 * n` entries when no AMD estimate exists, as with `COLAMD`, and are
-  reallocated three times on the way to their 160,000 and 200,000 entries,
-  faulting in fresh pages each time (about 5,100 page faults per one-thread
-  factorization in a fresh process, 3,000 after larger factorizations have
-  warmed the heap). Second, the depth-first search starts from a column's
-  entries in their stored order, which follows the random row labels. In an
-  uncommitted scratch prototype, reserving each array for
-  `2.3 * nnz(A) + n` entries and starting the search from a column's entries
-  in increasing pivot position together cut the fresh-process numeric phase
-  from 12.5 to 7.2 ms (the reserve alone to 9.8-10.1 ms, the search order
-  alone to 10.5 ms), while relabeling the rows for locality with an
-  unchanged traversal gained nothing; with both changes the prototype ran
-  the case at 0.90-0.94 times the SuperLU time of the same runs (see
-  "Row-permuted band" in `docs/benchmarking.md`). Sizing the arrays would
-  leave the factors bitwise identical; the search order would change the
-  order in which updates reach an entry, and with it LU factors in the last
-  bits (in the prototype, up to 2.2e-16 of the largest `U` entry on the
-  benchmark bands, with unchanged permutations and patterns), and it could
-  change a pivot choice wherever two candidates, or the preferred row and
-  the threshold, lie within those last bits of each other (in the
-  prototype, row-permuted bands of `+-1` entries changed permutations);
+  without supernodes or symmetric pruning. With the search order, search
+  formulation and storage reserve of "Left-looking CSC LU", the row-permuted
+  20,000-row band with `COLAMD` took 0.71-0.76 times SuperLU's time with
+  eight threads (0.74-0.76 with one) in three gate runs, against 1.14-1.17
+  before, and 0.80-0.82 times when run alone in a fresh process (1.23-1.28
+  before, interleaved runs); its numeric phase takes about 5 ms against
+  SuperLU's 9.5 ms for its whole factorization, so COLAMD (about 8 ms, as
+  for SuperLU) is now most of its time. The search start order is a
+  heuristic for bands, and it costs on short columns in some orders: a
+  nonsymmetric tridiagonal matrix of 200,000 rows with `MMD_AT_PLUS_A` takes
+  6-7% longer in its numeric phase than in earlier builds (1.5-3% end to
+  end; see "Left-looking CSC LU");
+- the left-looking storage reserve extrapolates each factor array's size
+  from the first `max(256, n / 16)` columns, so a factor whose later columns
+  are much sparser than its first ones keeps unused (committed, not
+  resident) capacity up to the ceiling `1.15 * max(2n, AMD estimate,
+  2 * nnz(A)) + n` entries per array, and one whose later columns are denser
+  grows 1.5-fold (doubling with libstdc++ and libc++) past it, as in earlier
+  builds;
 - `NATURAL` never selects the left-looking engine (only `COLAMD` runs the
   probe, and `MMD_AT_PLUS_A` selects it from the AMD estimate), so narrow
   nonsymmetric bands with `NATURAL` run on the row-hybrid engine at 2.1-2.6
@@ -1075,9 +1273,12 @@ remains opt-in. At the end of the performance roadmap (`105fe2c`, 2026-10-09;
 Windows x64 release build on an i5-13600K with `avx2-fma`), the
 `MMD_AT_PLUS_A` gate with `--extended --dense-lu` passed three consecutive
 runs, and the `COLAMD` runs (the default `permc_spec`) failed only on the
-row-permuted band (above).
+row-permuted band. With the left-looking search order, search formulation
+and staged storage reserve of "Left-looking CSC LU", three consecutive
+`COLAMD` gate runs and three consecutive `MMD_AT_PLUS_A` gate runs passed
+every case on the same machine (see "Current status" in
+`docs/benchmarking.md`).
 Linux x64 release builds have not been measured since these changes (CI runs
 the tests and the quick benchmark without `--gate`), so `NATIVE_DEFAULT` in
-`src/spsolve/sparse_lu.py` stays `False`. The next targets are the
-left-looking CSC costs above (factor array sizing, search order, and engine
-selection for `NATURAL`), then a Linux gate run.
+`src/spsolve/sparse_lu.py` stays `False`. The next targets are engine
+selection for `NATURAL` (above), then a Linux gate run.

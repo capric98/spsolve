@@ -87,11 +87,10 @@ matrices because pivots are dependency ordered. Irregular matrices with wide
 fronts benefit most. Structured symmetric positive-definite and narrow-front
 problems use lower-overhead serial CSC engines instead. On one Windows x64
 machine (i5-13600K, `avx2-fma`) the native backend passes the checked-in
-performance gate with the promotion ordering `MMD_AT_PLUS_A` (three
-consecutive runs); with `COLAMD`, the default `permc_spec`, one case (a
-row-permuted band) still takes 1.14-1.17 times SuperLU's time. The backend
-remains opt-in until the gate passes consistently on both Windows and Linux
-release builds.
+performance gate (`--extended --dense-lu`) with both the promotion ordering
+`MMD_AT_PLUS_A` and `COLAMD`, the default `permc_spec` (three consecutive
+runs each). The backend remains opt-in until the gate passes consistently on
+both Windows and Linux release builds.
 
 See [the implementation notes](docs/native-lu.md), [API notes](docs/api.md),
 and [benchmark gate](docs/benchmarking.md) for details.
