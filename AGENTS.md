@@ -108,8 +108,10 @@ python benchmarks/factorization.py --threads 8 --repeats 5 --gate   # promotion 
   thread. A failed attempt also reports `spd_subtrees == 0`.
 - **Public contracts.** `Pr @ Dr @ A @ Dc @ Pc == L @ U`; lazy CSC `L`/`U`
   via `export_l_csr`/`export_u_csr`; `solve_inplace`; every existing `stats`
-  key keeps its meaning (new keys may be added); the filled pattern including
-  numerically cancelled entries stays stored.
+  key keeps its meaning (new keys may be added); the symmetric LDL^T engines
+  keep their filled pattern stored, including entries that cancel numerically
+  to zero, while the pivoted LU engines (left-looking CSC and row-hybrid)
+  store only nonzero entries and drop exact zeros.
 - **No input mutation.** The native code only reads `const` pointers; tests
   assert the caller's arrays are unchanged.
 - **Licensing.** BSD-3 only. Do not copy code from SuperLU, CHOLMOD, UMFPACK,
